@@ -74,6 +74,30 @@ CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
                                      size_t count,
                                      const int *ascending,
                                      CpError *err);
+CpDataFrame *cp_df_head(const CpDataFrame *df, size_t n, CpError *err);
+CpDataFrame *cp_df_tail(const CpDataFrame *df, size_t n, CpError *err);
+int cp_df_dtypes(const CpDataFrame *df,
+                 CpDType *out,
+                 size_t out_len,
+                 CpError *err);
+CpDataFrame *cp_df_drop_cols(const CpDataFrame *df,
+                             const char **names,
+                             size_t count,
+                             CpError *err);
+CpDataFrame *cp_df_rename_cols(const CpDataFrame *df,
+                               const char **old_names,
+                               const char **new_names,
+                               size_t count,
+                               CpError *err);
+int cp_df_isnull_mask(const CpDataFrame *df,
+                      uint8_t *out,
+                      size_t out_len,
+                      CpError *err);
+CpDataFrame *cp_df_dropna(const CpDataFrame *df, CpError *err);
+CpDataFrame *cp_df_fillna(const CpDataFrame *df,
+                          const char **values,
+                          size_t count,
+                          CpError *err);
 
 int cp_df_append_row(CpDataFrame *df,
                      const char **values,

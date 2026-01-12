@@ -832,6 +832,224 @@ static void test_sort_values_multi(void) {
   cp_df_free(df);
 }
 
+static void test_head_tail(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(2, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "Alice"};
+  const char *row2[] = {"2", "Bob"};
+  const char *row3[] = {"3", "Charlie"};
+  CHECK(cp_df_append_row(df, row1, 2, &err));
+  CHECK(cp_df_append_row(df, row2, 2, &err));
+  CHECK(cp_df_append_row(df, row3, 2, &err));
+
+  CpDataFrame *head = cp_df_head(df, 2, &err);
+  CHECK(head != NULL);
+  if (head) {
+    CHECK(cp_df_nrows(head) == 2);
+    const CpSeries *id = cp_df_get_col(head, "id");
+    const CpSeries *name = cp_df_get_col(head, "name");
+    CHECK(id && name);
+
+    int64_t id_val = 0;
+    const char *name_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+  }
+
+  CpDataFrame *tail = cp_df_tail(df, 2, &err);
+  CHECK(tail != NULL);
+  if (tail) {
+    CHECK(cp_df_nrows(tail) == 2);
+    const CpSeries *id = cp_df_get_col(tail, "id");
+    CHECK(id != NULL);
+
+    int64_t id_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+  }
+
+  CpDataFrame *head0 = cp_df_head(df, 0, &err);
+  CHECK(head0 != NULL);
+  if (head0) {
+    CHECK(cp_df_nrows(head0) == 0);
+  }
+
+  CpDataFrame *tail_big = cp_df_tail(df, 10, &err);
+  CHECK(tail_big != NULL);
+  if (tail_big) {
+    CHECK(cp_df_nrows(tail_big) == 3);
+  }
+
+  if (head) {
+    cp_df_free(head);
+  }
+  if (tail) {
+    cp_df_free(tail);
+  }
+  if (head0) {
+    cp_df_free(head0);
+  }
+  if (tail_big) {
+    cp_df_free(tail_big);
+  }
+  cp_df_free(df);
+}
+
+static void test_dtypes_and_rename_drop_fill(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a", "b", "c"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  CpDType out[3] = {0};
+  CHECK(cp_df_dtypes(df, out, 3, &err));
+  CHECK(out[0] == CP_DTYPE_INT64);
+  CHECK(out[1] == CP_DTYPE_FLOAT64);
+  CHECK(out[2] == CP_DTYPE_STRING);
+
+  cp_error_clear(&err);
+  CpDType short_out[1] = {0};
+  CHECK(!cp_df_dtypes(df, short_out, 1, &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  const char *row1[] = {"1", "1.5", "x"};
+  const char *row2[] = {"2", "", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+
+  const char *drop_cols[] = {"b"};
+  CpDataFrame *dropped = cp_df_drop_cols(df, drop_cols, 1, &err);
+  CHECK(dropped != NULL);
+  if (dropped) {
+    CHECK(cp_df_ncols(dropped) == 2);
+    CHECK(cp_df_get_col(dropped, "a") != NULL);
+    CHECK(cp_df_get_col(dropped, "c") != NULL);
+  }
+
+  const char *old_names[] = {"a", "c"};
+  const char *new_names[] = {"alpha", "gamma"};
+  CpDataFrame *renamed = cp_df_rename_cols(df, old_names, new_names, 2, &err);
+  CHECK(renamed != NULL);
+  if (renamed) {
+    CHECK(cp_df_get_col(renamed, "alpha") != NULL);
+    CHECK(cp_df_get_col(renamed, "gamma") != NULL);
+    CHECK(cp_df_get_col(renamed, "a") == NULL);
+  }
+
+  cp_error_clear(&err);
+  const char *drop_all[] = {"a", "b", "c"};
+  CpDataFrame *none = cp_df_drop_cols(df, drop_all, 3, &err);
+  CHECK(none == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  const char *fill_values[] = {"0", "2.5", "unknown"};
+  CpDataFrame *filled = cp_df_fillna(df, fill_values, 3, &err);
+  CHECK(filled != NULL);
+  if (filled) {
+    const CpSeries *b = cp_df_get_col(filled, "b");
+    const CpSeries *c = cp_df_get_col(filled, "c");
+    CHECK(b && c);
+
+    double b_val = 0.0;
+    const char *c_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_float64(b, 1, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 2.5) < 1e-9);
+    CHECK(cp_series_get_string(c, 1, &c_val, &is_null));
+    CHECK(!is_null && strcmp(c_val, "unknown") == 0);
+  }
+
+  cp_error_clear(&err);
+  const char *bad_fill[] = {"", "1.0", "x"};
+  CpDataFrame *bad = cp_df_fillna(df, bad_fill, 3, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (dropped) {
+    cp_df_free(dropped);
+  }
+  if (renamed) {
+    cp_df_free(renamed);
+  }
+  if (filled) {
+    cp_df_free(filled);
+  }
+  cp_df_free(df);
+}
+
+static void test_isnull_dropna(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "1.0", "Alice"};
+  const char *row2[] = {"", "", "Bob"};
+  const char *row3[] = {"3", "", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  uint8_t mask[9] = {0};
+  CHECK(cp_df_isnull_mask(df, mask, 9, &err));
+  CHECK(mask[0] == 0);
+  CHECK(mask[1] == 0);
+  CHECK(mask[2] == 0);
+  CHECK(mask[3] == 1);
+  CHECK(mask[4] == 1);
+  CHECK(mask[5] == 0);
+  CHECK(mask[6] == 0);
+  CHECK(mask[7] == 1);
+  CHECK(mask[8] == 1);
+
+  CpDataFrame *dropna = cp_df_dropna(df, &err);
+  CHECK(dropna != NULL);
+  if (dropna) {
+    CHECK(cp_df_nrows(dropna) == 1);
+    const CpSeries *id = cp_df_get_col(dropna, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+  }
+
+  if (dropna) {
+    cp_df_free(dropna);
+  }
+  cp_df_free(df);
+}
+
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
@@ -843,6 +1061,9 @@ int main(void) {
   test_select_and_filter();
   test_sort_values();
   test_sort_values_multi();
+  test_head_tail();
+  test_dtypes_and_rename_drop_fill();
+  test_isnull_dropna();
 
   if (tests_failed != 0) {
     fprintf(stderr, "%d test(s) failed\n", tests_failed);
