@@ -23,6 +23,15 @@ typedef enum {
   CP_ERR_INVALID = 4
 } CpErrCode;
 
+typedef enum {
+  CP_OP_EQ = 0,
+  CP_OP_NE = 1,
+  CP_OP_LT = 2,
+  CP_OP_LE = 3,
+  CP_OP_GT = 4,
+  CP_OP_GE = 5
+} CpCompareOp;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -77,6 +86,42 @@ CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
                                      CpError *err);
 int cp_df_info(const CpDataFrame *df, FILE *out, CpError *err);
 CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err);
+int cp_df_mask_int64(const CpDataFrame *df,
+                     const char *name,
+                     CpCompareOp op,
+                     int64_t value,
+                     uint8_t *out,
+                     size_t out_len,
+                     CpError *err);
+int cp_df_mask_float64(const CpDataFrame *df,
+                       const char *name,
+                       CpCompareOp op,
+                       double value,
+                       uint8_t *out,
+                       size_t out_len,
+                       CpError *err);
+int cp_df_mask_string(const CpDataFrame *df,
+                      const char *name,
+                      CpCompareOp op,
+                      const char *value,
+                      uint8_t *out,
+                      size_t out_len,
+                      CpError *err);
+CpDataFrame *cp_df_filter_int64(const CpDataFrame *df,
+                                const char *name,
+                                CpCompareOp op,
+                                int64_t value,
+                                CpError *err);
+CpDataFrame *cp_df_filter_float64(const CpDataFrame *df,
+                                  const char *name,
+                                  CpCompareOp op,
+                                  double value,
+                                  CpError *err);
+CpDataFrame *cp_df_filter_string(const CpDataFrame *df,
+                                 const char *name,
+                                 CpCompareOp op,
+                                 const char *value,
+                                 CpError *err);
 CpDataFrame *cp_df_iloc(const CpDataFrame *df,
                         const size_t *row_indices,
                         size_t row_count,

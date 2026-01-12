@@ -52,6 +52,120 @@ static void cp_error_set(CpError *err,
                          size_t row,
                          size_t col,
                          const char *fmt,
+                         ...);
+
+static int cp_eval_compare_int64(int64_t lhs,
+                                 CpCompareOp op,
+                                 int64_t rhs,
+                                 int *out,
+                                 CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compare output");
+    return 0;
+  }
+  switch (op) {
+    case CP_OP_EQ:
+      *out = (lhs == rhs);
+      return 1;
+    case CP_OP_NE:
+      *out = (lhs != rhs);
+      return 1;
+    case CP_OP_LT:
+      *out = (lhs < rhs);
+      return 1;
+    case CP_OP_LE:
+      *out = (lhs <= rhs);
+      return 1;
+    case CP_OP_GT:
+      *out = (lhs > rhs);
+      return 1;
+    case CP_OP_GE:
+      *out = (lhs >= rhs);
+      return 1;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compare op");
+      return 0;
+  }
+}
+
+static int cp_eval_compare_float64(double lhs,
+                                   CpCompareOp op,
+                                   double rhs,
+                                   int *out,
+                                   CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compare output");
+    return 0;
+  }
+  if (isnan(lhs) || isnan(rhs)) {
+    *out = 0;
+    return 1;
+  }
+  switch (op) {
+    case CP_OP_EQ:
+      *out = (lhs == rhs);
+      return 1;
+    case CP_OP_NE:
+      *out = (lhs != rhs);
+      return 1;
+    case CP_OP_LT:
+      *out = (lhs < rhs);
+      return 1;
+    case CP_OP_LE:
+      *out = (lhs <= rhs);
+      return 1;
+    case CP_OP_GT:
+      *out = (lhs > rhs);
+      return 1;
+    case CP_OP_GE:
+      *out = (lhs >= rhs);
+      return 1;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compare op");
+      return 0;
+  }
+}
+
+static int cp_eval_compare_string(const char *lhs,
+                                  CpCompareOp op,
+                                  const char *rhs,
+                                  int *out,
+                                  CpError *err) {
+  if (!out || !lhs || !rhs) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compare input");
+    return 0;
+  }
+  int cmp = strcmp(lhs, rhs);
+  switch (op) {
+    case CP_OP_EQ:
+      *out = (cmp == 0);
+      return 1;
+    case CP_OP_NE:
+      *out = (cmp != 0);
+      return 1;
+    case CP_OP_LT:
+      *out = (cmp < 0);
+      return 1;
+    case CP_OP_LE:
+      *out = (cmp <= 0);
+      return 1;
+    case CP_OP_GT:
+      *out = (cmp > 0);
+      return 1;
+    case CP_OP_GE:
+      *out = (cmp >= 0);
+      return 1;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compare op");
+      return 0;
+  }
+}
+
+static void cp_error_set(CpError *err,
+                         CpErrCode code,
+                         size_t row,
+                         size_t col,
+                         const char *fmt,
                          ...) {
   if (!err) {
     return;
@@ -1667,6 +1781,199 @@ CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err) {
   free(mins);
   free(maxs);
   free(numeric_cols);
+  return out;
+}
+
+int cp_df_mask_int64(const CpDataFrame *df,
+                     const char *name,
+                     CpCompareOp op,
+                     int64_t value,
+                     uint8_t *out,
+                     size_t out_len,
+                     CpError *err) {
+  if (!df || !name || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  if (out_len < df->nrows) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "output buffer too small");
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  if (series->dtype != CP_DTYPE_INT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (series->is_null[row]) {
+      out[row] = 0;
+      continue;
+    }
+    int match = 0;
+    if (!cp_eval_compare_int64(series->data.i64[row], op, value, &match, err)) {
+      return 0;
+    }
+    out[row] = match ? 1 : 0;
+  }
+  return 1;
+}
+
+int cp_df_mask_float64(const CpDataFrame *df,
+                       const char *name,
+                       CpCompareOp op,
+                       double value,
+                       uint8_t *out,
+                       size_t out_len,
+                       CpError *err) {
+  if (!df || !name || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  if (out_len < df->nrows) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "output buffer too small");
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  if (series->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (series->is_null[row]) {
+      out[row] = 0;
+      continue;
+    }
+    int match = 0;
+    if (!cp_eval_compare_float64(series->data.f64[row], op, value, &match, err)) {
+      return 0;
+    }
+    out[row] = match ? 1 : 0;
+  }
+  return 1;
+}
+
+int cp_df_mask_string(const CpDataFrame *df,
+                      const char *name,
+                      CpCompareOp op,
+                      const char *value,
+                      uint8_t *out,
+                      size_t out_len,
+                      CpError *err) {
+  if (!df || !name || !out || !value) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  if (out_len < df->nrows) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "output buffer too small");
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  if (series->dtype != CP_DTYPE_STRING) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (series->is_null[row]) {
+      out[row] = 0;
+      continue;
+    }
+    const char *lhs = series->data.str[row] ? series->data.str[row] : "";
+    int match = 0;
+    if (!cp_eval_compare_string(lhs, op, value, &match, err)) {
+      return 0;
+    }
+    out[row] = match ? 1 : 0;
+  }
+  return 1;
+}
+
+CpDataFrame *cp_df_filter_int64(const CpDataFrame *df,
+                                const char *name,
+                                CpCompareOp op,
+                                int64_t value,
+                                CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (df->nrows == 0) {
+    return cp_df_empty_like(df, err);
+  }
+  uint8_t *mask = (uint8_t *)calloc(df->nrows, sizeof(uint8_t));
+  if (!mask) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  if (!cp_df_mask_int64(df, name, op, value, mask, df->nrows, err)) {
+    free(mask);
+    return NULL;
+  }
+  CpDataFrame *out = cp_df_filter_mask(df, mask, df->nrows, err);
+  free(mask);
+  return out;
+}
+
+CpDataFrame *cp_df_filter_float64(const CpDataFrame *df,
+                                  const char *name,
+                                  CpCompareOp op,
+                                  double value,
+                                  CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (df->nrows == 0) {
+    return cp_df_empty_like(df, err);
+  }
+  uint8_t *mask = (uint8_t *)calloc(df->nrows, sizeof(uint8_t));
+  if (!mask) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  if (!cp_df_mask_float64(df, name, op, value, mask, df->nrows, err)) {
+    free(mask);
+    return NULL;
+  }
+  CpDataFrame *out = cp_df_filter_mask(df, mask, df->nrows, err);
+  free(mask);
+  return out;
+}
+
+CpDataFrame *cp_df_filter_string(const CpDataFrame *df,
+                                 const char *name,
+                                 CpCompareOp op,
+                                 const char *value,
+                                 CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (df->nrows == 0) {
+    return cp_df_empty_like(df, err);
+  }
+  uint8_t *mask = (uint8_t *)calloc(df->nrows, sizeof(uint8_t));
+  if (!mask) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  if (!cp_df_mask_string(df, name, op, value, mask, df->nrows, err)) {
+    free(mask);
+    return NULL;
+  }
+  CpDataFrame *out = cp_df_filter_mask(df, mask, df->nrows, err);
+  free(mask);
   return out;
 }
 
