@@ -724,6 +724,114 @@ static void test_sort_values(void) {
   cp_df_free(df);
 }
 
+static void test_sort_values_multi(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"3", "2.0", "Bob"};
+  const char *row2[] = {"1", "5.0", "Alice"};
+  const char *row3[] = {"2", "1.5", "Charlie"};
+  const char *row4[] = {"", "4.5", ""};
+  const char *row5[] = {"2", "0.5", "Bob"};
+
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+  CHECK(cp_df_append_row(df, row5, 3, &err));
+
+  const char *keys1[] = {"name", "id"};
+  int asc1[] = {1, 0};
+  CpDataFrame *sorted = cp_df_sort_values_multi(df, keys1, 2, asc1, &err);
+  CHECK(sorted != NULL);
+  if (sorted) {
+    const CpSeries *id = cp_df_get_col(sorted, "id");
+    const CpSeries *name = cp_df_get_col(sorted, "name");
+    CHECK(id && name);
+
+    const char *name_val = NULL;
+    int64_t id_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+
+    CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+
+    CHECK(cp_series_get_string(name, 2, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+    CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+
+    CHECK(cp_series_get_string(name, 3, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Charlie") == 0);
+
+    CHECK(cp_series_get_string(name, 4, &name_val, &is_null));
+    CHECK(is_null);
+  }
+
+  const char *keys2[] = {"id", "score"};
+  int asc2[] = {1, 0};
+  CpDataFrame *sorted2 = cp_df_sort_values_multi(df, keys2, 2, asc2, &err);
+  CHECK(sorted2 != NULL);
+  if (sorted2) {
+    const CpSeries *id = cp_df_get_col(sorted2, "id");
+    const CpSeries *score = cp_df_get_col(sorted2, "score");
+    CHECK(id && score);
+
+    int64_t id_val = 0;
+    double score_val = 0.0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_float64(score, 0, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 5.0) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_float64(score, 1, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 1.5) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_float64(score, 2, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 0.5) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 3, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+
+    CHECK(cp_series_get_int64(id, 4, &id_val, &is_null));
+    CHECK(is_null);
+  }
+
+  cp_error_clear(&err);
+  CpDataFrame *bad = cp_df_sort_values_multi(df, NULL, 0, NULL, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (sorted) {
+    cp_df_free(sorted);
+  }
+  if (sorted2) {
+    cp_df_free(sorted2);
+  }
+  cp_df_free(df);
+}
+
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
@@ -734,6 +842,7 @@ int main(void) {
   test_df_aggregation_helpers();
   test_select_and_filter();
   test_sort_values();
+  test_sort_values_multi();
 
   if (tests_failed != 0) {
     fprintf(stderr, "%d test(s) failed\n", tests_failed);

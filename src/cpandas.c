@@ -950,18 +950,92 @@ static void cp_sort_indices_merge(size_t *indices,
   }
 }
 
-CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
-                               const char *name,
-                               int ascending,
-                               CpError *err) {
-  const CpSeries *series = cp_df_require_col(df, name, err);
-  if (!series) {
+static int cp_compare_rows_multi(const CpSeries **keys,
+                                 const int *ascending,
+                                 size_t key_count,
+                                 size_t a,
+                                 size_t b) {
+  for (size_t i = 0; i < key_count; ++i) {
+    int asc = 1;
+    if (ascending) {
+      asc = ascending[i] != 0;
+    }
+    int cmp = cp_series_compare_dir(keys[i], a, b, asc);
+    if (cmp != 0) {
+      return cmp;
+    }
+  }
+  return 0;
+}
+
+static void cp_sort_indices_merge_multi(size_t *indices,
+                                        size_t *tmp,
+                                        size_t left,
+                                        size_t right,
+                                        const CpSeries **keys,
+                                        const int *ascending,
+                                        size_t key_count) {
+  if (right - left <= 1) {
+    return;
+  }
+  size_t mid = left + (right - left) / 2;
+  cp_sort_indices_merge_multi(indices, tmp, left, mid, keys, ascending,
+                              key_count);
+  cp_sort_indices_merge_multi(indices, tmp, mid, right, keys, ascending,
+                              key_count);
+
+  size_t i = left;
+  size_t j = mid;
+  size_t k = left;
+  while (i < mid && j < right) {
+    int cmp =
+        cp_compare_rows_multi(keys, ascending, key_count, indices[i], indices[j]);
+    if (cmp <= 0) {
+      tmp[k++] = indices[i++];
+    } else {
+      tmp[k++] = indices[j++];
+    }
+  }
+  while (i < mid) {
+    tmp[k++] = indices[i++];
+  }
+  while (j < right) {
+    tmp[k++] = indices[j++];
+  }
+  for (size_t idx = left; idx < right; ++idx) {
+    indices[idx] = tmp[idx];
+  }
+}
+
+CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
+                                     const char **names,
+                                     size_t count,
+                                     const int *ascending,
+                                     CpError *err) {
+  if (!df || !names || count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid sort keys");
     return NULL;
   }
-  if (series->dtype != CP_DTYPE_INT64 && series->dtype != CP_DTYPE_FLOAT64 &&
-      series->dtype != CP_DTYPE_STRING) {
-    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported sort dtype");
+
+  const CpSeries **keys = (const CpSeries **)malloc(count * sizeof(const CpSeries *));
+  if (!keys) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
     return NULL;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const CpSeries *series = cp_df_require_col(df, names[i], err);
+    if (!series) {
+      free(keys);
+      return NULL;
+    }
+    if (series->dtype != CP_DTYPE_INT64 && series->dtype != CP_DTYPE_FLOAT64 &&
+        series->dtype != CP_DTYPE_STRING) {
+      free(keys);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported sort dtype");
+      return NULL;
+    }
+    keys[i] = series;
   }
 
   size_t nrows = df->nrows;
@@ -974,6 +1048,7 @@ CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
     if (!indices || !tmp) {
       free(indices);
       free(tmp);
+      free(keys);
       cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
       return NULL;
     }
@@ -981,37 +1056,40 @@ CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
       indices[i] = i;
     }
     if (nrows > 1) {
-      cp_sort_indices_merge(indices, tmp, 0, nrows, series, ascending != 0);
+      cp_sort_indices_merge_multi(indices, tmp, 0, nrows, keys, ascending,
+                                  count);
     }
   }
 
   CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
-  const char **names = (const char **)malloc(ncols * sizeof(const char *));
+  const char **out_names = (const char **)malloc(ncols * sizeof(const char *));
   const CpSeries **src_cols =
       (const CpSeries **)malloc(ncols * sizeof(const CpSeries *));
-  if (!dtypes || !names || !src_cols) {
+  if (!dtypes || !out_names || !src_cols) {
     free(dtypes);
-    free(names);
+    free(out_names);
     free(src_cols);
     free(indices);
     free(tmp);
+    free(keys);
     cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
     return NULL;
   }
 
   for (size_t i = 0; i < ncols; ++i) {
     src_cols[i] = df->cols[i];
-    names[i] = df->cols[i]->name;
+    out_names[i] = df->cols[i]->name;
     dtypes[i] = df->cols[i]->dtype;
   }
 
-  CpDataFrame *out = cp_df_create(ncols, names, dtypes, nrows, err);
+  CpDataFrame *out = cp_df_create(ncols, out_names, dtypes, nrows, err);
   if (!out) {
     free(dtypes);
-    free(names);
+    free(out_names);
     free(src_cols);
     free(indices);
     free(tmp);
+    free(keys);
     return NULL;
   }
 
@@ -1025,11 +1103,21 @@ CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
   }
 
   free(dtypes);
-  free(names);
+  free(out_names);
   free(src_cols);
   free(indices);
   free(tmp);
+  free(keys);
   return out;
+}
+
+CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
+                               const char *name,
+                               int ascending,
+                               CpError *err) {
+  const char *names[1] = {name};
+  int asc[1] = {ascending};
+  return cp_df_sort_values_multi(df, names, 1, asc, err);
 }
 
 int cp_df_append_row(CpDataFrame *df,
