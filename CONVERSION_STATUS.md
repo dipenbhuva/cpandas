@@ -17,6 +17,8 @@ I/O
 Data exploration
 - `head` / `tail` row slicing helpers.
 - DataFrame dtypes listing.
+- `info` summary output.
+- `describe` summary statistics (numeric columns).
 
 Data operations
 - Column lookup by name.
@@ -48,14 +50,13 @@ Source: https://www.geeksforgeeks.org/pandas/pandas-functions-in-python/
 
 Implemented from the list
 - DataFrame creation (`pd.DataFrame()` -> `cp_df_create`).
-- Data exploration (`head`, `tail`, `dtypes`).
+- Data exploration (`head`, `tail`, `dtypes`, `info`, `describe`).
 - Column selection (`df["col"]`, `df[["col1", "col2"]]`).
 - Sorting by column (`df.sort_values`).
 - Column drop/rename.
 - Missing value helpers (`isnull`, `dropna`, `fillna`).
 
 Remaining from the list
-- Data exploration (`info`, `describe`).
 - Label/positional indexing (`loc`, `iloc`).
 - Predicate filtering (`df[df["col"] > value]` helpers).
 - Groupby and `agg`.

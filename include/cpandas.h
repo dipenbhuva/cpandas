@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 typedef enum {
@@ -74,6 +75,8 @@ CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
                                      size_t count,
                                      const int *ascending,
                                      CpError *err);
+int cp_df_info(const CpDataFrame *df, FILE *out, CpError *err);
+CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err);
 CpDataFrame *cp_df_head(const CpDataFrame *df, size_t n, CpError *err);
 CpDataFrame *cp_df_tail(const CpDataFrame *df, size_t n, CpError *err);
 int cp_df_dtypes(const CpDataFrame *df,

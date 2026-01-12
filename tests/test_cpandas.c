@@ -1050,6 +1050,91 @@ static void test_isnull_dropna(void) {
   cp_df_free(df);
 }
 
+static void test_info_describe(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "2.0", "Alice"};
+  const char *row2[] = {"2", "-1.0", ""};
+  const char *row3[] = {"", "3.0", "Bob"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (path) {
+    FILE *fp = fopen(path, "w");
+    CHECK(fp != NULL);
+    if (fp) {
+      CHECK(cp_df_info(df, fp, &err));
+      fclose(fp);
+      char *contents = read_file(path);
+      CHECK(contents != NULL);
+      if (contents) {
+        CHECK(strstr(contents, "Rows: 3") != NULL);
+        CHECK(strstr(contents, "Columns: 3") != NULL);
+        CHECK(strstr(contents, "[0] id (int64) non-null: 2") != NULL);
+        CHECK(strstr(contents, "[1] score (float64) non-null: 3") != NULL);
+        CHECK(strstr(contents, "[2] name (string) non-null: 2") != NULL);
+      }
+      free(contents);
+    }
+    remove(path);
+    free(path);
+  }
+
+  cp_error_clear(&err);
+  CHECK(!cp_df_info(df, NULL, &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  CpDataFrame *desc = cp_df_describe(df, &err);
+  CHECK(desc != NULL);
+  if (desc) {
+    CHECK(cp_df_nrows(desc) == 4);
+    CHECK(cp_df_ncols(desc) == 3);
+    const CpSeries *stat = cp_df_get_col(desc, "stat");
+    const CpSeries *id = cp_df_get_col(desc, "id");
+    const CpSeries *score = cp_df_get_col(desc, "score");
+    CHECK(stat && id && score);
+
+    const char *stat_val = NULL;
+    double val = 0.0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(stat, 0, &stat_val, &is_null));
+    CHECK(!is_null && strcmp(stat_val, "count") == 0);
+    CHECK(cp_series_get_float64(id, 0, &val, &is_null));
+    CHECK(!is_null && fabs(val - 2.0) < 1e-9);
+
+    CHECK(cp_series_get_string(stat, 1, &stat_val, &is_null));
+    CHECK(!is_null && strcmp(stat_val, "mean") == 0);
+    CHECK(cp_series_get_float64(id, 1, &val, &is_null));
+    CHECK(!is_null && fabs(val - 1.5) < 1e-9);
+
+    CHECK(cp_series_get_string(stat, 2, &stat_val, &is_null));
+    CHECK(!is_null && strcmp(stat_val, "min") == 0);
+    CHECK(cp_series_get_float64(score, 2, &val, &is_null));
+    CHECK(!is_null && fabs(val - (-1.0)) < 1e-9);
+
+    CHECK(cp_series_get_string(stat, 3, &stat_val, &is_null));
+    CHECK(!is_null && strcmp(stat_val, "max") == 0);
+    CHECK(cp_series_get_float64(score, 3, &val, &is_null));
+    CHECK(!is_null && fabs(val - 3.0) < 1e-9);
+  }
+
+  cp_df_free(desc);
+  cp_df_free(df);
+}
+
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
@@ -1064,6 +1149,7 @@ int main(void) {
   test_head_tail();
   test_dtypes_and_rename_drop_fill();
   test_isnull_dropna();
+  test_info_describe();
 
   if (tests_failed != 0) {
     fprintf(stderr, "%d test(s) failed\n", tests_failed);
