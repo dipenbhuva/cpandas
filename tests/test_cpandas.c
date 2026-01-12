@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -500,6 +501,101 @@ static void test_df_aggregation_helpers(void) {
   cp_df_free(df);
 }
 
+static void test_select_and_filter(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "10.5", "Alice"};
+  const char *row2[] = {"2", "", "Bob"};
+  const char *row3[] = {"3", "8.0", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  const char *sel[] = {"name", "id"};
+  CpDataFrame *selected = cp_df_select_cols(df, sel, 2, &err);
+  CHECK(selected != NULL);
+  if (selected) {
+    CHECK(cp_df_ncols(selected) == 2);
+    CHECK(cp_df_nrows(selected) == 3);
+
+    const CpSeries *name = cp_df_get_col(selected, "name");
+    const CpSeries *id = cp_df_get_col(selected, "id");
+    CHECK(name && id);
+
+    const char *name_val = NULL;
+    int64_t id_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+
+    CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+
+    CHECK(cp_series_get_string(name, 2, &name_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+  }
+
+  cp_error_clear(&err);
+  const char *bad_sel[] = {"missing"};
+  CpDataFrame *bad = cp_df_select_cols(df, bad_sel, 1, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  uint8_t mask[] = {1, 0, 1};
+  CpDataFrame *filtered = cp_df_filter_mask(df, mask, 3, &err);
+  CHECK(filtered != NULL);
+  if (filtered) {
+    CHECK(cp_df_nrows(filtered) == 2);
+    const CpSeries *fid = cp_df_get_col(filtered, "id");
+    const CpSeries *fname = cp_df_get_col(filtered, "name");
+    CHECK(fid && fname);
+
+    int64_t id_val = 0;
+    const char *name_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(fid, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_string(fname, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+
+    CHECK(cp_series_get_int64(fid, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+    CHECK(cp_series_get_string(fname, 1, &name_val, &is_null));
+    CHECK(is_null);
+  }
+
+  cp_error_clear(&err);
+  uint8_t bad_mask[] = {1, 0};
+  CpDataFrame *bad_filter = cp_df_filter_mask(df, bad_mask, 2, &err);
+  CHECK(bad_filter == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (selected) {
+    cp_df_free(selected);
+  }
+  if (filtered) {
+    cp_df_free(filtered);
+  }
+  cp_df_free(df);
+}
+
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
@@ -508,6 +604,7 @@ int main(void) {
   test_read_csv_mismatch();
   test_aggregations();
   test_df_aggregation_helpers();
+  test_select_and_filter();
 
   if (tests_failed != 0) {
     fprintf(stderr, "%d test(s) failed\n", tests_failed);
