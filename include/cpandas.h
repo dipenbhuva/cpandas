@@ -57,6 +57,15 @@ size_t cp_df_nrows(const CpDataFrame *df);
 size_t cp_df_ncols(const CpDataFrame *df);
 const CpSeries *cp_df_get_col(const CpDataFrame *df, const char *name);
 
+CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
+                               const char **names,
+                               size_t count,
+                               CpError *err);
+CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
+                               const uint8_t *mask,
+                               size_t mask_len,
+                               CpError *err);
+
 int cp_df_append_row(CpDataFrame *df,
                      const char **values,
                      size_t nvalues,

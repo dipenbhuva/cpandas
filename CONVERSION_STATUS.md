@@ -16,7 +16,9 @@ I/O
 
 Data operations
 - Column lookup by name.
+- Column selection by name.
 - Row append with type parsing (int64/float64/string).
+- Row filtering by boolean mask.
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -31,8 +33,8 @@ Validation and tooling
 ## Remaining / Not Yet Implemented
 
 Core DataFrame operations
-- Column selection (by list, by dtype) and projection API.
-- Row filtering (boolean masks, predicates).
+- Column selection by dtype and projection API.
+- Row filtering via predicates (beyond mask-based filtering).
 - Sorting by column(s).
 - Vectorized arithmetic and comparison ops beyond aggregations.
 

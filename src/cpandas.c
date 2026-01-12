@@ -246,6 +246,32 @@ static int cp_series_append_string(CpSeries *s,
   return 1;
 }
 
+static int cp_series_append_from(CpSeries *dest,
+                                 const CpSeries *src,
+                                 size_t idx,
+                                 CpError *err) {
+  if (!dest || !src || dest->dtype != src->dtype) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  if (idx >= src->length) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "row index out of range");
+    return 0;
+  }
+  int is_null = src->is_null[idx] ? 1 : 0;
+  switch (dest->dtype) {
+    case CP_DTYPE_INT64:
+      return cp_series_append_int64(dest, src->data.i64[idx], is_null, err);
+    case CP_DTYPE_FLOAT64:
+      return cp_series_append_float64(dest, src->data.f64[idx], is_null, err);
+    case CP_DTYPE_STRING:
+      return cp_series_append_string(dest, src->data.str[idx], is_null, err);
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+      return 0;
+  }
+}
+
 static void cp_series_pop(CpSeries *s) {
   if (!s || s->length == 0) {
     return;
@@ -665,6 +691,148 @@ static const CpSeries *cp_df_require_col_index(const CpDataFrame *df,
     return NULL;
   }
   return df->cols[index];
+}
+
+static int cp_df_append_row_from_sources(CpDataFrame *df,
+                                         const CpSeries **src_cols,
+                                         size_t ncols,
+                                         size_t row,
+                                         CpError *err) {
+  if (!df || !src_cols || ncols != df->ncols) {
+    cp_error_set(err, CP_ERR_INVALID, row, 0, "invalid row source");
+    return 0;
+  }
+  for (size_t i = 0; i < ncols; ++i) {
+    if (!cp_series_append_from(df->cols[i], src_cols[i], row, err)) {
+      for (size_t j = 0; j < i; ++j) {
+        cp_series_pop(df->cols[j]);
+      }
+      return 0;
+    }
+  }
+  df->nrows += 1;
+  return 1;
+}
+
+CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
+                               const char **names,
+                               size_t count,
+                               CpError *err) {
+  if (!df || !names || count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid selection");
+    return NULL;
+  }
+
+  CpDType *dtypes = (CpDType *)malloc(count * sizeof(CpDType));
+  const char **sel_names = (const char **)malloc(count * sizeof(const char *));
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(count * sizeof(const CpSeries *));
+  if (!dtypes || !sel_names || !src_cols) {
+    free(dtypes);
+    free(sel_names);
+    free(src_cols);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const CpSeries *series = cp_df_get_col(df, names[i]);
+    if (!series) {
+      free(dtypes);
+      free(sel_names);
+      free(src_cols);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+      return NULL;
+    }
+    dtypes[i] = series->dtype;
+    sel_names[i] = series->name;
+    src_cols[i] = series;
+  }
+
+  CpDataFrame *out = cp_df_create(count, sel_names, dtypes, df->nrows, err);
+  if (!out) {
+    free(dtypes);
+    free(sel_names);
+    free(src_cols);
+    return NULL;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (!cp_df_append_row_from_sources(out, src_cols, count, row, err)) {
+      cp_df_free(out);
+      out = NULL;
+      break;
+    }
+  }
+
+  free(dtypes);
+  free(sel_names);
+  free(src_cols);
+  return out;
+}
+
+CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
+                               const uint8_t *mask,
+                               size_t mask_len,
+                               CpError *err) {
+  if (!df || !mask) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid filter");
+    return NULL;
+  }
+  if (mask_len != df->nrows) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "mask length mismatch");
+    return NULL;
+  }
+
+  size_t keep = 0;
+  for (size_t i = 0; i < mask_len; ++i) {
+    if (mask[i]) {
+      keep += 1;
+    }
+  }
+
+  size_t ncols = df->ncols;
+  CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
+  const char **names = (const char **)malloc(ncols * sizeof(const char *));
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(ncols * sizeof(const CpSeries *));
+  if (!dtypes || !names || !src_cols) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < ncols; ++i) {
+    src_cols[i] = df->cols[i];
+    names[i] = df->cols[i]->name;
+    dtypes[i] = df->cols[i]->dtype;
+  }
+
+  CpDataFrame *out = cp_df_create(ncols, names, dtypes, keep, err);
+  if (!out) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    return NULL;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (!mask[row]) {
+      continue;
+    }
+    if (!cp_df_append_row_from_sources(out, src_cols, ncols, row, err)) {
+      cp_df_free(out);
+      out = NULL;
+      break;
+    }
+  }
+
+  free(dtypes);
+  free(names);
+  free(src_cols);
+  return out;
 }
 
 int cp_df_append_row(CpDataFrame *df,
