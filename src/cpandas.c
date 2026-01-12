@@ -788,6 +788,171 @@ static CpDataFrame *cp_df_empty_like(const CpDataFrame *df, CpError *err) {
   return out;
 }
 
+static int cp_indices_have_duplicates(const size_t *indices, size_t count) {
+  if (!indices) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    for (size_t j = i + 1; j < count; ++j) {
+      if (indices[i] == indices[j]) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+CpDataFrame *cp_df_iloc(const CpDataFrame *df,
+                        const size_t *row_indices,
+                        size_t row_count,
+                        const size_t *col_indices,
+                        size_t col_count,
+                        CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+
+  size_t ncols = df->ncols;
+  size_t nrows = df->nrows;
+  size_t sel_cols = col_indices ? col_count : ncols;
+  if (sel_cols == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no columns selected");
+    return NULL;
+  }
+
+  if (col_indices && cp_indices_have_duplicates(col_indices, col_count)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "duplicate column indices");
+    return NULL;
+  }
+
+  CpDType *dtypes = (CpDType *)malloc(sel_cols * sizeof(CpDType));
+  const char **names = (const char **)malloc(sel_cols * sizeof(const char *));
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(sel_cols * sizeof(const CpSeries *));
+  if (!dtypes || !names || !src_cols) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  if (col_indices) {
+    for (size_t i = 0; i < sel_cols; ++i) {
+      if (col_indices[i] >= ncols) {
+        free(dtypes);
+        free(names);
+        free(src_cols);
+        cp_error_set(err, CP_ERR_INVALID, 0, col_indices[i],
+                     "column index out of range");
+        return NULL;
+      }
+      const CpSeries *series = df->cols[col_indices[i]];
+      dtypes[i] = series->dtype;
+      names[i] = series->name;
+      src_cols[i] = series;
+    }
+  } else {
+    for (size_t i = 0; i < sel_cols; ++i) {
+      dtypes[i] = df->cols[i]->dtype;
+      names[i] = df->cols[i]->name;
+      src_cols[i] = df->cols[i];
+    }
+  }
+
+  size_t out_rows = row_indices ? row_count : nrows;
+  CpDataFrame *out = cp_df_create(sel_cols, names, dtypes, out_rows, err);
+  if (!out) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    return NULL;
+  }
+
+  if (row_indices) {
+    for (size_t i = 0; i < row_count; ++i) {
+      size_t row = row_indices[i];
+      if (row >= nrows) {
+        cp_error_set(err, CP_ERR_INVALID, row, 0, "row index out of range");
+        cp_df_free(out);
+        out = NULL;
+        break;
+      }
+      if (!cp_df_append_row_from_sources(out, src_cols, sel_cols, row, err)) {
+        cp_df_free(out);
+        out = NULL;
+        break;
+      }
+    }
+  } else {
+    for (size_t row = 0; row < nrows; ++row) {
+      if (!cp_df_append_row_from_sources(out, src_cols, sel_cols, row, err)) {
+        cp_df_free(out);
+        out = NULL;
+        break;
+      }
+    }
+  }
+
+  free(dtypes);
+  free(names);
+  free(src_cols);
+  return out;
+}
+
+CpDataFrame *cp_df_loc(const CpDataFrame *df,
+                       const size_t *row_indices,
+                       size_t row_count,
+                       const char **names,
+                       size_t name_count,
+                       CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (names && name_count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no columns selected");
+    return NULL;
+  }
+
+  size_t *col_indices = NULL;
+  size_t col_count = 0;
+  if (names) {
+    col_count = name_count;
+    col_indices = (size_t *)malloc(name_count * sizeof(size_t));
+    if (!col_indices) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    for (size_t i = 0; i < name_count; ++i) {
+      const CpSeries *series = cp_df_get_col(df, names[i]);
+      if (!series) {
+        free(col_indices);
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+        return NULL;
+      }
+      size_t idx = 0;
+      for (; idx < df->ncols; ++idx) {
+        if (df->cols[idx] == series) {
+          break;
+        }
+      }
+      if (idx >= df->ncols) {
+        free(col_indices);
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+        return NULL;
+      }
+      col_indices[i] = idx;
+    }
+  }
+
+  CpDataFrame *out =
+      cp_df_iloc(df, row_indices, row_count, col_indices, col_count, err);
+  free(col_indices);
+  return out;
+}
+
 CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
                                const char **names,
                                size_t count,

@@ -26,6 +26,7 @@ Data operations
 - Column drop and rename.
 - Row append with type parsing (int64/float64/string).
 - Row filtering by boolean mask.
+- Row/column selection by position and name (`iloc`, `loc`).
 - Sorting by a single column (ascending/descending, nulls last).
 - Sorting by multiple columns.
 - Aggregations (Series-level and DataFrame-level by name/index):
@@ -57,7 +58,6 @@ Implemented from the list
 - Missing value helpers (`isnull`, `dropna`, `fillna`).
 
 Remaining from the list
-- Label/positional indexing (`loc`, `iloc`).
 - Predicate filtering (`df[df["col"] > value]` helpers).
 - Groupby and `agg`.
 - Merging (`pd.merge`).
