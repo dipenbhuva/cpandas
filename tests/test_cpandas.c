@@ -1504,6 +1504,192 @@ static void test_join_inner_left(void) {
   cp_df_free(left);
 }
 
+static void test_pivot_table(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"region", "quarter", "sales"};
+  CpDType dtypes[] = {CP_DTYPE_STRING, CP_DTYPE_STRING, CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *r1[] = {"East", "Q1", "10"};
+  const char *r2[] = {"East", "Q2", "20"};
+  const char *r3[] = {"West", "Q1", "5"};
+  const char *r4[] = {"West", "Q2", "15"};
+  const char *r5[] = {"West", "Q2", "5"};
+  const char *r6[] = {"East", "Q3", ""};
+  const char *r7[] = {"", "Q1", "7"};
+  const char *r8[] = {"East", "", "9"};
+  CHECK(cp_df_append_row(df, r1, 3, &err));
+  CHECK(cp_df_append_row(df, r2, 3, &err));
+  CHECK(cp_df_append_row(df, r3, 3, &err));
+  CHECK(cp_df_append_row(df, r4, 3, &err));
+  CHECK(cp_df_append_row(df, r5, 3, &err));
+  CHECK(cp_df_append_row(df, r6, 3, &err));
+  CHECK(cp_df_append_row(df, r7, 3, &err));
+  CHECK(cp_df_append_row(df, r8, 3, &err));
+
+  CpDataFrame *pivot = cp_df_pivot_table(df, "region", "quarter", "sales", CP_AGG_SUM, &err);
+  CHECK(pivot != NULL);
+  if (pivot) {
+    CHECK(cp_df_nrows(pivot) == 2);
+    CHECK(cp_df_ncols(pivot) == 4);
+
+    const CpSeries *region = cp_df_get_col(pivot, "region");
+    const CpSeries *q1 = cp_df_get_col(pivot, "Q1");
+    const CpSeries *q2 = cp_df_get_col(pivot, "Q2");
+    const CpSeries *q3 = cp_df_get_col(pivot, "Q3");
+    CHECK(region && q1 && q2 && q3);
+
+    const char *region_val = NULL;
+    int64_t i64_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(region, 0, &region_val, &is_null));
+    CHECK(!is_null && strcmp(region_val, "East") == 0);
+    CHECK(cp_series_get_int64(q1, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 10);
+    CHECK(cp_series_get_int64(q2, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 20);
+    CHECK(cp_series_get_int64(q3, 0, &i64_val, &is_null));
+    CHECK(is_null);
+
+    CHECK(cp_series_get_string(region, 1, &region_val, &is_null));
+    CHECK(!is_null && strcmp(region_val, "West") == 0);
+    CHECK(cp_series_get_int64(q1, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 5);
+    CHECK(cp_series_get_int64(q2, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 20);
+    CHECK(cp_series_get_int64(q3, 1, &i64_val, &is_null));
+    CHECK(is_null);
+  }
+
+  if (pivot) {
+    cp_df_free(pivot);
+  }
+  cp_df_free(df);
+
+  cp_error_clear(&err);
+  const char *names2[] = {"id", "metric", "value"};
+  CpDType dtypes2[] = {CP_DTYPE_INT64, CP_DTYPE_INT64, CP_DTYPE_FLOAT64};
+  CpDataFrame *df2 = cp_df_create(3, names2, dtypes2, 0, &err);
+  CHECK(df2 != NULL);
+  if (!df2) {
+    return;
+  }
+
+  const char *v1[] = {"1", "100", "1.0"};
+  const char *v2[] = {"1", "200", "3.0"};
+  const char *v3[] = {"1", "100", "5.0"};
+  const char *v4[] = {"2", "100", "6.0"};
+  const char *v5[] = {"2", "200", ""};
+  CHECK(cp_df_append_row(df2, v1, 3, &err));
+  CHECK(cp_df_append_row(df2, v2, 3, &err));
+  CHECK(cp_df_append_row(df2, v3, 3, &err));
+  CHECK(cp_df_append_row(df2, v4, 3, &err));
+  CHECK(cp_df_append_row(df2, v5, 3, &err));
+
+  CpDataFrame *pivot2 = cp_df_pivot_table(df2, "id", "metric", "value", CP_AGG_MEAN, &err);
+  CHECK(pivot2 != NULL);
+  if (pivot2) {
+    CHECK(cp_df_nrows(pivot2) == 2);
+    CHECK(cp_df_ncols(pivot2) == 3);
+
+    const CpSeries *id = cp_df_get_col(pivot2, "id");
+    const CpSeries *c100 = cp_df_get_col(pivot2, "100");
+    const CpSeries *c200 = cp_df_get_col(pivot2, "200");
+    CHECK(id && c100 && c200);
+
+    int is_null = 0;
+    int64_t id_val = 0;
+    double mean_val = 0.0;
+
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_float64(c100, 0, &mean_val, &is_null));
+    CHECK(!is_null && fabs(mean_val - 3.0) < 1e-9);
+    CHECK(cp_series_get_float64(c200, 0, &mean_val, &is_null));
+    CHECK(!is_null && fabs(mean_val - 3.0) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_float64(c100, 1, &mean_val, &is_null));
+    CHECK(!is_null && fabs(mean_val - 6.0) < 1e-9);
+    CHECK(cp_series_get_float64(c200, 1, &mean_val, &is_null));
+    CHECK(is_null);
+  }
+
+  if (pivot2) {
+    cp_df_free(pivot2);
+  }
+  cp_df_free(df2);
+
+  cp_error_clear(&err);
+  const char *names3[] = {"group", "metric", "label"};
+  CpDType dtypes3[] = {CP_DTYPE_INT64, CP_DTYPE_INT64, CP_DTYPE_STRING};
+  CpDataFrame *df3 = cp_df_create(3, names3, dtypes3, 0, &err);
+  CHECK(df3 != NULL);
+  if (!df3) {
+    return;
+  }
+
+  const char *c1[] = {"1", "10", "A"};
+  const char *c2[] = {"1", "10", ""};
+  const char *c3[] = {"1", "20", "B"};
+  const char *c4[] = {"2", "10", "C"};
+  CHECK(cp_df_append_row(df3, c1, 3, &err));
+  CHECK(cp_df_append_row(df3, c2, 3, &err));
+  CHECK(cp_df_append_row(df3, c3, 3, &err));
+  CHECK(cp_df_append_row(df3, c4, 3, &err));
+
+  CpDataFrame *pivot3 = cp_df_pivot_table(df3, "group", "metric", "label", CP_AGG_COUNT, &err);
+  CHECK(pivot3 != NULL);
+  if (pivot3) {
+    CHECK(cp_df_nrows(pivot3) == 2);
+    CHECK(cp_df_ncols(pivot3) == 3);
+
+    const CpSeries *group = cp_df_get_col(pivot3, "group");
+    const CpSeries *c10 = cp_df_get_col(pivot3, "10");
+    const CpSeries *c20 = cp_df_get_col(pivot3, "20");
+    CHECK(group && c10 && c20);
+
+    int is_null = 0;
+    int64_t group_val = 0;
+    int64_t count_val = 0;
+
+    CHECK(cp_series_get_int64(group, 0, &group_val, &is_null));
+    CHECK(!is_null && group_val == 1);
+    CHECK(cp_series_get_int64(c10, 0, &count_val, &is_null));
+    CHECK(!is_null && count_val == 1);
+    CHECK(cp_series_get_int64(c20, 0, &count_val, &is_null));
+    CHECK(!is_null && count_val == 1);
+
+    CHECK(cp_series_get_int64(group, 1, &group_val, &is_null));
+    CHECK(!is_null && group_val == 2);
+    CHECK(cp_series_get_int64(c10, 1, &count_val, &is_null));
+    CHECK(!is_null && count_val == 1);
+    CHECK(cp_series_get_int64(c20, 1, &count_val, &is_null));
+    CHECK(!is_null && count_val == 0);
+  }
+
+  if (pivot3) {
+    cp_df_free(pivot3);
+  }
+
+  cp_error_clear(&err);
+  CpDataFrame *bad = cp_df_pivot_table(df3, "group", "metric", "label", CP_AGG_SUM, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+  if (bad) {
+    cp_df_free(bad);
+  }
+  cp_df_free(df3);
+}
+
 static void test_predicate_filters(void) {
   CpError err;
   cp_error_clear(&err);
@@ -1627,6 +1813,7 @@ int main(void) {
   test_loc_iloc();
   test_groupby_agg();
   test_join_inner_left();
+  test_pivot_table();
   test_predicate_filters();
 
   if (tests_failed != 0) {
