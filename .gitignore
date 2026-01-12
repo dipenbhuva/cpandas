@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Compiler outputs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+
+# Misc
+*.log
+*.tmp
