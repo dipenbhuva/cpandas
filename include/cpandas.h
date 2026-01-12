@@ -69,6 +69,11 @@ CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
                                const char *name,
                                int ascending,
                                CpError *err);
+CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
+                                     const char **names,
+                                     size_t count,
+                                     const int *ascending,
+                                     CpError *err);
 
 int cp_df_append_row(CpDataFrame *df,
                      const char **values,
