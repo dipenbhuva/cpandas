@@ -40,6 +40,11 @@ typedef enum {
   CP_AGG_MAX = 4
 } CpAggOp;
 
+typedef enum {
+  CP_JOIN_INNER = 0,
+  CP_JOIN_LEFT = 1
+} CpJoinType;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -100,6 +105,12 @@ CpDataFrame *cp_df_groupby_agg(const CpDataFrame *df,
                                const CpAggOp *ops,
                                size_t count,
                                CpError *err);
+CpDataFrame *cp_df_join(const CpDataFrame *left,
+                        const CpDataFrame *right,
+                        const char *left_key,
+                        const char *right_key,
+                        CpJoinType how,
+                        CpError *err);
 int cp_df_mask_int64(const CpDataFrame *df,
                      const char *name,
                      CpCompareOp op,

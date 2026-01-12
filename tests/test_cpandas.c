@@ -1362,6 +1362,148 @@ static void test_groupby_agg(void) {
   cp_df_free(df2);
 }
 
+static void test_join_inner_left(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *left_names[] = {"id", "name", "score"};
+  CpDType left_types[] = {CP_DTYPE_INT64, CP_DTYPE_STRING, CP_DTYPE_FLOAT64};
+  CpDataFrame *left = cp_df_create(3, left_names, left_types, 0, &err);
+  CHECK(left != NULL);
+  if (!left) {
+    return;
+  }
+
+  const char *l0[] = {"1", "Ann", "1.0"};
+  const char *l1[] = {"2", "Bob", "2.0"};
+  const char *l2[] = {"2", "Beth", "2.5"};
+  const char *l3[] = {"3", "Cid", "3.0"};
+  const char *l4[] = {"", "NullKey", "4.0"};
+  const char *l5[] = {"4", "Dan", "4.5"};
+  CHECK(cp_df_append_row(left, l0, 3, &err));
+  CHECK(cp_df_append_row(left, l1, 3, &err));
+  CHECK(cp_df_append_row(left, l2, 3, &err));
+  CHECK(cp_df_append_row(left, l3, 3, &err));
+  CHECK(cp_df_append_row(left, l4, 3, &err));
+  CHECK(cp_df_append_row(left, l5, 3, &err));
+
+  const char *right_names[] = {"id", "city", "score"};
+  CpDType right_types[] = {CP_DTYPE_INT64, CP_DTYPE_STRING, CP_DTYPE_FLOAT64};
+  CpDataFrame *right = cp_df_create(3, right_names, right_types, 0, &err);
+  CHECK(right != NULL);
+  if (!right) {
+    cp_df_free(left);
+    return;
+  }
+
+  const char *r0[] = {"1", "NY", "10.0"};
+  const char *r1[] = {"2", "SF", "20.0"};
+  const char *r2[] = {"2", "LA", "21.0"};
+  const char *r3[] = {"5", "TX", "50.0"};
+  const char *r4[] = {"", "NA", "99.0"};
+  const char *r5[] = {"3", "SEA", ""};
+  CHECK(cp_df_append_row(right, r0, 3, &err));
+  CHECK(cp_df_append_row(right, r1, 3, &err));
+  CHECK(cp_df_append_row(right, r2, 3, &err));
+  CHECK(cp_df_append_row(right, r3, 3, &err));
+  CHECK(cp_df_append_row(right, r4, 3, &err));
+  CHECK(cp_df_append_row(right, r5, 3, &err));
+
+  CpDataFrame *inner = cp_df_join(left, right, "id", "id", CP_JOIN_INNER, &err);
+  CHECK(inner != NULL);
+  if (inner) {
+    CHECK(cp_df_nrows(inner) == 6);
+    CHECK(cp_df_ncols(inner) == 5);
+
+    const CpSeries *id = cp_df_get_col(inner, "id");
+    const CpSeries *name = cp_df_get_col(inner, "name");
+    const CpSeries *score = cp_df_get_col(inner, "score");
+    const CpSeries *city = cp_df_get_col(inner, "city");
+    const CpSeries *score_right = cp_df_get_col(inner, "score_right");
+    CHECK(id && name && score && city && score_right);
+
+    int is_null = 0;
+    int64_t id_val = 0;
+    double f64_val = 0.0;
+    const char *str_val = NULL;
+
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_string(city, 0, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "NY") == 0);
+    CHECK(cp_series_get_float64(score_right, 0, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 10.0) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_string(city, 1, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "SF") == 0);
+    CHECK(cp_series_get_float64(score_right, 1, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 20.0) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_string(city, 2, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "LA") == 0);
+    CHECK(cp_series_get_float64(score_right, 2, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 21.0) < 1e-9);
+
+    CHECK(cp_series_get_int64(id, 5, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+    CHECK(cp_series_get_string(city, 5, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "SEA") == 0);
+    CHECK(cp_series_get_float64(score_right, 5, &f64_val, &is_null));
+    CHECK(is_null);
+
+    CHECK(cp_series_get_string(name, 0, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "Ann") == 0);
+    CHECK(cp_series_get_float64(score, 0, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 1.0) < 1e-9);
+  }
+
+  CpDataFrame *left_join = cp_df_join(left, right, "id", "id", CP_JOIN_LEFT, &err);
+  CHECK(left_join != NULL);
+  if (left_join) {
+    CHECK(cp_df_nrows(left_join) == 8);
+
+    const CpSeries *id = cp_df_get_col(left_join, "id");
+    const CpSeries *name = cp_df_get_col(left_join, "name");
+    const CpSeries *city = cp_df_get_col(left_join, "city");
+    const CpSeries *score_right = cp_df_get_col(left_join, "score_right");
+    CHECK(id && name && city && score_right);
+
+    int is_null = 0;
+    int64_t id_val = 0;
+    const char *str_val = NULL;
+    double f64_val = 0.0;
+
+    CHECK(cp_series_get_int64(id, 6, &id_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_string(name, 6, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "NullKey") == 0);
+    CHECK(cp_series_get_string(city, 6, &str_val, &is_null));
+    CHECK(is_null);
+
+    CHECK(cp_series_get_int64(id, 7, &id_val, &is_null));
+    CHECK(!is_null && id_val == 4);
+    CHECK(cp_series_get_string(name, 7, &str_val, &is_null));
+    CHECK(!is_null && strcmp(str_val, "Dan") == 0);
+    CHECK(cp_series_get_string(city, 7, &str_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_float64(score_right, 7, &f64_val, &is_null));
+    CHECK(is_null);
+  }
+
+  if (inner) {
+    cp_df_free(inner);
+  }
+  if (left_join) {
+    cp_df_free(left_join);
+  }
+  cp_df_free(right);
+  cp_df_free(left);
+}
+
 static void test_predicate_filters(void) {
   CpError err;
   cp_error_clear(&err);
@@ -1484,6 +1626,7 @@ int main(void) {
   test_info_describe();
   test_loc_iloc();
   test_groupby_agg();
+  test_join_inner_left();
   test_predicate_filters();
 
   if (tests_failed != 0) {
