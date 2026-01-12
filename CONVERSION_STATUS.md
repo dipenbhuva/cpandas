@@ -32,6 +32,7 @@ Data operations
 - Sorting by multiple columns.
 - Groupby aggregation by key column (int64/string) with count/sum/mean/min/max.
 - Joins (inner/left) on a single key column with basic name disambiguation.
+- Pivot tables (single index/column/value with count/sum/mean/min/max).
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -61,9 +62,10 @@ Implemented from the list
 - Missing value helpers (`isnull`, `dropna`, `fillna`).
 - Groupby and `agg`.
 - Merging (`pd.merge`).
+- Pivot tables.
 
 Remaining from the list
-- Pivot tables.
+None from the GeeksforGeeks list.
 
 ## Remaining / Not Yet Implemented
 
@@ -95,7 +97,7 @@ Interop and parity
 
 Advanced pandas features
 - Time series APIs.
-- Pivot tables.
+- Multi-index pivot tables and margins.
 - Advanced indexing (multi-index, label-based slices).
 
 ## Notes

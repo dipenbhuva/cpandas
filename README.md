@@ -9,6 +9,7 @@ functionality with a low-level, performance-oriented API.
 - Typed columns: int64, float64, string.
 - CSV read/write with header support.
 - Aggregations: count, sum, mean, min, max (Series and DataFrame helpers).
+- Joins (inner/left) and pivot tables.
 - Tests and a simple benchmark target.
 
 ## Build
