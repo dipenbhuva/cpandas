@@ -1,0 +1,1893 @@
+#include "cpandas.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct CpSeries {
+  char *name;
+  CpDType dtype;
+  size_t length;
+  size_t capacity;
+  unsigned char *is_null;
+  union {
+    int64_t *i64;
+    double *f64;
+    char **str;
+  } data;
+};
+
+struct CpDataFrame {
+  size_t ncols;
+  size_t nrows;
+  CpSeries **cols;
+};
+
+static void cp_error_set(CpError *err,
+                         CpErrCode code,
+                         size_t row,
+                         size_t col,
+                         const char *fmt,
+                         ...) {
+  if (!err) {
+    return;
+  }
+  err->code = code;
+  err->row = row;
+  err->col = col;
+  if (fmt && fmt[0] != '\0') {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(err->message, sizeof(err->message), fmt, args);
+    va_end(args);
+  } else {
+    err->message[0] = '\0';
+  }
+}
+
+void cp_error_clear(CpError *err) {
+  if (!err) {
+    return;
+  }
+  err->code = CP_OK;
+  err->row = 0;
+  err->col = 0;
+  err->message[0] = '\0';
+}
+
+static char *cp_strndup(const char *s, size_t len) {
+  char *out = (char *)malloc(len + 1);
+  if (!out) {
+    return NULL;
+  }
+  if (len > 0) {
+    memcpy(out, s, len);
+  }
+  out[len] = '\0';
+  return out;
+}
+
+static char *cp_strdup(const char *s) {
+  if (!s) {
+    return NULL;
+  }
+  return cp_strndup(s, strlen(s));
+}
+
+static int cp_series_reserve(CpSeries *s, size_t needed, CpError *err) {
+  if (needed <= s->capacity) {
+    return 1;
+  }
+  size_t new_cap = s->capacity == 0 ? 16 : s->capacity;
+  while (new_cap < needed) {
+    new_cap *= 2;
+  }
+
+  unsigned char *new_nulls =
+      (unsigned char *)realloc(s->is_null, new_cap * sizeof(unsigned char));
+  if (!new_nulls) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  if (new_cap > s->capacity) {
+    memset(new_nulls + s->capacity, 0, new_cap - s->capacity);
+  }
+  s->is_null = new_nulls;
+
+  switch (s->dtype) {
+    case CP_DTYPE_INT64: {
+      int64_t *new_data =
+          (int64_t *)realloc(s->data.i64, new_cap * sizeof(int64_t));
+      if (!new_data) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return 0;
+      }
+      s->data.i64 = new_data;
+      break;
+    }
+    case CP_DTYPE_FLOAT64: {
+      double *new_data =
+          (double *)realloc(s->data.f64, new_cap * sizeof(double));
+      if (!new_data) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return 0;
+      }
+      s->data.f64 = new_data;
+      break;
+    }
+    case CP_DTYPE_STRING: {
+      char **new_data = (char **)realloc(s->data.str, new_cap * sizeof(char *));
+      if (!new_data) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return 0;
+      }
+      if (new_cap > s->capacity) {
+        memset(new_data + s->capacity, 0,
+               (new_cap - s->capacity) * sizeof(char *));
+      }
+      s->data.str = new_data;
+      break;
+    }
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+      return 0;
+  }
+
+  s->capacity = new_cap;
+  return 1;
+}
+
+static void cp_series_free(CpSeries *s) {
+  if (!s) {
+    return;
+  }
+  free(s->name);
+  if (s->dtype == CP_DTYPE_STRING && s->data.str) {
+    for (size_t i = 0; i < s->length; ++i) {
+      free(s->data.str[i]);
+    }
+  }
+  free(s->data.str);
+  free(s->is_null);
+  free(s);
+}
+
+static CpSeries *cp_series_create(const char *name,
+                                  CpDType dtype,
+                                  size_t capacity,
+                                  CpError *err) {
+  CpSeries *s = (CpSeries *)calloc(1, sizeof(CpSeries));
+  if (!s) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  s->name = cp_strdup(name ? name : "");
+  if (!s->name) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    cp_series_free(s);
+    return NULL;
+  }
+  s->dtype = dtype;
+  s->length = 0;
+  s->capacity = 0;
+  s->is_null = NULL;
+  s->data.str = NULL;
+
+  if (capacity > 0) {
+    if (!cp_series_reserve(s, capacity, err)) {
+      cp_series_free(s);
+      return NULL;
+    }
+  }
+
+  return s;
+}
+
+static int cp_series_append_int64(CpSeries *s,
+                                  int64_t value,
+                                  int is_null,
+                                  CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_INT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  if (!cp_series_reserve(s, s->length + 1, err)) {
+    return 0;
+  }
+  s->data.i64[s->length] = value;
+  s->is_null[s->length] = is_null ? 1 : 0;
+  s->length += 1;
+  return 1;
+}
+
+static int cp_series_append_float64(CpSeries *s,
+                                    double value,
+                                    int is_null,
+                                    CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  if (!cp_series_reserve(s, s->length + 1, err)) {
+    return 0;
+  }
+  s->data.f64[s->length] = value;
+  s->is_null[s->length] = is_null ? 1 : 0;
+  s->length += 1;
+  return 1;
+}
+
+static int cp_series_append_string(CpSeries *s,
+                                   const char *value,
+                                   int is_null,
+                                   CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_STRING) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  if (!cp_series_reserve(s, s->length + 1, err)) {
+    return 0;
+  }
+  s->data.str[s->length] = NULL;
+  if (!is_null) {
+    s->data.str[s->length] = cp_strdup(value ? value : "");
+    if (!s->data.str[s->length]) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+  }
+  s->is_null[s->length] = is_null ? 1 : 0;
+  s->length += 1;
+  return 1;
+}
+
+static void cp_series_pop(CpSeries *s) {
+  if (!s || s->length == 0) {
+    return;
+  }
+  size_t idx = s->length - 1;
+  if (s->dtype == CP_DTYPE_STRING) {
+    free(s->data.str[idx]);
+    s->data.str[idx] = NULL;
+  }
+  s->length -= 1;
+}
+
+static int cp_is_blank(const char *s) {
+  if (!s) {
+    return 1;
+  }
+  for (const char *p = s; *p; ++p) {
+    if (!isspace((unsigned char)*p)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int cp_parse_int64(const char *s,
+                          int64_t *out,
+                          int *is_null,
+                          CpError *err,
+                          size_t row,
+                          size_t col) {
+  if (cp_is_blank(s)) {
+    if (out) {
+      *out = 0;
+    }
+    if (is_null) {
+      *is_null = 1;
+    }
+    return 1;
+  }
+  const char *start = s;
+  while (isspace((unsigned char)*start)) {
+    start++;
+  }
+  errno = 0;
+  char *end = NULL;
+  long long value = strtoll(start, &end, 10);
+  if (errno == ERANGE) {
+    cp_error_set(err, CP_ERR_PARSE, row, col, "int64 overflow");
+    return 0;
+  }
+  while (end && isspace((unsigned char)*end)) {
+    end++;
+  }
+  if (!end || *end != '\0') {
+    cp_error_set(err, CP_ERR_PARSE, row, col, "invalid int64 value");
+    return 0;
+  }
+  if (out) {
+    *out = (int64_t)value;
+  }
+  if (is_null) {
+    *is_null = 0;
+  }
+  return 1;
+}
+
+static int cp_parse_float64(const char *s,
+                            double *out,
+                            int *is_null,
+                            CpError *err,
+                            size_t row,
+                            size_t col) {
+  if (cp_is_blank(s)) {
+    if (out) {
+      *out = 0.0;
+    }
+    if (is_null) {
+      *is_null = 1;
+    }
+    return 1;
+  }
+  const char *start = s;
+  while (isspace((unsigned char)*start)) {
+    start++;
+  }
+  errno = 0;
+  char *end = NULL;
+  double value = strtod(start, &end);
+  if (errno == ERANGE) {
+    cp_error_set(err, CP_ERR_PARSE, row, col, "float64 overflow");
+    return 0;
+  }
+  while (end && isspace((unsigned char)*end)) {
+    end++;
+  }
+  if (!end || *end != '\0') {
+    cp_error_set(err, CP_ERR_PARSE, row, col, "invalid float64 value");
+    return 0;
+  }
+  if (out) {
+    *out = value;
+  }
+  if (is_null) {
+    *is_null = 0;
+  }
+  return 1;
+}
+
+static int cp_parse_string(const char *s,
+                           const char **out,
+                           int *is_null) {
+  if (cp_is_blank(s)) {
+    if (out) {
+      *out = NULL;
+    }
+    if (is_null) {
+      *is_null = 1;
+    }
+    return 1;
+  }
+  if (out) {
+    *out = s;
+  }
+  if (is_null) {
+    *is_null = 0;
+  }
+  return 1;
+}
+
+static void cp_free_fields(char **fields, size_t count) {
+  if (!fields) {
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    free(fields[i]);
+  }
+  free(fields);
+}
+
+static int cp_fields_push(char ***fields,
+                          size_t *count,
+                          size_t *capacity,
+                          const char *buf,
+                          size_t len,
+                          CpError *err) {
+  if (*count + 1 > *capacity) {
+    size_t new_cap = *capacity == 0 ? 8 : (*capacity * 2);
+    char **new_fields = (char **)realloc(*fields, new_cap * sizeof(char *));
+    if (!new_fields) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+    *fields = new_fields;
+    *capacity = new_cap;
+  }
+  char *field = cp_strndup(buf, len);
+  if (!field) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  (*fields)[*count] = field;
+  *count += 1;
+  return 1;
+}
+
+static int cp_field_append(char **buf, size_t *len, size_t *cap, char ch) {
+  if (*len + 1 >= *cap) {
+    size_t new_cap = *cap == 0 ? 64 : (*cap * 2);
+    char *new_buf = (char *)realloc(*buf, new_cap);
+    if (!new_buf) {
+      return 0;
+    }
+    *buf = new_buf;
+    *cap = new_cap;
+  }
+  (*buf)[*len] = ch;
+  *len += 1;
+  return 1;
+}
+
+static int cp_parse_csv_line(const char *line,
+                             char delimiter,
+                             char ***out_fields,
+                             size_t *out_count,
+                             CpError *err) {
+  char **fields = NULL;
+  size_t field_count = 0;
+  size_t field_cap = 0;
+
+  size_t i = 0;
+  while (1) {
+    char *field_buf = NULL;
+    size_t field_len = 0;
+    size_t buf_cap = 0;
+
+    if (line[i] == '"') {
+      int closed = 0;
+      i += 1;
+      while (line[i]) {
+        if (line[i] == '"') {
+          if (line[i + 1] == '"') {
+            if (!cp_field_append(&field_buf, &field_len, &buf_cap, '"')) {
+              cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+              free(field_buf);
+              cp_free_fields(fields, field_count);
+              return 0;
+            }
+            i += 2;
+            continue;
+          }
+          i += 1;
+          closed = 1;
+          break;
+        }
+        if (!cp_field_append(&field_buf, &field_len, &buf_cap, line[i])) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          free(field_buf);
+          cp_free_fields(fields, field_count);
+          return 0;
+        }
+        i += 1;
+      }
+      if (!closed) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "unterminated quoted field");
+        free(field_buf);
+        cp_free_fields(fields, field_count);
+        return 0;
+      }
+      if (line[i] && line[i] != delimiter) {
+        while (line[i] && line[i] != delimiter) {
+          if (!isspace((unsigned char)line[i])) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid quoted field");
+            free(field_buf);
+            cp_free_fields(fields, field_count);
+            return 0;
+          }
+          i += 1;
+        }
+      }
+    } else {
+      while (line[i] && line[i] != delimiter) {
+        if (!cp_field_append(&field_buf, &field_len, &buf_cap, line[i])) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          free(field_buf);
+          cp_free_fields(fields, field_count);
+          return 0;
+        }
+        i += 1;
+      }
+    }
+
+    if (!field_buf) {
+      field_buf = (char *)malloc(1);
+      if (!field_buf) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        cp_free_fields(fields, field_count);
+        return 0;
+      }
+    }
+    if (field_len == 0) {
+      field_buf[0] = '\0';
+    } else {
+      field_buf[field_len] = '\0';
+    }
+
+    if (!cp_fields_push(&fields, &field_count, &field_cap, field_buf,
+                        field_len, err)) {
+      free(field_buf);
+      cp_free_fields(fields, field_count);
+      return 0;
+    }
+    free(field_buf);
+
+    if (line[i] == delimiter) {
+      i += 1;
+      continue;
+    }
+    if (line[i] == '\0') {
+      break;
+    }
+  }
+
+  *out_fields = fields;
+  *out_count = field_count;
+  return 1;
+}
+
+static char *cp_read_line(FILE *fp, CpError *err) {
+  size_t cap = 256;
+  size_t len = 0;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  int ch;
+  while ((ch = fgetc(fp)) != EOF) {
+    if (len + 1 >= cap) {
+      size_t new_cap = cap * 2;
+      char *new_buf = (char *)realloc(buf, new_cap);
+      if (!new_buf) {
+        free(buf);
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return NULL;
+      }
+      buf = new_buf;
+      cap = new_cap;
+    }
+    if (ch == '\n') {
+      break;
+    }
+    buf[len++] = (char)ch;
+  }
+  if (ch == EOF && len == 0) {
+    free(buf);
+    return NULL;
+  }
+  if (len > 0 && buf[len - 1] == '\r') {
+    len -= 1;
+  }
+  buf[len] = '\0';
+  return buf;
+}
+
+CpDataFrame *cp_df_create(size_t ncols,
+                          const char **names,
+                          const CpDType *dtypes,
+                          size_t capacity,
+                          CpError *err) {
+  if (ncols == 0 || !names || !dtypes) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe schema");
+    return NULL;
+  }
+  CpDataFrame *df = (CpDataFrame *)calloc(1, sizeof(CpDataFrame));
+  if (!df) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  df->ncols = ncols;
+  df->nrows = 0;
+  df->cols = (CpSeries **)calloc(ncols, sizeof(CpSeries *));
+  if (!df->cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    free(df);
+    return NULL;
+  }
+
+  for (size_t i = 0; i < ncols; ++i) {
+    df->cols[i] = cp_series_create(names[i], dtypes[i], capacity, err);
+    if (!df->cols[i]) {
+      cp_df_free(df);
+      return NULL;
+    }
+  }
+  return df;
+}
+
+void cp_df_free(CpDataFrame *df) {
+  if (!df) {
+    return;
+  }
+  for (size_t i = 0; i < df->ncols; ++i) {
+    cp_series_free(df->cols[i]);
+  }
+  free(df->cols);
+  free(df);
+}
+
+size_t cp_df_nrows(const CpDataFrame *df) {
+  return df ? df->nrows : 0;
+}
+
+size_t cp_df_ncols(const CpDataFrame *df) {
+  return df ? df->ncols : 0;
+}
+
+const CpSeries *cp_df_get_col(const CpDataFrame *df, const char *name) {
+  if (!df || !name) {
+    return NULL;
+  }
+  for (size_t i = 0; i < df->ncols; ++i) {
+    if (df->cols[i] && df->cols[i]->name && strcmp(df->cols[i]->name, name) == 0) {
+      return df->cols[i];
+    }
+  }
+  return NULL;
+}
+
+static const CpSeries *cp_df_require_col(const CpDataFrame *df,
+                                         const char *name,
+                                         CpError *err) {
+  if (!df || !name) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid column");
+    return NULL;
+  }
+  const CpSeries *series = cp_df_get_col(df, name);
+  if (!series) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+    return NULL;
+  }
+  return series;
+}
+
+static const CpSeries *cp_df_require_col_index(const CpDataFrame *df,
+                                               size_t index,
+                                               CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid column index");
+    return NULL;
+  }
+  if (index >= df->ncols) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "column index out of range");
+    return NULL;
+  }
+  if (!df->cols[index]) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+    return NULL;
+  }
+  return df->cols[index];
+}
+
+int cp_df_append_row(CpDataFrame *df,
+                     const char **values,
+                     size_t nvalues,
+                     CpError *err) {
+  if (!df || !values || nvalues != df->ncols) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid row data");
+    return 0;
+  }
+  size_t row = df->nrows;
+  for (size_t i = 0; i < df->ncols; ++i) {
+    CpSeries *col = df->cols[i];
+    int ok = 0;
+    switch (col->dtype) {
+      case CP_DTYPE_INT64: {
+        int64_t v = 0;
+        int is_null = 0;
+        ok = cp_parse_int64(values[i], &v, &is_null, err, row, i);
+        if (ok) {
+          ok = cp_series_append_int64(col, v, is_null, err);
+        }
+        break;
+      }
+      case CP_DTYPE_FLOAT64: {
+        double v = 0.0;
+        int is_null = 0;
+        ok = cp_parse_float64(values[i], &v, &is_null, err, row, i);
+        if (ok) {
+          ok = cp_series_append_float64(col, v, is_null, err);
+        }
+        break;
+      }
+      case CP_DTYPE_STRING: {
+        const char *v = NULL;
+        int is_null = 0;
+        ok = cp_parse_string(values[i], &v, &is_null);
+        if (ok) {
+          ok = cp_series_append_string(col, v, is_null, err);
+        }
+        break;
+      }
+      default:
+        cp_error_set(err, CP_ERR_INVALID, row, i, "unknown dtype");
+        ok = 0;
+        break;
+    }
+    if (!ok) {
+      for (size_t j = 0; j < i; ++j) {
+        cp_series_pop(df->cols[j]);
+      }
+      return 0;
+    }
+  }
+  df->nrows += 1;
+  return 1;
+}
+
+static int cp_is_line_blank(const char *line) {
+  if (!line) {
+    return 1;
+  }
+  return cp_is_blank(line);
+}
+
+static char **cp_make_default_names(size_t ncols, CpError *err) {
+  char **names = (char **)calloc(ncols, sizeof(char *));
+  if (!names) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  for (size_t i = 0; i < ncols; ++i) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "col%zu", i);
+    names[i] = cp_strdup(buf);
+    if (!names[i]) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      for (size_t j = 0; j < i; ++j) {
+        free(names[j]);
+      }
+      free(names);
+      return NULL;
+    }
+  }
+  return names;
+}
+
+CpDataFrame *cp_df_read_csv(const char *path,
+                            char delimiter,
+                            int has_header,
+                            const CpDType *dtypes,
+                            size_t dtype_count,
+                            CpError *err) {
+  if (!path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
+    return NULL;
+  }
+  FILE *fp = fopen(path, "r");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return NULL;
+  }
+
+  char *line = NULL;
+  while ((line = cp_read_line(fp, err)) != NULL) {
+    if (!cp_is_line_blank(line)) {
+      break;
+    }
+    free(line);
+  }
+
+  if (!line) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "empty csv");
+    return NULL;
+  }
+
+  char **fields = NULL;
+  size_t ncols = 0;
+  if (!cp_parse_csv_line(line, delimiter, &fields, &ncols, err)) {
+    free(line);
+    fclose(fp);
+    return NULL;
+  }
+  free(line);
+
+  if (ncols == 0) {
+    cp_free_fields(fields, ncols);
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "no columns found");
+    return NULL;
+  }
+
+  char **col_names = NULL;
+  if (has_header) {
+    col_names = fields;
+  } else {
+    col_names = cp_make_default_names(ncols, err);
+    if (!col_names) {
+      cp_free_fields(fields, ncols);
+      fclose(fp);
+      return NULL;
+    }
+  }
+
+  CpDType *local_dtypes = NULL;
+  if (dtypes) {
+    if (dtype_count != ncols) {
+      if (!has_header) {
+        cp_free_fields(col_names, ncols);
+        cp_free_fields(fields, ncols);
+      } else {
+        cp_free_fields(fields, ncols);
+      }
+      fclose(fp);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype count mismatch");
+      return NULL;
+    }
+  } else {
+    local_dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
+    if (!local_dtypes) {
+      if (!has_header) {
+        cp_free_fields(col_names, ncols);
+        cp_free_fields(fields, ncols);
+      } else {
+        cp_free_fields(fields, ncols);
+      }
+      fclose(fp);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    for (size_t i = 0; i < ncols; ++i) {
+      local_dtypes[i] = CP_DTYPE_STRING;
+    }
+    dtypes = local_dtypes;
+    dtype_count = ncols;
+  }
+
+  const char **name_ptrs = (const char **)col_names;
+  CpDataFrame *df = cp_df_create(ncols, name_ptrs, dtypes, 0, err);
+  if (!df) {
+    if (!has_header) {
+      cp_free_fields(col_names, ncols);
+      cp_free_fields(fields, ncols);
+    } else {
+      cp_free_fields(fields, ncols);
+    }
+    free(local_dtypes);
+    fclose(fp);
+    return NULL;
+  }
+
+  if (has_header) {
+    cp_free_fields(fields, ncols);
+  } else {
+    cp_free_fields(col_names, ncols);
+    const char **row_values = (const char **)fields;
+    if (!cp_df_append_row(df, row_values, ncols, err)) {
+      cp_free_fields(fields, ncols);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    cp_free_fields(fields, ncols);
+  }
+
+  size_t line_no = 1;
+  while ((line = cp_read_line(fp, err)) != NULL) {
+    line_no += 1;
+    if (cp_is_line_blank(line)) {
+      free(line);
+      continue;
+    }
+    char **row_fields = NULL;
+    size_t field_count = 0;
+    if (!cp_parse_csv_line(line, delimiter, &row_fields, &field_count, err)) {
+      free(line);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    free(line);
+
+    if (field_count != ncols) {
+      cp_error_set(err, CP_ERR_PARSE, df->nrows, 0,
+                   "column count mismatch on line %zu", line_no);
+      cp_free_fields(row_fields, field_count);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+
+    const char **row_values = (const char **)row_fields;
+    if (!cp_df_append_row(df, row_values, field_count, err)) {
+      cp_free_fields(row_fields, field_count);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    cp_free_fields(row_fields, field_count);
+  }
+
+  free(local_dtypes);
+  fclose(fp);
+  return df;
+}
+
+static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {
+  int needs_quotes = 0;
+  for (const char *p = s; *p; ++p) {
+    if (*p == delimiter || *p == '"' || *p == '\n' || *p == '\r') {
+      needs_quotes = 1;
+      break;
+    }
+  }
+  if (!needs_quotes) {
+    return fputs(s, fp) >= 0;
+  }
+  if (fputc('"', fp) == EOF) {
+    return 0;
+  }
+  for (const char *p = s; *p; ++p) {
+    if (*p == '"') {
+      if (fputc('"', fp) == EOF) {
+        return 0;
+      }
+    }
+    if (fputc(*p, fp) == EOF) {
+      return 0;
+    }
+  }
+  return fputc('"', fp) != EOF;
+}
+
+int cp_df_write_csv(const CpDataFrame *df,
+                    const char *path,
+                    char delimiter,
+                    int include_header,
+                    CpError *err) {
+  if (!df || !path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return 0;
+  }
+
+  if (include_header) {
+    for (size_t i = 0; i < df->ncols; ++i) {
+      if (i > 0 && fputc(delimiter, fp) == EOF) {
+        cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write header");
+        fclose(fp);
+        return 0;
+      }
+      const char *name = df->cols[i]->name ? df->cols[i]->name : "";
+      if (!cp_write_csv_field(fp, name, delimiter)) {
+        cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write header");
+        fclose(fp);
+        return 0;
+      }
+    }
+    if (fputc('\n', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write header");
+      fclose(fp);
+      return 0;
+    }
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    for (size_t col = 0; col < df->ncols; ++col) {
+      if (col > 0 && fputc(delimiter, fp) == EOF) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write csv");
+        fclose(fp);
+        return 0;
+      }
+      CpSeries *series = df->cols[col];
+      if (series->is_null[row]) {
+        continue;
+      }
+      switch (series->dtype) {
+        case CP_DTYPE_INT64: {
+          if (fprintf(fp, "%" PRId64, series->data.i64[row]) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write csv");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        case CP_DTYPE_FLOAT64: {
+          if (fprintf(fp, "%.17g", series->data.f64[row]) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write csv");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        case CP_DTYPE_STRING: {
+          const char *value = series->data.str[row];
+          if (!value) {
+            break;
+          }
+          if (!cp_write_csv_field(fp, value, delimiter)) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write csv");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
+          fclose(fp);
+          return 0;
+      }
+    }
+    if (fputc('\n', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write csv");
+      fclose(fp);
+      return 0;
+    }
+  }
+
+  fclose(fp);
+  return 1;
+}
+
+const char *cp_series_name(const CpSeries *s) {
+  return s ? s->name : NULL;
+}
+
+CpDType cp_series_dtype(const CpSeries *s) {
+  return s ? s->dtype : CP_DTYPE_STRING;
+}
+
+size_t cp_series_len(const CpSeries *s) {
+  return s ? s->length : 0;
+}
+
+int cp_series_get_int64(const CpSeries *s,
+                        size_t idx,
+                        int64_t *out,
+                        int *is_null) {
+  if (!s || s->dtype != CP_DTYPE_INT64 || idx >= s->length) {
+    return 0;
+  }
+  if (out) {
+    *out = s->data.i64[idx];
+  }
+  if (is_null) {
+    *is_null = s->is_null[idx] ? 1 : 0;
+  }
+  return 1;
+}
+
+int cp_series_get_float64(const CpSeries *s,
+                          size_t idx,
+                          double *out,
+                          int *is_null) {
+  if (!s || s->dtype != CP_DTYPE_FLOAT64 || idx >= s->length) {
+    return 0;
+  }
+  if (out) {
+    *out = s->data.f64[idx];
+  }
+  if (is_null) {
+    *is_null = s->is_null[idx] ? 1 : 0;
+  }
+  return 1;
+}
+
+int cp_series_get_string(const CpSeries *s,
+                         size_t idx,
+                         const char **out,
+                         int *is_null) {
+  if (!s || s->dtype != CP_DTYPE_STRING || idx >= s->length) {
+    return 0;
+  }
+  if (out) {
+    *out = s->data.str[idx];
+  }
+  if (is_null) {
+    *is_null = s->is_null[idx] ? 1 : 0;
+  }
+  return 1;
+}
+
+int cp_series_count(const CpSeries *s, size_t *out, size_t *out_nulls, CpError *err) {
+  if (!s) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid series");
+    return 0;
+  }
+  size_t count = 0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+    } else {
+      count += 1;
+    }
+  }
+  if (out) {
+    *out = count;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_sum_int64(const CpSeries *s,
+                        int64_t *out,
+                        size_t *out_count,
+                        size_t *out_nulls,
+                        CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_INT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  int64_t sum = 0;
+  size_t count = 0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+      continue;
+    }
+    int64_t value = s->data.i64[i];
+    if ((value > 0 && sum > INT64_MAX - value) ||
+        (value < 0 && sum < INT64_MIN - value)) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "int64 sum overflow");
+      return 0;
+    }
+    sum += value;
+    count += 1;
+  }
+  if (out) {
+    *out = sum;
+  }
+  if (out_count) {
+    *out_count = count;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_sum_float64(const CpSeries *s,
+                          double *out,
+                          size_t *out_count,
+                          size_t *out_nulls,
+                          CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  double sum = 0.0;
+  size_t count = 0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+      continue;
+    }
+    sum += s->data.f64[i];
+    count += 1;
+  }
+  if (out) {
+    *out = sum;
+  }
+  if (out_count) {
+    *out_count = count;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_mean(const CpSeries *s,
+                   double *out,
+                   size_t *out_count,
+                   size_t *out_nulls,
+                   CpError *err) {
+  if (!s || (s->dtype != CP_DTYPE_INT64 && s->dtype != CP_DTYPE_FLOAT64)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  double sum = 0.0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (s->dtype == CP_DTYPE_INT64) {
+    for (size_t i = 0; i < s->length; ++i) {
+      if (s->is_null[i]) {
+        nulls += 1;
+        continue;
+      }
+      sum += (double)s->data.i64[i];
+      count += 1;
+    }
+  } else {
+    for (size_t i = 0; i < s->length; ++i) {
+      if (s->is_null[i]) {
+        nulls += 1;
+        continue;
+      }
+      sum += s->data.f64[i];
+      count += 1;
+    }
+  }
+  if (count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "mean of empty series");
+    return 0;
+  }
+  if (out) {
+    *out = sum / (double)count;
+  }
+  if (out_count) {
+    *out_count = count;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_min_int64(const CpSeries *s,
+                        int64_t *out,
+                        size_t *out_nulls,
+                        CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_INT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  int found = 0;
+  int64_t min_val = 0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+      continue;
+    }
+    if (!found) {
+      min_val = s->data.i64[i];
+      found = 1;
+    } else if (s->data.i64[i] < min_val) {
+      min_val = s->data.i64[i];
+    }
+  }
+  if (!found) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "min of empty series");
+    return 0;
+  }
+  if (out) {
+    *out = min_val;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_max_int64(const CpSeries *s,
+                        int64_t *out,
+                        size_t *out_nulls,
+                        CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_INT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  int found = 0;
+  int64_t max_val = 0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+      continue;
+    }
+    if (!found) {
+      max_val = s->data.i64[i];
+      found = 1;
+    } else if (s->data.i64[i] > max_val) {
+      max_val = s->data.i64[i];
+    }
+  }
+  if (!found) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "max of empty series");
+    return 0;
+  }
+  if (out) {
+    *out = max_val;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_min_float64(const CpSeries *s,
+                          double *out,
+                          size_t *out_nulls,
+                          CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  int found = 0;
+  double min_val = 0.0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+      continue;
+    }
+    if (!found) {
+      min_val = s->data.f64[i];
+      found = 1;
+    } else if (s->data.f64[i] < min_val) {
+      min_val = s->data.f64[i];
+    }
+  }
+  if (!found) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "min of empty series");
+    return 0;
+  }
+  if (out) {
+    *out = min_val;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_series_max_float64(const CpSeries *s,
+                          double *out,
+                          size_t *out_nulls,
+                          CpError *err) {
+  if (!s || s->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+    return 0;
+  }
+  int found = 0;
+  double max_val = 0.0;
+  size_t nulls = 0;
+  for (size_t i = 0; i < s->length; ++i) {
+    if (s->is_null[i]) {
+      nulls += 1;
+      continue;
+    }
+    if (!found) {
+      max_val = s->data.f64[i];
+      found = 1;
+    } else if (s->data.f64[i] > max_val) {
+      max_val = s->data.f64[i];
+    }
+  }
+  if (!found) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "max of empty series");
+    return 0;
+  }
+  if (out) {
+    *out = max_val;
+  }
+  if (out_nulls) {
+    *out_nulls = nulls;
+  }
+  return 1;
+}
+
+int cp_df_count(const CpDataFrame *df,
+                const char *name,
+                size_t *out,
+                size_t *out_nulls,
+                CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_count(series, out, out_nulls, err);
+}
+
+int cp_df_sum_int64(const CpDataFrame *df,
+                    const char *name,
+                    int64_t *out,
+                    size_t *out_count,
+                    size_t *out_nulls,
+                    CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_sum_int64(series, out, out_count, out_nulls, err);
+}
+
+int cp_df_sum_float64(const CpDataFrame *df,
+                      const char *name,
+                      double *out,
+                      size_t *out_count,
+                      size_t *out_nulls,
+                      CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_sum_float64(series, out, out_count, out_nulls, err);
+}
+
+int cp_df_mean(const CpDataFrame *df,
+               const char *name,
+               double *out,
+               size_t *out_count,
+               size_t *out_nulls,
+               CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_mean(series, out, out_count, out_nulls, err);
+}
+
+int cp_df_min_int64(const CpDataFrame *df,
+                    const char *name,
+                    int64_t *out,
+                    size_t *out_nulls,
+                    CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_min_int64(series, out, out_nulls, err);
+}
+
+int cp_df_max_int64(const CpDataFrame *df,
+                    const char *name,
+                    int64_t *out,
+                    size_t *out_nulls,
+                    CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_max_int64(series, out, out_nulls, err);
+}
+
+int cp_df_min_float64(const CpDataFrame *df,
+                      const char *name,
+                      double *out,
+                      size_t *out_nulls,
+                      CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_min_float64(series, out, out_nulls, err);
+}
+
+int cp_df_max_float64(const CpDataFrame *df,
+                      const char *name,
+                      double *out,
+                      size_t *out_nulls,
+                      CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_max_float64(series, out, out_nulls, err);
+}
+
+int cp_df_count_at(const CpDataFrame *df,
+                   size_t col_idx,
+                   size_t *out,
+                   size_t *out_nulls,
+                   CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_count(series, out, out_nulls, err);
+}
+
+int cp_df_sum_int64_at(const CpDataFrame *df,
+                       size_t col_idx,
+                       int64_t *out,
+                       size_t *out_count,
+                       size_t *out_nulls,
+                       CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_sum_int64(series, out, out_count, out_nulls, err);
+}
+
+int cp_df_sum_float64_at(const CpDataFrame *df,
+                         size_t col_idx,
+                         double *out,
+                         size_t *out_count,
+                         size_t *out_nulls,
+                         CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_sum_float64(series, out, out_count, out_nulls, err);
+}
+
+int cp_df_mean_at(const CpDataFrame *df,
+                  size_t col_idx,
+                  double *out,
+                  size_t *out_count,
+                  size_t *out_nulls,
+                  CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_mean(series, out, out_count, out_nulls, err);
+}
+
+int cp_df_min_int64_at(const CpDataFrame *df,
+                       size_t col_idx,
+                       int64_t *out,
+                       size_t *out_nulls,
+                       CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_min_int64(series, out, out_nulls, err);
+}
+
+int cp_df_max_int64_at(const CpDataFrame *df,
+                       size_t col_idx,
+                       int64_t *out,
+                       size_t *out_nulls,
+                       CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_max_int64(series, out, out_nulls, err);
+}
+
+int cp_df_min_float64_at(const CpDataFrame *df,
+                         size_t col_idx,
+                         double *out,
+                         size_t *out_nulls,
+                         CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_min_float64(series, out, out_nulls, err);
+}
+
+int cp_df_max_float64_at(const CpDataFrame *df,
+                         size_t col_idx,
+                         double *out,
+                         size_t *out_nulls,
+                         CpError *err) {
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  return cp_series_max_float64(series, out, out_nulls, err);
+}
+
+static int cp_agg_require_out_int64(CpAggInt64 *out, CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "output is required");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_agg_require_out_float64(CpAggFloat64 *out, CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "output is required");
+    return 0;
+  }
+  return 1;
+}
+
+int cp_df_sum_int64_result(const CpDataFrame *df,
+                           const char *name,
+                           CpAggInt64 *out,
+                           CpError *err) {
+  if (!cp_agg_require_out_int64(out, err)) {
+    return 0;
+  }
+  int64_t value = 0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (!cp_df_sum_int64(df, name, &value, &count, &nulls, err)) {
+    return 0;
+  }
+  out->value = value;
+  out->count = count;
+  out->nulls = nulls;
+  return 1;
+}
+
+int cp_df_sum_float64_result(const CpDataFrame *df,
+                             const char *name,
+                             CpAggFloat64 *out,
+                             CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (!cp_df_sum_float64(df, name, &value, &count, &nulls, err)) {
+    return 0;
+  }
+  out->value = value;
+  out->count = count;
+  out->nulls = nulls;
+  return 1;
+}
+
+int cp_df_mean_result(const CpDataFrame *df,
+                      const char *name,
+                      CpAggFloat64 *out,
+                      CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (!cp_df_mean(df, name, &value, &count, &nulls, err)) {
+    return 0;
+  }
+  out->value = value;
+  out->count = count;
+  out->nulls = nulls;
+  return 1;
+}
+
+int cp_df_min_int64_result(const CpDataFrame *df,
+                           const char *name,
+                           CpAggInt64 *out,
+                           CpError *err) {
+  if (!cp_agg_require_out_int64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  int64_t value = 0;
+  size_t nulls = 0;
+  if (!cp_series_min_int64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_max_int64_result(const CpDataFrame *df,
+                           const char *name,
+                           CpAggInt64 *out,
+                           CpError *err) {
+  if (!cp_agg_require_out_int64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  int64_t value = 0;
+  size_t nulls = 0;
+  if (!cp_series_max_int64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_min_float64_result(const CpDataFrame *df,
+                             const char *name,
+                             CpAggFloat64 *out,
+                             CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t nulls = 0;
+  if (!cp_series_min_float64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_max_float64_result(const CpDataFrame *df,
+                             const char *name,
+                             CpAggFloat64 *out,
+                             CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t nulls = 0;
+  if (!cp_series_max_float64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_sum_int64_result_at(const CpDataFrame *df,
+                              size_t col_idx,
+                              CpAggInt64 *out,
+                              CpError *err) {
+  if (!cp_agg_require_out_int64(out, err)) {
+    return 0;
+  }
+  int64_t value = 0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (!cp_df_sum_int64_at(df, col_idx, &value, &count, &nulls, err)) {
+    return 0;
+  }
+  out->value = value;
+  out->count = count;
+  out->nulls = nulls;
+  return 1;
+}
+
+int cp_df_sum_float64_result_at(const CpDataFrame *df,
+                                size_t col_idx,
+                                CpAggFloat64 *out,
+                                CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (!cp_df_sum_float64_at(df, col_idx, &value, &count, &nulls, err)) {
+    return 0;
+  }
+  out->value = value;
+  out->count = count;
+  out->nulls = nulls;
+  return 1;
+}
+
+int cp_df_mean_result_at(const CpDataFrame *df,
+                         size_t col_idx,
+                         CpAggFloat64 *out,
+                         CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t count = 0;
+  size_t nulls = 0;
+  if (!cp_df_mean_at(df, col_idx, &value, &count, &nulls, err)) {
+    return 0;
+  }
+  out->value = value;
+  out->count = count;
+  out->nulls = nulls;
+  return 1;
+}
+
+int cp_df_min_int64_result_at(const CpDataFrame *df,
+                              size_t col_idx,
+                              CpAggInt64 *out,
+                              CpError *err) {
+  if (!cp_agg_require_out_int64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  int64_t value = 0;
+  size_t nulls = 0;
+  if (!cp_series_min_int64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_max_int64_result_at(const CpDataFrame *df,
+                              size_t col_idx,
+                              CpAggInt64 *out,
+                              CpError *err) {
+  if (!cp_agg_require_out_int64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  int64_t value = 0;
+  size_t nulls = 0;
+  if (!cp_series_max_int64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_min_float64_result_at(const CpDataFrame *df,
+                                size_t col_idx,
+                                CpAggFloat64 *out,
+                                CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t nulls = 0;
+  if (!cp_series_min_float64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
+
+int cp_df_max_float64_result_at(const CpDataFrame *df,
+                                size_t col_idx,
+                                CpAggFloat64 *out,
+                                CpError *err) {
+  if (!cp_agg_require_out_float64(out, err)) {
+    return 0;
+  }
+  const CpSeries *series = cp_df_require_col_index(df, col_idx, err);
+  if (!series) {
+    return 0;
+  }
+  double value = 0.0;
+  size_t nulls = 0;
+  if (!cp_series_max_float64(series, &value, &nulls, err)) {
+    return 0;
+  }
+  size_t len = cp_series_len(series);
+  out->value = value;
+  out->nulls = nulls;
+  out->count = len >= nulls ? len - nulls : 0;
+  return 1;
+}
