@@ -34,6 +34,19 @@ CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
                                size_t mask_len,
                                CpError *err);
 
+static const char *cp_dtype_name(CpDType dtype) {
+  switch (dtype) {
+    case CP_DTYPE_INT64:
+      return "int64";
+    case CP_DTYPE_FLOAT64:
+      return "float64";
+    case CP_DTYPE_STRING:
+      return "string";
+    default:
+      return "unknown";
+  }
+}
+
 static void cp_error_set(CpError *err,
                          CpErrCode code,
                          size_t row,
@@ -1251,6 +1264,244 @@ CpDataFrame *cp_df_fillna(const CpDataFrame *df,
   free(fill_i64);
   free(fill_f64);
   free(fill_str);
+  return out;
+}
+
+int cp_df_info(const CpDataFrame *df, FILE *out, CpError *err) {
+  if (!df || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  if (fprintf(out, "DataFrame\n") < 0 ||
+      fprintf(out, "Rows: %zu\n", df->nrows) < 0 ||
+      fprintf(out, "Columns: %zu\n", df->ncols) < 0 ||
+      fprintf(out, "Columns detail:\n") < 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write info");
+    return 0;
+  }
+  for (size_t i = 0; i < df->ncols; ++i) {
+    size_t count = 0;
+    size_t nulls = 0;
+    if (!cp_series_count(df->cols[i], &count, &nulls, err)) {
+      return 0;
+    }
+    if (fprintf(out, "  [%zu] %s (%s) non-null: %zu\n", i,
+                df->cols[i]->name ? df->cols[i]->name : "",
+                cp_dtype_name(df->cols[i]->dtype),
+                count) < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write info");
+      return 0;
+    }
+  }
+  return 1;
+}
+
+CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+
+  size_t numeric_count = 0;
+  for (size_t i = 0; i < df->ncols; ++i) {
+    CpDType dtype = df->cols[i]->dtype;
+    if (dtype == CP_DTYPE_INT64 || dtype == CP_DTYPE_FLOAT64) {
+      numeric_count += 1;
+    }
+  }
+  if (numeric_count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no numeric columns");
+    return NULL;
+  }
+
+  const CpSeries **numeric_cols =
+      (const CpSeries **)malloc(numeric_count * sizeof(const CpSeries *));
+  if (!numeric_cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  size_t idx = 0;
+  for (size_t i = 0; i < df->ncols; ++i) {
+    CpDType dtype = df->cols[i]->dtype;
+    if (dtype == CP_DTYPE_INT64 || dtype == CP_DTYPE_FLOAT64) {
+      numeric_cols[idx++] = df->cols[i];
+    }
+  }
+
+  size_t out_cols = numeric_count + 1;
+  const char **names = (const char **)malloc(out_cols * sizeof(const char *));
+  CpDType *dtypes = (CpDType *)malloc(out_cols * sizeof(CpDType));
+  if (!names || !dtypes) {
+    free(names);
+    free(dtypes);
+    free(numeric_cols);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  names[0] = "stat";
+  dtypes[0] = CP_DTYPE_STRING;
+  for (size_t i = 0; i < numeric_count; ++i) {
+    names[i + 1] = numeric_cols[i]->name;
+    dtypes[i + 1] = CP_DTYPE_FLOAT64;
+  }
+
+  CpDataFrame *out = cp_df_create(out_cols, names, dtypes, 4, err);
+  free(names);
+  free(dtypes);
+  if (!out) {
+    free(numeric_cols);
+    return NULL;
+  }
+
+  double *counts = (double *)calloc(numeric_count, sizeof(double));
+  double *means = (double *)calloc(numeric_count, sizeof(double));
+  double *mins = (double *)calloc(numeric_count, sizeof(double));
+  double *maxs = (double *)calloc(numeric_count, sizeof(double));
+  if (!counts || !means || !mins || !maxs) {
+    free(counts);
+    free(means);
+    free(mins);
+    free(maxs);
+    free(numeric_cols);
+    cp_df_free(out);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < numeric_count; ++i) {
+    const CpSeries *series = numeric_cols[i];
+    size_t count = 0;
+    double sum = 0.0;
+    double min_val = 0.0;
+    double max_val = 0.0;
+    int found = 0;
+    for (size_t row = 0; row < series->length; ++row) {
+      if (series->is_null[row]) {
+        continue;
+      }
+      double value = 0.0;
+      if (series->dtype == CP_DTYPE_INT64) {
+        value = (double)series->data.i64[row];
+      } else {
+        value = series->data.f64[row];
+      }
+      if (!found) {
+        min_val = value;
+        max_val = value;
+        found = 1;
+      } else {
+        if (value < min_val) {
+          min_val = value;
+        }
+        if (value > max_val) {
+          max_val = value;
+        }
+      }
+      sum += value;
+      count += 1;
+    }
+    counts[i] = (double)count;
+    if (count == 0) {
+      means[i] = NAN;
+      mins[i] = NAN;
+      maxs[i] = NAN;
+    } else {
+      means[i] = sum / (double)count;
+      mins[i] = min_val;
+      maxs[i] = max_val;
+    }
+  }
+
+  const char *stat_names[] = {"count", "mean", "min", "max"};
+  for (size_t row = 0; row < 4; ++row) {
+    char **values = (char **)malloc(out_cols * sizeof(char *));
+    char **allocated = (char **)calloc(out_cols, sizeof(char *));
+    if (!values || !allocated) {
+      free(values);
+      free(allocated);
+      free(counts);
+      free(means);
+      free(mins);
+      free(maxs);
+      free(numeric_cols);
+      cp_df_free(out);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+
+    values[0] = (char *)stat_names[row];
+    for (size_t col = 0; col < numeric_count; ++col) {
+      double value = 0.0;
+      switch (row) {
+        case 0:
+          value = counts[col];
+          break;
+        case 1:
+          value = means[col];
+          break;
+        case 2:
+          value = mins[col];
+          break;
+        case 3:
+          value = maxs[col];
+          break;
+        default:
+          value = NAN;
+          break;
+      }
+      char buf[64];
+      if (isnan(value)) {
+        snprintf(buf, sizeof(buf), "nan");
+      } else {
+        snprintf(buf, sizeof(buf), "%.17g", value);
+      }
+      allocated[col + 1] = cp_strdup(buf);
+      if (!allocated[col + 1]) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        for (size_t j = 0; j < out_cols; ++j) {
+          free(allocated[j]);
+        }
+        free(values);
+        free(allocated);
+        free(counts);
+        free(means);
+        free(mins);
+        free(maxs);
+        free(numeric_cols);
+        cp_df_free(out);
+        return NULL;
+      }
+      values[col + 1] = allocated[col + 1];
+    }
+
+    if (!cp_df_append_row(out, (const char **)values, out_cols, err)) {
+      for (size_t j = 0; j < out_cols; ++j) {
+        free(allocated[j]);
+      }
+      free(values);
+      free(allocated);
+      free(counts);
+      free(means);
+      free(mins);
+      free(maxs);
+      free(numeric_cols);
+      cp_df_free(out);
+      return NULL;
+    }
+
+    for (size_t j = 0; j < out_cols; ++j) {
+      free(allocated[j]);
+    }
+    free(values);
+    free(allocated);
+  }
+
+  free(counts);
+  free(means);
+  free(mins);
+  free(maxs);
+  free(numeric_cols);
   return out;
 }
 
