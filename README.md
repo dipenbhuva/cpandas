@@ -33,4 +33,5 @@ ctest --test-dir build
 ## Status
 
 See `CONVERSION_STATUS.md` for a checklist of implemented and remaining
-pandas features.
+pandas features, and `PANDAS_FUNCTIONS_GFG.md` for coverage against the
+GeeksforGeeks pandas functions list.
