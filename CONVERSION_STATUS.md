@@ -32,6 +32,25 @@ Validation and tooling
 - Deterministic CSV roundtrip fuzz test.
 - Simple benchmark target for append and sum throughput.
 
+## GeeksforGeeks Pandas Functions Checklist
+
+Source: https://www.geeksforgeeks.org/pandas/pandas-functions-in-python/
+
+Implemented from the list
+- DataFrame creation (`pd.DataFrame()` -> `cp_df_create`).
+- Column selection (`df["col"]`, `df[["col1", "col2"]]`).
+- Sorting by column (`df.sort_values`).
+
+Remaining from the list
+- Data exploration (`head`, `tail`, `info`, `describe`, `dtypes`).
+- Label/positional indexing (`loc`, `iloc`).
+- Predicate filtering (`df[df["col"] > value]` helpers).
+- Column add/drop/rename.
+- Groupby and `agg`.
+- Missing value helpers (`isnull`, `dropna`, `fillna`).
+- Merging (`pd.merge`).
+- Pivot tables.
+
 ## Remaining / Not Yet Implemented
 
 Core DataFrame operations
