@@ -18,3 +18,4 @@ Testing/
 # Misc
 *.log
 *.tmp
+.DS_Store
