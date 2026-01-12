@@ -31,6 +31,7 @@ Data operations
 - Sorting by a single column (ascending/descending, nulls last).
 - Sorting by multiple columns.
 - Groupby aggregation by key column (int64/string) with count/sum/mean/min/max.
+- Joins (inner/left) on a single key column with basic name disambiguation.
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -59,9 +60,9 @@ Implemented from the list
 - Column drop/rename.
 - Missing value helpers (`isnull`, `dropna`, `fillna`).
 - Groupby and `agg`.
+- Merging (`pd.merge`).
 
 Remaining from the list
-- Merging (`pd.merge`).
 - Pivot tables.
 
 ## Remaining / Not Yet Implemented
@@ -72,7 +73,8 @@ Core DataFrame operations
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
 Joins
-- Joins (inner, left) with key handling.
+- Multi-key joins.
+- Right/outer joins and suffix configuration.
 
 Indexing and missing values
 - Index and index-based operations.

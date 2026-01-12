@@ -414,6 +414,24 @@ static int cp_series_append_string(CpSeries *s,
   return 1;
 }
 
+static int cp_series_append_null(CpSeries *s, CpError *err) {
+  if (!s) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid series");
+    return 0;
+  }
+  switch (s->dtype) {
+    case CP_DTYPE_INT64:
+      return cp_series_append_int64(s, 0, 1, err);
+    case CP_DTYPE_FLOAT64:
+      return cp_series_append_float64(s, 0.0, 1, err);
+    case CP_DTYPE_STRING:
+      return cp_series_append_string(s, NULL, 1, err);
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+      return 0;
+  }
+}
+
 static int cp_series_append_from(CpSeries *dest,
                                  const CpSeries *src,
                                  size_t idx,
@@ -911,6 +929,80 @@ static int cp_names_have_duplicates(const char **names, size_t count) {
     }
   }
   return 0;
+}
+
+static const char *cp_join_unique_name(const char *base,
+                                       const char **existing,
+                                       size_t existing_count,
+                                       int *owned,
+                                       CpError *err) {
+  if (!owned) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid name ownership");
+    return NULL;
+  }
+  *owned = 0;
+  const char *safe = base ? base : "";
+  if (!cp_name_in_list(safe, existing, existing_count)) {
+    return safe;
+  }
+
+  const char *suffix = "_right";
+  size_t attempt = 1;
+  for (;;) {
+    char num_buf[32];
+    if (attempt == 1) {
+      num_buf[0] = '\0';
+    } else {
+      snprintf(num_buf, sizeof(num_buf), "%zu", attempt);
+    }
+    size_t len = strlen(safe) + strlen(suffix) + strlen(num_buf) + 1;
+    char *name = (char *)malloc(len);
+    if (!name) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    snprintf(name, len, "%s%s%s", safe, suffix, num_buf);
+    if (!cp_name_in_list(name, existing, existing_count)) {
+      *owned = 1;
+      return name;
+    }
+    free(name);
+    attempt += 1;
+  }
+}
+
+static int cp_join_key_is_null(const CpSeries *s, size_t row) {
+  if (!s) {
+    return 1;
+  }
+  if (row >= s->length) {
+    return 1;
+  }
+  if (s->is_null[row]) {
+    return 1;
+  }
+  if (s->dtype == CP_DTYPE_STRING && !s->data.str[row]) {
+    return 1;
+  }
+  return 0;
+}
+
+static int cp_join_key_equal(const CpSeries *left_key,
+                             size_t left_row,
+                             const CpSeries *right_key,
+                             size_t right_row) {
+  if (!left_key || !right_key) {
+    return 0;
+  }
+  if (left_key->dtype == CP_DTYPE_INT64) {
+    return left_key->data.i64[left_row] == right_key->data.i64[right_row];
+  }
+  const char *lhs = left_key->data.str[left_row];
+  const char *rhs = right_key->data.str[right_row];
+  if (!lhs || !rhs) {
+    return 0;
+  }
+  return strcmp(lhs, rhs) == 0;
 }
 
 static int cp_agg_output_dtype(const CpSeries *series, CpAggOp op, CpDType *out) {
@@ -2197,6 +2289,284 @@ CpDataFrame *cp_df_groupby_agg(const CpDataFrame *df,
     free(specs[i].name);
   }
   free(specs);
+  return out;
+}
+
+static int cp_join_append_row(CpDataFrame *out,
+                              const CpSeries **sources,
+                              const unsigned char *from_right,
+                              size_t ncols,
+                              size_t left_row,
+                              size_t right_row,
+                              int has_right,
+                              CpError *err) {
+  if (!out || !sources || !from_right) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join row");
+    return 0;
+  }
+  for (size_t col = 0; col < ncols; ++col) {
+    int ok = 0;
+    if (from_right[col]) {
+      if (has_right) {
+        ok = cp_series_append_from(out->cols[col], sources[col], right_row, err);
+      } else {
+        ok = cp_series_append_null(out->cols[col], err);
+      }
+    } else {
+      ok = cp_series_append_from(out->cols[col], sources[col], left_row, err);
+    }
+    if (!ok) {
+      for (size_t j = 0; j < col; ++j) {
+        cp_series_pop(out->cols[j]);
+      }
+      return 0;
+    }
+  }
+  out->nrows += 1;
+  return 1;
+}
+
+CpDataFrame *cp_df_join(const CpDataFrame *left,
+                        const CpDataFrame *right,
+                        const char *left_key,
+                        const char *right_key,
+                        CpJoinType how,
+                        CpError *err) {
+  if (!left || !right || !left_key || !right_key) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join arguments");
+    return NULL;
+  }
+  if (left->ncols == 0 || right->ncols == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "empty schema");
+    return NULL;
+  }
+  if (how != CP_JOIN_INNER && how != CP_JOIN_LEFT) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported join type");
+    return NULL;
+  }
+
+  const CpSeries *left_key_series = cp_df_require_col(left, left_key, err);
+  if (!left_key_series) {
+    return NULL;
+  }
+  const CpSeries *right_key_series = cp_df_require_col(right, right_key, err);
+  if (!right_key_series) {
+    return NULL;
+  }
+
+  if (left_key_series->dtype != right_key_series->dtype) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "join key dtype mismatch");
+    return NULL;
+  }
+  if (left_key_series->dtype != CP_DTYPE_INT64 &&
+      left_key_series->dtype != CP_DTYPE_STRING) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported join key dtype");
+    return NULL;
+  }
+
+  int same_key_name = strcmp(left_key, right_key) == 0;
+  size_t out_cols = left->ncols + right->ncols - (same_key_name ? 1 : 0);
+  if (out_cols == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join schema");
+    return NULL;
+  }
+
+  const char **out_names = (const char **)malloc(out_cols * sizeof(const char *));
+  CpDType *out_dtypes = (CpDType *)malloc(out_cols * sizeof(CpDType));
+  const CpSeries **out_sources =
+      (const CpSeries **)malloc(out_cols * sizeof(const CpSeries *));
+  unsigned char *out_from_right =
+      (unsigned char *)calloc(out_cols, sizeof(unsigned char));
+  unsigned char *name_owned =
+      (unsigned char *)calloc(out_cols, sizeof(unsigned char));
+  if (!out_names || !out_dtypes || !out_sources || !out_from_right || !name_owned) {
+    free(out_names);
+    free(out_dtypes);
+    free(out_sources);
+    free(out_from_right);
+    free(name_owned);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  size_t out_idx = 0;
+  for (size_t i = 0; i < left->ncols; ++i) {
+    out_names[out_idx] = left->cols[i]->name;
+    out_dtypes[out_idx] = left->cols[i]->dtype;
+    out_sources[out_idx] = left->cols[i];
+    out_from_right[out_idx] = 0;
+    out_idx += 1;
+  }
+
+  for (size_t i = 0; i < right->ncols; ++i) {
+    const CpSeries *series = right->cols[i];
+    if (same_key_name && strcmp(series->name, right_key) == 0) {
+      continue;
+    }
+    int owned = 0;
+    const char *name = cp_join_unique_name(series->name,
+                                           out_names,
+                                           out_idx,
+                                           &owned,
+                                           err);
+    if (!name) {
+      for (size_t j = 0; j < out_idx; ++j) {
+        if (name_owned[j]) {
+          free((char *)out_names[j]);
+        }
+      }
+      free(out_names);
+      free(out_dtypes);
+      free(out_sources);
+      free(out_from_right);
+      free(name_owned);
+      return NULL;
+    }
+    out_names[out_idx] = name;
+    out_dtypes[out_idx] = series->dtype;
+    out_sources[out_idx] = series;
+    out_from_right[out_idx] = 1;
+    if (owned) {
+      name_owned[out_idx] = 1;
+    }
+    out_idx += 1;
+  }
+
+  if (out_idx != out_cols) {
+    for (size_t j = 0; j < out_idx; ++j) {
+      if (name_owned[j]) {
+        free((char *)out_names[j]);
+      }
+    }
+    free(out_names);
+    free(out_dtypes);
+    free(out_sources);
+    free(out_from_right);
+    free(name_owned);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "join schema mismatch");
+    return NULL;
+  }
+
+  size_t total_rows = 0;
+  for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
+    if (cp_join_key_is_null(left_key_series, lrow)) {
+      if (how == CP_JOIN_LEFT) {
+        if (total_rows == SIZE_MAX) {
+          cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
+          total_rows = 0;
+          break;
+        }
+        total_rows += 1;
+      }
+      continue;
+    }
+    size_t matches = 0;
+    for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+      if (cp_join_key_is_null(right_key_series, rrow)) {
+        continue;
+      }
+      if (cp_join_key_equal(left_key_series, lrow, right_key_series, rrow)) {
+        matches += 1;
+      }
+    }
+    if (matches == 0) {
+      if (how == CP_JOIN_LEFT) {
+        if (total_rows == SIZE_MAX) {
+          cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
+          total_rows = 0;
+          break;
+        }
+        total_rows += 1;
+      }
+    } else {
+      if (total_rows > SIZE_MAX - matches) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
+        total_rows = 0;
+        break;
+      }
+      total_rows += matches;
+    }
+  }
+
+  CpDataFrame *out = cp_df_create(out_cols, out_names, out_dtypes, total_rows, err);
+  for (size_t j = 0; j < out_cols; ++j) {
+    if (name_owned[j]) {
+      free((char *)out_names[j]);
+    }
+  }
+  free(out_names);
+  free(out_dtypes);
+  free(name_owned);
+
+  if (!out) {
+    free(out_sources);
+    free(out_from_right);
+    return NULL;
+  }
+
+  for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
+    if (cp_join_key_is_null(left_key_series, lrow)) {
+      if (how == CP_JOIN_LEFT) {
+        if (!cp_join_append_row(out,
+                                out_sources,
+                                out_from_right,
+                                out_cols,
+                                lrow,
+                                0,
+                                0,
+                                err)) {
+          cp_df_free(out);
+          out = NULL;
+          break;
+        }
+      }
+      continue;
+    }
+
+    int matched = 0;
+    for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+      if (cp_join_key_is_null(right_key_series, rrow)) {
+        continue;
+      }
+      if (cp_join_key_equal(left_key_series, lrow, right_key_series, rrow)) {
+        matched = 1;
+        if (!cp_join_append_row(out,
+                                out_sources,
+                                out_from_right,
+                                out_cols,
+                                lrow,
+                                rrow,
+                                1,
+                                err)) {
+          cp_df_free(out);
+          out = NULL;
+          break;
+        }
+      }
+    }
+
+    if (!out) {
+      break;
+    }
+
+    if (!matched && how == CP_JOIN_LEFT) {
+      if (!cp_join_append_row(out,
+                              out_sources,
+                              out_from_right,
+                              out_cols,
+                              lrow,
+                              0,
+                              0,
+                              err)) {
+        cp_df_free(out);
+        out = NULL;
+        break;
+      }
+    }
+  }
+
+  free(out_sources);
+  free(out_from_right);
   return out;
 }
 
