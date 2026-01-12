@@ -1221,6 +1221,147 @@ static void test_loc_iloc(void) {
   cp_df_free(df);
 }
 
+static void test_groupby_agg(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"city", "sales", "score"};
+  CpDType dtypes[] = {CP_DTYPE_STRING, CP_DTYPE_INT64, CP_DTYPE_FLOAT64};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"NY", "10", "1.5"};
+  const char *row2[] = {"SF", "5", "2.0"};
+  const char *row3[] = {"NY", "7", "2.5"};
+  const char *row4[] = {"LA", "8", "2.5"};
+  const char *row5[] = {"SF", "", "2.0"};
+  const char *row6[] = {"", "4", "9.0"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+  CHECK(cp_df_append_row(df, row5, 3, &err));
+  CHECK(cp_df_append_row(df, row6, 3, &err));
+
+  const char *value_cols[] = {"sales", "score", "score", "sales"};
+  CpAggOp ops[] = {CP_AGG_SUM, CP_AGG_MEAN, CP_AGG_MAX, CP_AGG_COUNT};
+  CpDataFrame *grouped = cp_df_groupby_agg(df, "city", value_cols, ops, 4, &err);
+  CHECK(grouped != NULL);
+  if (grouped) {
+    CHECK(cp_df_nrows(grouped) == 3);
+    CHECK(cp_df_ncols(grouped) == 5);
+    const CpSeries *city = cp_df_get_col(grouped, "city");
+    const CpSeries *sales_sum = cp_df_get_col(grouped, "sales_sum");
+    const CpSeries *score_mean = cp_df_get_col(grouped, "score_mean");
+    const CpSeries *score_max = cp_df_get_col(grouped, "score_max");
+    const CpSeries *sales_count = cp_df_get_col(grouped, "sales_count");
+    CHECK(city && sales_sum && score_mean && score_max && sales_count);
+
+    const char *city_val = NULL;
+    int64_t i64_val = 0;
+    double f64_val = 0.0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(city, 0, &city_val, &is_null));
+    CHECK(!is_null && strcmp(city_val, "NY") == 0);
+    CHECK(cp_series_get_int64(sales_sum, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 17);
+    CHECK(cp_series_get_float64(score_mean, 0, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 2.0) < 1e-9);
+    CHECK(cp_series_get_float64(score_max, 0, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 2.5) < 1e-9);
+    CHECK(cp_series_get_int64(sales_count, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 2);
+
+    CHECK(cp_series_get_string(city, 1, &city_val, &is_null));
+    CHECK(!is_null && strcmp(city_val, "SF") == 0);
+    CHECK(cp_series_get_int64(sales_sum, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 5);
+    CHECK(cp_series_get_float64(score_mean, 1, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 2.0) < 1e-9);
+    CHECK(cp_series_get_float64(score_max, 1, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 2.0) < 1e-9);
+    CHECK(cp_series_get_int64(sales_count, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 1);
+
+    CHECK(cp_series_get_string(city, 2, &city_val, &is_null));
+    CHECK(!is_null && strcmp(city_val, "LA") == 0);
+    CHECK(cp_series_get_int64(sales_sum, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 8);
+    CHECK(cp_series_get_float64(score_mean, 2, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 2.5) < 1e-9);
+    CHECK(cp_series_get_float64(score_max, 2, &f64_val, &is_null));
+    CHECK(!is_null && fabs(f64_val - 2.5) < 1e-9);
+    CHECK(cp_series_get_int64(sales_count, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 1);
+  }
+
+  if (grouped) {
+    cp_df_free(grouped);
+  }
+
+  cp_error_clear(&err);
+  const char *bad_cols[] = {"city"};
+  CpAggOp bad_ops[] = {CP_AGG_SUM};
+  CpDataFrame *bad = cp_df_groupby_agg(df, "city", bad_cols, bad_ops, 1, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+  if (bad) {
+    cp_df_free(bad);
+  }
+
+  cp_df_free(df);
+
+  cp_error_clear(&err);
+  const char *names2[] = {"group", "value"};
+  CpDType dtypes2[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64};
+  CpDataFrame *df2 = cp_df_create(2, names2, dtypes2, 0, &err);
+  CHECK(df2 != NULL);
+  if (!df2) {
+    return;
+  }
+
+  const char *g1[] = {"1", "2.0"};
+  const char *g2[] = {"1", "4.0"};
+  const char *g3[] = {"2", "6.0"};
+  CHECK(cp_df_append_row(df2, g1, 2, &err));
+  CHECK(cp_df_append_row(df2, g2, 2, &err));
+  CHECK(cp_df_append_row(df2, g3, 2, &err));
+
+  const char *value_cols2[] = {"value"};
+  CpAggOp ops2[] = {CP_AGG_MEAN};
+  CpDataFrame *grouped2 = cp_df_groupby_agg(df2, "group", value_cols2, ops2, 1, &err);
+  CHECK(grouped2 != NULL);
+  if (grouped2) {
+    CHECK(cp_df_nrows(grouped2) == 2);
+    const CpSeries *group = cp_df_get_col(grouped2, "group");
+    const CpSeries *value_mean = cp_df_get_col(grouped2, "value_mean");
+    CHECK(group && value_mean);
+
+    int is_null = 0;
+    int64_t group_val = 0;
+    double mean_val = 0.0;
+
+    CHECK(cp_series_get_int64(group, 0, &group_val, &is_null));
+    CHECK(!is_null && group_val == 1);
+    CHECK(cp_series_get_float64(value_mean, 0, &mean_val, &is_null));
+    CHECK(!is_null && fabs(mean_val - 3.0) < 1e-9);
+
+    CHECK(cp_series_get_int64(group, 1, &group_val, &is_null));
+    CHECK(!is_null && group_val == 2);
+    CHECK(cp_series_get_float64(value_mean, 1, &mean_val, &is_null));
+    CHECK(!is_null && fabs(mean_val - 6.0) < 1e-9);
+  }
+
+  if (grouped2) {
+    cp_df_free(grouped2);
+  }
+  cp_df_free(df2);
+}
+
 static void test_predicate_filters(void) {
   CpError err;
   cp_error_clear(&err);
@@ -1342,6 +1483,7 @@ int main(void) {
   test_isnull_dropna();
   test_info_describe();
   test_loc_iloc();
+  test_groupby_agg();
   test_predicate_filters();
 
   if (tests_failed != 0) {

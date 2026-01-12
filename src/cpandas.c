@@ -47,6 +47,23 @@ static const char *cp_dtype_name(CpDType dtype) {
   }
 }
 
+static const char *cp_agg_op_name(CpAggOp op) {
+  switch (op) {
+    case CP_AGG_COUNT:
+      return "count";
+    case CP_AGG_SUM:
+      return "sum";
+    case CP_AGG_MEAN:
+      return "mean";
+    case CP_AGG_MIN:
+      return "min";
+    case CP_AGG_MAX:
+      return "max";
+    default:
+      return "unknown";
+  }
+}
+
 static void cp_error_set(CpError *err,
                          CpErrCode code,
                          size_t row,
@@ -160,6 +177,24 @@ static int cp_eval_compare_string(const char *lhs,
       return 0;
   }
 }
+
+typedef struct {
+  size_t count;
+  int has_value;
+  int64_t sum_i64;
+  int64_t min_i64;
+  int64_t max_i64;
+  double sum_f64;
+  double min_f64;
+  double max_f64;
+} CpAggState;
+
+typedef struct {
+  const CpSeries *series;
+  CpAggOp op;
+  CpDType out_dtype;
+  char *name;
+} CpAggSpec;
 
 static void cp_error_set(CpError *err,
                          CpErrCode code,
@@ -874,6 +909,29 @@ static int cp_names_have_duplicates(const char **names, size_t count) {
         return 1;
       }
     }
+  }
+  return 0;
+}
+
+static int cp_agg_output_dtype(const CpSeries *series, CpAggOp op, CpDType *out) {
+  if (!series || !out) {
+    return 0;
+  }
+  if (op == CP_AGG_COUNT) {
+    *out = CP_DTYPE_INT64;
+    return 1;
+  }
+  if (op == CP_AGG_MEAN) {
+    *out = CP_DTYPE_FLOAT64;
+    return 1;
+  }
+  if (series->dtype == CP_DTYPE_INT64) {
+    *out = CP_DTYPE_INT64;
+    return 1;
+  }
+  if (series->dtype == CP_DTYPE_FLOAT64) {
+    *out = CP_DTYPE_FLOAT64;
+    return 1;
   }
   return 0;
 }
@@ -1781,6 +1839,364 @@ CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err) {
   free(mins);
   free(maxs);
   free(numeric_cols);
+  return out;
+}
+
+CpDataFrame *cp_df_groupby_agg(const CpDataFrame *df,
+                               const char *key,
+                               const char **value_cols,
+                               const CpAggOp *ops,
+                               size_t count,
+                               CpError *err) {
+  if (!df || !key || !value_cols || !ops || count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid groupby arguments");
+    return NULL;
+  }
+
+  const CpSeries *key_series = cp_df_require_col(df, key, err);
+  if (!key_series) {
+    return NULL;
+  }
+  if (key_series->dtype != CP_DTYPE_INT64 && key_series->dtype != CP_DTYPE_STRING) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported key dtype");
+    return NULL;
+  }
+
+  CpAggSpec *specs = (CpAggSpec *)calloc(count, sizeof(CpAggSpec));
+  if (!specs) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const CpSeries *series = cp_df_require_col(df, value_cols[i], err);
+    if (!series) {
+      free(specs);
+      return NULL;
+    }
+    if (ops[i] != CP_AGG_COUNT &&
+        series->dtype != CP_DTYPE_INT64 &&
+        series->dtype != CP_DTYPE_FLOAT64) {
+      free(specs);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "aggregation requires numeric dtype");
+      return NULL;
+    }
+    CpDType out_dtype = CP_DTYPE_FLOAT64;
+    if (!cp_agg_output_dtype(series, ops[i], &out_dtype)) {
+      free(specs);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid aggregation dtype");
+      return NULL;
+    }
+    const char *op_name = cp_agg_op_name(ops[i]);
+    size_t name_len = strlen(series->name ? series->name : "") + 1 + strlen(op_name) + 1;
+    char *col_name = (char *)malloc(name_len);
+    if (!col_name) {
+      free(specs);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    snprintf(col_name, name_len, "%s_%s", series->name ? series->name : "", op_name);
+    specs[i].series = series;
+    specs[i].op = ops[i];
+    specs[i].out_dtype = out_dtype;
+    specs[i].name = col_name;
+  }
+
+  size_t group_cap = 8;
+  size_t group_count = 0;
+  typedef struct {
+    int64_t key_i64;
+    const char *key_str;
+    CpAggState *states;
+  } CpGroup;
+  CpGroup *groups = (CpGroup *)calloc(group_cap, sizeof(CpGroup));
+  if (!groups) {
+    for (size_t i = 0; i < count; ++i) {
+      free(specs[i].name);
+    }
+    free(specs);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (key_series->is_null[row]) {
+      continue;
+    }
+    int64_t key_i64 = 0;
+    const char *key_str = NULL;
+    if (key_series->dtype == CP_DTYPE_INT64) {
+      key_i64 = key_series->data.i64[row];
+    } else {
+      key_str = key_series->data.str[row];
+      if (!key_str) {
+        continue;
+      }
+    }
+
+    size_t group_idx = group_count;
+    for (size_t g = 0; g < group_count; ++g) {
+      if (key_series->dtype == CP_DTYPE_INT64) {
+        if (groups[g].key_i64 == key_i64) {
+          group_idx = g;
+          break;
+        }
+      } else {
+        if (groups[g].key_str && strcmp(groups[g].key_str, key_str) == 0) {
+          group_idx = g;
+          break;
+        }
+      }
+    }
+
+    if (group_idx == group_count) {
+      if (group_count == group_cap) {
+        size_t new_cap = group_cap * 2;
+        CpGroup *new_groups =
+            (CpGroup *)realloc(groups, new_cap * sizeof(CpGroup));
+        if (!new_groups) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          for (size_t i = 0; i < group_count; ++i) {
+            free(groups[i].states);
+          }
+          free(groups);
+          for (size_t i = 0; i < count; ++i) {
+            free(specs[i].name);
+          }
+          free(specs);
+          return NULL;
+        }
+        memset(new_groups + group_cap, 0, (new_cap - group_cap) * sizeof(CpGroup));
+        groups = new_groups;
+        group_cap = new_cap;
+      }
+      groups[group_idx].states = (CpAggState *)calloc(count, sizeof(CpAggState));
+      if (!groups[group_idx].states) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        for (size_t i = 0; i < group_count; ++i) {
+          free(groups[i].states);
+        }
+        free(groups);
+        for (size_t i = 0; i < count; ++i) {
+          free(specs[i].name);
+        }
+        free(specs);
+        return NULL;
+      }
+      if (key_series->dtype == CP_DTYPE_INT64) {
+        groups[group_idx].key_i64 = key_i64;
+      } else {
+        groups[group_idx].key_str = key_str;
+      }
+      group_count += 1;
+    }
+
+    CpAggState *states = groups[group_idx].states;
+    for (size_t i = 0; i < count; ++i) {
+      const CpSeries *series = specs[i].series;
+      if (series->is_null[row]) {
+        continue;
+      }
+      if (series->dtype == CP_DTYPE_INT64) {
+        int64_t value = series->data.i64[row];
+        if (ops[i] == CP_AGG_COUNT) {
+          states[i].count += 1;
+          continue;
+        }
+        if (ops[i] == CP_AGG_SUM || ops[i] == CP_AGG_MEAN) {
+          if ((value > 0 && states[i].sum_i64 > INT64_MAX - value) ||
+              (value < 0 && states[i].sum_i64 < INT64_MIN - value)) {
+            cp_error_set(err, CP_ERR_INVALID, row, i, "int64 sum overflow");
+            for (size_t g = 0; g < group_count; ++g) {
+              free(groups[g].states);
+            }
+            free(groups);
+            for (size_t j = 0; j < count; ++j) {
+              free(specs[j].name);
+            }
+            free(specs);
+            return NULL;
+          }
+          states[i].sum_i64 += value;
+          states[i].count += 1;
+          states[i].has_value = 1;
+        } else if (ops[i] == CP_AGG_MIN) {
+          if (!states[i].has_value || value < states[i].min_i64) {
+            states[i].min_i64 = value;
+          }
+          states[i].has_value = 1;
+        } else if (ops[i] == CP_AGG_MAX) {
+          if (!states[i].has_value || value > states[i].max_i64) {
+            states[i].max_i64 = value;
+          }
+          states[i].has_value = 1;
+        }
+      } else if (series->dtype == CP_DTYPE_FLOAT64) {
+        double value = series->data.f64[row];
+        if (ops[i] == CP_AGG_COUNT) {
+          states[i].count += 1;
+          continue;
+        }
+        if (ops[i] == CP_AGG_SUM || ops[i] == CP_AGG_MEAN) {
+          states[i].sum_f64 += value;
+          states[i].count += 1;
+          states[i].has_value = 1;
+        } else if (ops[i] == CP_AGG_MIN) {
+          if (!states[i].has_value || value < states[i].min_f64) {
+            states[i].min_f64 = value;
+          }
+          states[i].has_value = 1;
+        } else if (ops[i] == CP_AGG_MAX) {
+          if (!states[i].has_value || value > states[i].max_f64) {
+            states[i].max_f64 = value;
+          }
+          states[i].has_value = 1;
+        }
+      } else if (ops[i] == CP_AGG_COUNT) {
+        states[i].count += 1;
+      }
+    }
+  }
+
+  size_t out_cols = count + 1;
+  const char **names = (const char **)malloc(out_cols * sizeof(const char *));
+  CpDType *dtypes = (CpDType *)malloc(out_cols * sizeof(CpDType));
+  if (!names || !dtypes) {
+    free(names);
+    free(dtypes);
+    for (size_t g = 0; g < group_count; ++g) {
+      free(groups[g].states);
+    }
+    free(groups);
+    for (size_t i = 0; i < count; ++i) {
+      free(specs[i].name);
+    }
+    free(specs);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  names[0] = key_series->name ? key_series->name : "key";
+  dtypes[0] = key_series->dtype;
+  for (size_t i = 0; i < count; ++i) {
+    names[i + 1] = specs[i].name;
+    dtypes[i + 1] = specs[i].out_dtype;
+  }
+
+  CpDataFrame *out = cp_df_create(out_cols, names, dtypes, group_count, err);
+  free(names);
+  free(dtypes);
+  if (!out) {
+    for (size_t g = 0; g < group_count; ++g) {
+      free(groups[g].states);
+    }
+    free(groups);
+    for (size_t i = 0; i < count; ++i) {
+      free(specs[i].name);
+    }
+    free(specs);
+    return NULL;
+  }
+
+  for (size_t g = 0; g < group_count; ++g) {
+    int ok = 1;
+    for (size_t col = 0; col < out_cols; ++col) {
+      CpSeries *dest = out->cols[col];
+      if (col == 0) {
+        if (key_series->dtype == CP_DTYPE_INT64) {
+          ok = cp_series_append_int64(dest, groups[g].key_i64, 0, err);
+        } else {
+          ok = cp_series_append_string(dest, groups[g].key_str, 0, err);
+        }
+      } else {
+        size_t spec_idx = col - 1;
+        CpAggState *state = &groups[g].states[spec_idx];
+        CpAggOp op = specs[spec_idx].op;
+        CpDType out_dtype = specs[spec_idx].out_dtype;
+        if (op == CP_AGG_COUNT) {
+          ok = cp_series_append_int64(dest, (int64_t)state->count, 0, err);
+        } else if (op == CP_AGG_MEAN) {
+          if (state->count == 0) {
+            ok = cp_series_append_float64(dest, 0.0, 1, err);
+          } else {
+            double mean = 0.0;
+            if (specs[spec_idx].series->dtype == CP_DTYPE_INT64) {
+              mean = (double)state->sum_i64 / (double)state->count;
+            } else {
+              mean = state->sum_f64 / (double)state->count;
+            }
+            ok = cp_series_append_float64(dest, mean, 0, err);
+          }
+        } else if (out_dtype == CP_DTYPE_INT64) {
+          if (op == CP_AGG_SUM) {
+            if (state->count == 0) {
+              ok = cp_series_append_int64(dest, 0, 1, err);
+            } else {
+              ok = cp_series_append_int64(dest, state->sum_i64, 0, err);
+            }
+          } else if (op == CP_AGG_MIN) {
+            if (!state->has_value) {
+              ok = cp_series_append_int64(dest, 0, 1, err);
+            } else {
+              ok = cp_series_append_int64(dest, state->min_i64, 0, err);
+            }
+          } else if (op == CP_AGG_MAX) {
+            if (!state->has_value) {
+              ok = cp_series_append_int64(dest, 0, 1, err);
+            } else {
+              ok = cp_series_append_int64(dest, state->max_i64, 0, err);
+            }
+          } else {
+            ok = 0;
+          }
+        } else {
+          if (op == CP_AGG_SUM) {
+            if (state->count == 0) {
+              ok = cp_series_append_float64(dest, 0.0, 1, err);
+            } else {
+              ok = cp_series_append_float64(dest, state->sum_f64, 0, err);
+            }
+          } else if (op == CP_AGG_MIN) {
+            if (!state->has_value) {
+              ok = cp_series_append_float64(dest, 0.0, 1, err);
+            } else {
+              ok = cp_series_append_float64(dest, state->min_f64, 0, err);
+            }
+          } else if (op == CP_AGG_MAX) {
+            if (!state->has_value) {
+              ok = cp_series_append_float64(dest, 0.0, 1, err);
+            } else {
+              ok = cp_series_append_float64(dest, state->max_f64, 0, err);
+            }
+          } else {
+            ok = 0;
+          }
+        }
+      }
+
+      if (!ok) {
+        for (size_t j = 0; j < col; ++j) {
+          cp_series_pop(out->cols[j]);
+        }
+        cp_df_free(out);
+        out = NULL;
+        break;
+      }
+    }
+    if (!out) {
+      break;
+    }
+    out->nrows += 1;
+  }
+
+  for (size_t g = 0; g < group_count; ++g) {
+    free(groups[g].states);
+  }
+  free(groups);
+  for (size_t i = 0; i < count; ++i) {
+    free(specs[i].name);
+  }
+  free(specs);
   return out;
 }
 
