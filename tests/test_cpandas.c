@@ -1135,6 +1135,92 @@ static void test_info_describe(void) {
   cp_df_free(df);
 }
 
+static void test_loc_iloc(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"10", "1.0", "A"};
+  const char *row2[] = {"20", "2.0", "B"};
+  const char *row3[] = {"30", "3.0", "C"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  size_t rows[] = {2, 0};
+  size_t cols[] = {1, 0};
+  CpDataFrame *iloc = cp_df_iloc(df, rows, 2, cols, 2, &err);
+  CHECK(iloc != NULL);
+  if (iloc) {
+    CHECK(cp_df_nrows(iloc) == 2);
+    const CpSeries *score = cp_df_get_col(iloc, "score");
+    const CpSeries *id = cp_df_get_col(iloc, "id");
+    CHECK(score && id);
+
+    double score_val = 0.0;
+    int64_t id_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_float64(score, 0, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 3.0) < 1e-9);
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 30);
+
+    CHECK(cp_series_get_float64(score, 1, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 1.0) < 1e-9);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 10);
+  }
+
+  size_t rows2[] = {1};
+  const char *loc_cols[] = {"name", "id"};
+  CpDataFrame *loc = cp_df_loc(df, rows2, 1, loc_cols, 2, &err);
+  CHECK(loc != NULL);
+  if (loc) {
+    CHECK(cp_df_ncols(loc) == 2);
+    CHECK(cp_df_nrows(loc) == 1);
+    const CpSeries *name = cp_df_get_col(loc, "name");
+    const CpSeries *id = cp_df_get_col(loc, "id");
+    CHECK(name && id);
+
+    const char *name_val = NULL;
+    int64_t id_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "B") == 0);
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 20);
+  }
+
+  cp_error_clear(&err);
+  size_t bad_row[] = {5};
+  CpDataFrame *bad = cp_df_iloc(df, bad_row, 1, NULL, 0, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  const char *bad_cols[] = {"missing"};
+  CpDataFrame *bad_loc = cp_df_loc(df, NULL, 0, bad_cols, 1, &err);
+  CHECK(bad_loc == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (iloc) {
+    cp_df_free(iloc);
+  }
+  if (loc) {
+    cp_df_free(loc);
+  }
+  cp_df_free(df);
+}
+
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
@@ -1150,6 +1236,7 @@ int main(void) {
   test_dtypes_and_rename_drop_fill();
   test_isnull_dropna();
   test_info_describe();
+  test_loc_iloc();
 
   if (tests_failed != 0) {
     fprintf(stderr, "%d test(s) failed\n", tests_failed);

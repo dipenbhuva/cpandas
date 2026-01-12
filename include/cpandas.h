@@ -77,6 +77,18 @@ CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
                                      CpError *err);
 int cp_df_info(const CpDataFrame *df, FILE *out, CpError *err);
 CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err);
+CpDataFrame *cp_df_iloc(const CpDataFrame *df,
+                        const size_t *row_indices,
+                        size_t row_count,
+                        const size_t *col_indices,
+                        size_t col_count,
+                        CpError *err);
+CpDataFrame *cp_df_loc(const CpDataFrame *df,
+                       const size_t *row_indices,
+                       size_t row_count,
+                       const char **names,
+                       size_t name_count,
+                       CpError *err);
 CpDataFrame *cp_df_head(const CpDataFrame *df, size_t n, CpError *err);
 CpDataFrame *cp_df_tail(const CpDataFrame *df, size_t n, CpError *err);
 int cp_df_dtypes(const CpDataFrame *df,
