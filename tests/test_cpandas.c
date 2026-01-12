@@ -1221,6 +1221,111 @@ static void test_loc_iloc(void) {
   cp_df_free(df);
 }
 
+static void test_predicate_filters(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "1.5", "Alice"};
+  const char *row2[] = {"2", "-1.0", "Bob"};
+  const char *row3[] = {"3", "0.0", "Charlie"};
+  const char *row4[] = {"", "2.0", "Bob"};
+  const char *row5[] = {"4", "", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+  CHECK(cp_df_append_row(df, row5, 3, &err));
+
+  uint8_t mask[5] = {0};
+  CHECK(cp_df_mask_int64(df, "id", CP_OP_GT, 2, mask, 5, &err));
+  CHECK(mask[0] == 0);
+  CHECK(mask[1] == 0);
+  CHECK(mask[2] == 1);
+  CHECK(mask[3] == 0);
+  CHECK(mask[4] == 1);
+
+  CpDataFrame *filtered = cp_df_filter_int64(df, "id", CP_OP_GT, 2, &err);
+  CHECK(filtered != NULL);
+  if (filtered) {
+    CHECK(cp_df_nrows(filtered) == 2);
+    const CpSeries *id = cp_df_get_col(filtered, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 3);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 4);
+  }
+
+  uint8_t mask2[5] = {0};
+  CHECK(cp_df_mask_float64(df, "score", CP_OP_LE, 0.0, mask2, 5, &err));
+  CHECK(mask2[0] == 0);
+  CHECK(mask2[1] == 1);
+  CHECK(mask2[2] == 1);
+  CHECK(mask2[3] == 0);
+  CHECK(mask2[4] == 0);
+
+  CpDataFrame *filtered2 = cp_df_filter_float64(df, "score", CP_OP_LE, 0.0, &err);
+  CHECK(filtered2 != NULL);
+  if (filtered2) {
+    CHECK(cp_df_nrows(filtered2) == 2);
+    const CpSeries *name = cp_df_get_col(filtered2, "name");
+    CHECK(name != NULL);
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+    CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Charlie") == 0);
+  }
+
+  CpDataFrame *filtered3 = cp_df_filter_string(df, "name", CP_OP_EQ, "Bob", &err);
+  CHECK(filtered3 != NULL);
+  if (filtered3) {
+    CHECK(cp_df_nrows(filtered3) == 2);
+    const CpSeries *id = cp_df_get_col(filtered3, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(is_null);
+  }
+
+  cp_error_clear(&err);
+  CHECK(!cp_df_mask_int64(df, "score", CP_OP_GT, 1, mask, 5, &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  CHECK(!cp_df_mask_string(df, "name", CP_OP_EQ, NULL, mask, 5, &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  CHECK(!cp_df_mask_float64(df, "score", CP_OP_GT, 1.0, mask, 2, &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (filtered) {
+    cp_df_free(filtered);
+  }
+  if (filtered2) {
+    cp_df_free(filtered2);
+  }
+  if (filtered3) {
+    cp_df_free(filtered3);
+  }
+  cp_df_free(df);
+}
+
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
@@ -1237,6 +1342,7 @@ int main(void) {
   test_isnull_dropna();
   test_info_describe();
   test_loc_iloc();
+  test_predicate_filters();
 
   if (tests_failed != 0) {
     fprintf(stderr, "%d test(s) failed\n", tests_failed);
