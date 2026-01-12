@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -832,6 +833,202 @@ CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
   free(dtypes);
   free(names);
   free(src_cols);
+  return out;
+}
+
+static int cp_compare_int64(int64_t a, int64_t b) {
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+static int cp_compare_float64(double a, double b) {
+  int a_nan = isnan(a);
+  int b_nan = isnan(b);
+  if (a_nan && b_nan) {
+    return 0;
+  }
+  if (a_nan) {
+    return 1;
+  }
+  if (b_nan) {
+    return -1;
+  }
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+static int cp_series_compare_values(const CpSeries *s, size_t a, size_t b) {
+  switch (s->dtype) {
+    case CP_DTYPE_INT64:
+      return cp_compare_int64(s->data.i64[a], s->data.i64[b]);
+    case CP_DTYPE_FLOAT64:
+      return cp_compare_float64(s->data.f64[a], s->data.f64[b]);
+    case CP_DTYPE_STRING: {
+      const char *av = s->data.str[a] ? s->data.str[a] : "";
+      const char *bv = s->data.str[b] ? s->data.str[b] : "";
+      int cmp = strcmp(av, bv);
+      if (cmp < 0) {
+        return -1;
+      }
+      if (cmp > 0) {
+        return 1;
+      }
+      return 0;
+    }
+    default:
+      return 0;
+  }
+}
+
+static int cp_series_compare_dir(const CpSeries *s,
+                                 size_t a,
+                                 size_t b,
+                                 int ascending) {
+  int a_null = s->is_null[a] ? 1 : 0;
+  int b_null = s->is_null[b] ? 1 : 0;
+  if (a_null && b_null) {
+    return 0;
+  }
+  if (a_null) {
+    return 1;
+  }
+  if (b_null) {
+    return -1;
+  }
+  int cmp = cp_series_compare_values(s, a, b);
+  if (cmp == 0) {
+    return 0;
+  }
+  if (ascending) {
+    return cmp;
+  }
+  return -cmp;
+}
+
+static void cp_sort_indices_merge(size_t *indices,
+                                  size_t *tmp,
+                                  size_t left,
+                                  size_t right,
+                                  const CpSeries *series,
+                                  int ascending) {
+  if (right - left <= 1) {
+    return;
+  }
+  size_t mid = left + (right - left) / 2;
+  cp_sort_indices_merge(indices, tmp, left, mid, series, ascending);
+  cp_sort_indices_merge(indices, tmp, mid, right, series, ascending);
+
+  size_t i = left;
+  size_t j = mid;
+  size_t k = left;
+  while (i < mid && j < right) {
+    int cmp = cp_series_compare_dir(series, indices[i], indices[j], ascending);
+    if (cmp <= 0) {
+      tmp[k++] = indices[i++];
+    } else {
+      tmp[k++] = indices[j++];
+    }
+  }
+  while (i < mid) {
+    tmp[k++] = indices[i++];
+  }
+  while (j < right) {
+    tmp[k++] = indices[j++];
+  }
+  for (size_t idx = left; idx < right; ++idx) {
+    indices[idx] = tmp[idx];
+  }
+}
+
+CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
+                               const char *name,
+                               int ascending,
+                               CpError *err) {
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return NULL;
+  }
+  if (series->dtype != CP_DTYPE_INT64 && series->dtype != CP_DTYPE_FLOAT64 &&
+      series->dtype != CP_DTYPE_STRING) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported sort dtype");
+    return NULL;
+  }
+
+  size_t nrows = df->nrows;
+  size_t ncols = df->ncols;
+  size_t *indices = NULL;
+  size_t *tmp = NULL;
+  if (nrows > 0) {
+    indices = (size_t *)malloc(nrows * sizeof(size_t));
+    tmp = (size_t *)malloc(nrows * sizeof(size_t));
+    if (!indices || !tmp) {
+      free(indices);
+      free(tmp);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    for (size_t i = 0; i < nrows; ++i) {
+      indices[i] = i;
+    }
+    if (nrows > 1) {
+      cp_sort_indices_merge(indices, tmp, 0, nrows, series, ascending != 0);
+    }
+  }
+
+  CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
+  const char **names = (const char **)malloc(ncols * sizeof(const char *));
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(ncols * sizeof(const CpSeries *));
+  if (!dtypes || !names || !src_cols) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    free(indices);
+    free(tmp);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < ncols; ++i) {
+    src_cols[i] = df->cols[i];
+    names[i] = df->cols[i]->name;
+    dtypes[i] = df->cols[i]->dtype;
+  }
+
+  CpDataFrame *out = cp_df_create(ncols, names, dtypes, nrows, err);
+  if (!out) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    free(indices);
+    free(tmp);
+    return NULL;
+  }
+
+  for (size_t pos = 0; pos < nrows; ++pos) {
+    size_t row = indices ? indices[pos] : pos;
+    if (!cp_df_append_row_from_sources(out, src_cols, ncols, row, err)) {
+      cp_df_free(out);
+      out = NULL;
+      break;
+    }
+  }
+
+  free(dtypes);
+  free(names);
+  free(src_cols);
+  free(indices);
+  free(tmp);
   return out;
 }
 

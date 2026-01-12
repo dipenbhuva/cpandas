@@ -65,6 +65,10 @@ CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
                                const uint8_t *mask,
                                size_t mask_len,
                                CpError *err);
+CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
+                               const char *name,
+                               int ascending,
+                               CpError *err);
 
 int cp_df_append_row(CpDataFrame *df,
                      const char **values,

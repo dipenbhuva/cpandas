@@ -19,6 +19,7 @@ Data operations
 - Column selection by name.
 - Row append with type parsing (int64/float64/string).
 - Row filtering by boolean mask.
+- Sorting by a single column (ascending/descending, nulls last).
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -35,7 +36,7 @@ Validation and tooling
 Core DataFrame operations
 - Column selection by dtype and projection API.
 - Row filtering via predicates (beyond mask-based filtering).
-- Sorting by column(s).
+- Sorting by multiple columns.
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
 Groupby and joins
