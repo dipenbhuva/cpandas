@@ -32,6 +32,14 @@ typedef enum {
   CP_OP_GE = 5
 } CpCompareOp;
 
+typedef enum {
+  CP_AGG_COUNT = 0,
+  CP_AGG_SUM = 1,
+  CP_AGG_MEAN = 2,
+  CP_AGG_MIN = 3,
+  CP_AGG_MAX = 4
+} CpAggOp;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -86,6 +94,12 @@ CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
                                      CpError *err);
 int cp_df_info(const CpDataFrame *df, FILE *out, CpError *err);
 CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err);
+CpDataFrame *cp_df_groupby_agg(const CpDataFrame *df,
+                               const char *key,
+                               const char **value_cols,
+                               const CpAggOp *ops,
+                               size_t count,
+                               CpError *err);
 int cp_df_mask_int64(const CpDataFrame *df,
                      const char *name,
                      CpCompareOp op,

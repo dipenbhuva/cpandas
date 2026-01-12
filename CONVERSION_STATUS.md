@@ -30,6 +30,7 @@ Data operations
 - Predicate filtering helpers (numeric/string comparisons).
 - Sorting by a single column (ascending/descending, nulls last).
 - Sorting by multiple columns.
+- Groupby aggregation by key column (int64/string) with count/sum/mean/min/max.
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -57,9 +58,9 @@ Implemented from the list
 - Sorting by column (`df.sort_values`).
 - Column drop/rename.
 - Missing value helpers (`isnull`, `dropna`, `fillna`).
+- Groupby and `agg`.
 
 Remaining from the list
-- Groupby and `agg`.
 - Merging (`pd.merge`).
 - Pivot tables.
 
@@ -67,11 +68,10 @@ Remaining from the list
 
 Core DataFrame operations
 - Column selection by dtype and projection API.
-- Row filtering via predicates (beyond mask-based filtering).
+- Multi-column predicate composition (AND/OR) and expression evaluation.
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
-Groupby and joins
-- Groupby (split/apply/aggregate).
+Joins
 - Joins (inner, left) with key handling.
 
 Indexing and missing values
