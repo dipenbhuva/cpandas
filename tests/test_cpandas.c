@@ -1694,6 +1694,83 @@ static void test_join_multi_key(void) {
   cp_df_free(left);
 }
 
+static void test_join_hash_path(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *left_names[] = {"id", "left_val"};
+  CpDType left_types[] = {CP_DTYPE_INT64, CP_DTYPE_INT64};
+  CpDataFrame *left = cp_df_create(2, left_names, left_types, 0, &err);
+  CHECK(left != NULL);
+  if (!left) {
+    return;
+  }
+
+  const char *right_names[] = {"id", "right_val"};
+  CpDType right_types[] = {CP_DTYPE_INT64, CP_DTYPE_INT64};
+  CpDataFrame *right = cp_df_create(2, right_names, right_types, 0, &err);
+  CHECK(right != NULL);
+  if (!right) {
+    cp_df_free(left);
+    return;
+  }
+
+  for (int i = 0; i < 50; ++i) {
+    char id_buf[32];
+    char val_buf[32];
+    snprintf(id_buf, sizeof(id_buf), "%d", i);
+    snprintf(val_buf, sizeof(val_buf), "%d", i * 10);
+    const char *row[] = {id_buf, val_buf};
+    CHECK(cp_df_append_row(left, row, 2, &err));
+  }
+
+  for (int i = 25; i < 75; ++i) {
+    char id_buf[32];
+    char val_buf[32];
+    snprintf(id_buf, sizeof(id_buf), "%d", i);
+    snprintf(val_buf, sizeof(val_buf), "%d", i * 100);
+    const char *row[] = {id_buf, val_buf};
+    CHECK(cp_df_append_row(right, row, 2, &err));
+  }
+
+  CpDataFrame *inner = cp_df_join(left, right, "id", "id", CP_JOIN_INNER, &err);
+  CHECK(inner != NULL);
+  if (inner) {
+    CHECK(cp_df_nrows(inner) == 25);
+    CHECK(cp_df_ncols(inner) == 3);
+
+    const CpSeries *id = cp_df_get_col(inner, "id");
+    const CpSeries *left_val = cp_df_get_col(inner, "left_val");
+    const CpSeries *right_val = cp_df_get_col(inner, "right_val");
+    CHECK(id && left_val && right_val);
+
+    int is_null = 0;
+    int64_t id_val = 0;
+    int64_t left_v = 0;
+    int64_t right_v = 0;
+
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 25);
+    CHECK(cp_series_get_int64(left_val, 0, &left_v, &is_null));
+    CHECK(!is_null && left_v == 250);
+    CHECK(cp_series_get_int64(right_val, 0, &right_v, &is_null));
+    CHECK(!is_null && right_v == 2500);
+
+    CHECK(cp_series_get_int64(id, 24, &id_val, &is_null));
+    CHECK(!is_null && id_val == 49);
+    CHECK(cp_series_get_int64(left_val, 24, &left_v, &is_null));
+    CHECK(!is_null && left_v == 490);
+    CHECK(cp_series_get_int64(right_val, 24, &right_v, &is_null));
+    CHECK(!is_null && right_v == 4900);
+  }
+
+  if (inner) {
+    cp_df_free(inner);
+  }
+  cp_df_free(right);
+  cp_df_free(left);
+}
+
 static void test_pivot_table(void) {
   CpError err;
   cp_error_clear(&err);
@@ -2004,6 +2081,7 @@ int main(void) {
   test_groupby_agg();
   test_join_inner_left();
   test_join_multi_key();
+  test_join_hash_path();
   test_pivot_table();
   test_predicate_filters();
 
