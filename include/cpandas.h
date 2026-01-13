@@ -42,7 +42,9 @@ typedef enum {
 
 typedef enum {
   CP_JOIN_INNER = 0,
-  CP_JOIN_LEFT = 1
+  CP_JOIN_LEFT = 1,
+  CP_JOIN_RIGHT = 2,
+  CP_JOIN_OUTER = 3
 } CpJoinType;
 
 typedef struct {
@@ -117,6 +119,15 @@ CpDataFrame *cp_df_join(const CpDataFrame *left,
                         const char *right_key,
                         CpJoinType how,
                         CpError *err);
+CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
+                              const CpDataFrame *right,
+                              const char **left_keys,
+                              const char **right_keys,
+                              size_t key_count,
+                              CpJoinType how,
+                              const char *left_suffix,
+                              const char *right_suffix,
+                              CpError *err);
 int cp_df_mask_int64(const CpDataFrame *df,
                      const char *name,
                      CpCompareOp op,
