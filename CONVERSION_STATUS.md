@@ -31,7 +31,7 @@ Data operations
 - Sorting by a single column (ascending/descending, nulls last).
 - Sorting by multiple columns.
 - Groupby aggregation by key column (int64/string) with count/sum/mean/min/max.
-- Joins (inner/left) on a single key column with basic name disambiguation.
+- Joins (inner/left/right/outer) on single or multiple key columns with configurable suffixes.
 - Pivot tables (single index/column/value with count/sum/mean/min/max).
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
@@ -75,8 +75,7 @@ Core DataFrame operations
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
 Joins
-- Multi-key joins.
-- Right/outer joins and suffix configuration.
+- Hash-join or indexed join performance work.
 
 Indexing and missing values
 - Index and index-based operations.
