@@ -1107,6 +1107,187 @@ static int cp_join_keys_equal(const CpSeries **left_keys,
   return 1;
 }
 
+typedef struct {
+  uint64_t hash;
+  size_t *rows;
+  size_t count;
+  size_t capacity;
+  int in_use;
+} CpJoinBucket;
+
+typedef struct {
+  CpJoinBucket *buckets;
+  size_t bucket_count;
+  size_t mask;
+} CpJoinIndex;
+
+static uint64_t cp_hash_bytes(uint64_t hash,
+                              const unsigned char *data,
+                              size_t len) {
+  const uint64_t prime = 1099511628211ULL;
+  for (size_t i = 0; i < len; ++i) {
+    hash ^= (uint64_t)data[i];
+    hash *= prime;
+  }
+  return hash;
+}
+
+static uint64_t cp_hash_int64(uint64_t hash, int64_t value) {
+  unsigned char bytes[sizeof(int64_t)];
+  memcpy(bytes, &value, sizeof(int64_t));
+  return cp_hash_bytes(hash, bytes, sizeof(int64_t));
+}
+
+static uint64_t cp_hash_size(uint64_t hash, size_t value) {
+  unsigned char bytes[sizeof(size_t)];
+  memcpy(bytes, &value, sizeof(size_t));
+  return cp_hash_bytes(hash, bytes, sizeof(size_t));
+}
+
+static uint64_t cp_join_hash_keys(const CpSeries **keys,
+                                  size_t key_count,
+                                  size_t row) {
+  uint64_t hash = 14695981039346656037ULL;
+  for (size_t i = 0; i < key_count; ++i) {
+    const CpSeries *series = keys[i];
+    unsigned char marker = series->dtype == CP_DTYPE_INT64 ? 'i' : 's';
+    hash = cp_hash_bytes(hash, &marker, 1);
+    if (series->dtype == CP_DTYPE_INT64) {
+      hash = cp_hash_int64(hash, series->data.i64[row]);
+    } else {
+      const char *value = series->data.str[row];
+      size_t len = value ? strlen(value) : 0;
+      hash = cp_hash_size(hash, len);
+      if (len > 0) {
+        hash = cp_hash_bytes(hash, (const unsigned char *)value, len);
+      }
+    }
+  }
+  return hash;
+}
+
+static int cp_join_bucket_push(CpJoinBucket *bucket,
+                               size_t row,
+                               CpError *err) {
+  if (!bucket) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join bucket");
+    return 0;
+  }
+  if (bucket->count == bucket->capacity) {
+    size_t new_cap = bucket->capacity == 0 ? 4 : bucket->capacity * 2;
+    size_t *next = (size_t *)realloc(bucket->rows, new_cap * sizeof(size_t));
+    if (!next) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+    bucket->rows = next;
+    bucket->capacity = new_cap;
+  }
+  bucket->rows[bucket->count++] = row;
+  return 1;
+}
+
+static int cp_join_index_init(CpJoinIndex *index,
+                              size_t row_count,
+                              CpError *err) {
+  if (!index) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join index");
+    return 0;
+  }
+  index->buckets = NULL;
+  index->bucket_count = 0;
+  index->mask = 0;
+  if (row_count == 0) {
+    return 1;
+  }
+  if (row_count > SIZE_MAX / 2) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
+    return 0;
+  }
+  size_t target = row_count * 2;
+  if (target < 8) {
+    target = 8;
+  }
+  size_t bucket_count = 1;
+  while (bucket_count < target) {
+    if (bucket_count > SIZE_MAX / 2) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
+      return 0;
+    }
+    bucket_count <<= 1;
+  }
+
+  CpJoinBucket *buckets =
+      (CpJoinBucket *)calloc(bucket_count, sizeof(CpJoinBucket));
+  if (!buckets) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  index->buckets = buckets;
+  index->bucket_count = bucket_count;
+  index->mask = bucket_count - 1;
+  return 1;
+}
+
+static void cp_join_index_free(CpJoinIndex *index) {
+  if (!index || !index->buckets) {
+    return;
+  }
+  for (size_t i = 0; i < index->bucket_count; ++i) {
+    free(index->buckets[i].rows);
+  }
+  free(index->buckets);
+  index->buckets = NULL;
+  index->bucket_count = 0;
+  index->mask = 0;
+}
+
+static int cp_join_index_add(CpJoinIndex *index,
+                             uint64_t hash,
+                             size_t row,
+                             CpError *err) {
+  if (!index || !index->buckets || index->bucket_count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join index");
+    return 0;
+  }
+  size_t mask = index->mask;
+  size_t idx = (size_t)hash & mask;
+  for (size_t probe = 0; probe < index->bucket_count; ++probe) {
+    CpJoinBucket *bucket = &index->buckets[idx];
+    if (!bucket->in_use) {
+      bucket->in_use = 1;
+      bucket->hash = hash;
+      return cp_join_bucket_push(bucket, row, err);
+    }
+    if (bucket->hash == hash) {
+      return cp_join_bucket_push(bucket, row, err);
+    }
+    idx = (idx + 1) & mask;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "join hash table full");
+  return 0;
+}
+
+static const CpJoinBucket *cp_join_index_find(const CpJoinIndex *index,
+                                              uint64_t hash) {
+  if (!index || !index->buckets || index->bucket_count == 0) {
+    return NULL;
+  }
+  size_t mask = index->mask;
+  size_t idx = (size_t)hash & mask;
+  for (size_t probe = 0; probe < index->bucket_count; ++probe) {
+    const CpJoinBucket *bucket = &index->buckets[idx];
+    if (!bucket->in_use) {
+      return NULL;
+    }
+    if (bucket->hash == hash) {
+      return bucket;
+    }
+    idx = (idx + 1) & mask;
+  }
+  return NULL;
+}
+
 static int cp_agg_output_dtype(const CpSeries *series, CpAggOp op, CpDType *out) {
   if (!series || !out) {
     return 0;
@@ -2476,6 +2657,10 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
   size_t out_cols = 0;
   size_t out_idx = 0;
   size_t total_rows = 0;
+  CpJoinIndex hash_index;
+  int use_hash = 0;
+
+  memset(&hash_index, 0, sizeof(hash_index));
 
   left_key_series =
       (const CpSeries **)calloc(key_count, sizeof(const CpSeries *));
@@ -2572,25 +2757,28 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     const char *base = left->cols[col]->name;
     int collision = cp_name_in_list(base, right_names, right_include_count);
     int force_suffix = collision && left_suffix_safe[0] != '\0';
-    const char *suffix = force_suffix ? left_suffix_safe : "";
-    int owned = 0;
-    const char *name = cp_join_format_name(base,
-                                           out_names,
-                                           out_idx,
-                                           suffix,
-                                           force_suffix,
-                                           &owned,
-                                           err);
-    if (!name) {
-      goto cleanup;
+    if (!force_suffix) {
+      out_names[out_idx] = base;
+    } else {
+      int owned = 0;
+      const char *name = cp_join_format_name(base,
+                                             out_names,
+                                             out_idx,
+                                             left_suffix_safe,
+                                             1,
+                                             &owned,
+                                             err);
+      if (!name) {
+        goto cleanup;
+      }
+      out_names[out_idx] = name;
+      if (owned) {
+        name_owned[out_idx] = 1;
+      }
     }
-    out_names[out_idx] = name;
     out_dtypes[out_idx] = left->cols[col]->dtype;
     out_sources[out_idx] = left->cols[col];
     out_from_right[out_idx] = 0;
-    if (owned) {
-      name_owned[out_idx] = 1;
-    }
     out_idx += 1;
   }
 
@@ -2637,6 +2825,28 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     }
   }
 
+  if (left->nrows > 0 && right->nrows > 0) {
+    size_t threshold = 1024;
+    if (left->nrows > threshold / right->nrows) {
+      use_hash = 1;
+    }
+  }
+
+  if (use_hash) {
+    if (!cp_join_index_init(&hash_index, right->nrows, err)) {
+      goto cleanup;
+    }
+    for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+      if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
+        continue;
+      }
+      uint64_t hash = cp_join_hash_keys(right_key_series, key_count, rrow);
+      if (!cp_join_index_add(&hash_index, hash, rrow, err)) {
+        goto cleanup;
+      }
+    }
+  }
+
   total_rows = 0;
   for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
     if (cp_join_keys_any_null(left_key_series, key_count, lrow)) {
@@ -2650,18 +2860,38 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
       continue;
     }
     size_t matches = 0;
-    for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
-      if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
-        continue;
+    if (use_hash) {
+      uint64_t hash = cp_join_hash_keys(left_key_series, key_count, lrow);
+      const CpJoinBucket *bucket = cp_join_index_find(&hash_index, hash);
+      if (bucket) {
+        for (size_t i = 0; i < bucket->count; ++i) {
+          size_t rrow = bucket->rows[i];
+          if (cp_join_keys_equal(left_key_series,
+                                 right_key_series,
+                                 key_count,
+                                 lrow,
+                                 rrow)) {
+            matches += 1;
+            if (right_matched) {
+              right_matched[rrow] = 1;
+            }
+          }
+        }
       }
-      if (cp_join_keys_equal(left_key_series,
-                             right_key_series,
-                             key_count,
-                             lrow,
-                             rrow)) {
-        matches += 1;
-        if (right_matched) {
-          right_matched[rrow] = 1;
+    } else {
+      for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+        if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
+          continue;
+        }
+        if (cp_join_keys_equal(left_key_series,
+                               right_key_series,
+                               key_count,
+                               lrow,
+                               rrow)) {
+          matches += 1;
+          if (right_matched) {
+            right_matched[rrow] = 1;
+          }
         }
       }
     }
@@ -2736,31 +2966,64 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     }
 
     int matched = 0;
-    for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
-      if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
-        continue;
-      }
-      if (cp_join_keys_equal(left_key_series,
-                             right_key_series,
-                             key_count,
-                             lrow,
-                             rrow)) {
-        matched = 1;
-        if (right_matched) {
-          right_matched[rrow] = 1;
+    if (use_hash) {
+      uint64_t hash = cp_join_hash_keys(left_key_series, key_count, lrow);
+      const CpJoinBucket *bucket = cp_join_index_find(&hash_index, hash);
+      if (bucket) {
+        for (size_t i = 0; i < bucket->count; ++i) {
+          size_t rrow = bucket->rows[i];
+          if (cp_join_keys_equal(left_key_series,
+                                 right_key_series,
+                                 key_count,
+                                 lrow,
+                                 rrow)) {
+            matched = 1;
+            if (right_matched) {
+              right_matched[rrow] = 1;
+            }
+            if (!cp_join_append_row(out,
+                                    out_sources,
+                                    out_from_right,
+                                    out_cols,
+                                    lrow,
+                                    rrow,
+                                    1,
+                                    1,
+                                    err)) {
+              cp_df_free(out);
+              out = NULL;
+              goto cleanup;
+            }
+          }
         }
-        if (!cp_join_append_row(out,
-                                out_sources,
-                                out_from_right,
-                                out_cols,
-                                lrow,
-                                rrow,
-                                1,
-                                1,
-                                err)) {
-          cp_df_free(out);
-          out = NULL;
-          goto cleanup;
+      }
+    } else {
+      for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+        if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
+          continue;
+        }
+        if (cp_join_keys_equal(left_key_series,
+                               right_key_series,
+                               key_count,
+                               lrow,
+                               rrow)) {
+          matched = 1;
+          if (right_matched) {
+            right_matched[rrow] = 1;
+          }
+          if (!cp_join_append_row(out,
+                                  out_sources,
+                                  out_from_right,
+                                  out_cols,
+                                  lrow,
+                                  rrow,
+                                  1,
+                                  1,
+                                  err)) {
+            cp_df_free(out);
+            out = NULL;
+            goto cleanup;
+          }
         }
       }
     }
@@ -2804,6 +3067,7 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
   }
 
 cleanup:
+  cp_join_index_free(&hash_index);
   free(left_key_series);
   free(right_key_series);
   free(right_include);
