@@ -32,7 +32,7 @@ Data operations
 - Sorting by multiple columns.
 - Groupby aggregation by key column (int64/string) with count/sum/mean/min/max.
 - Joins (inner/left/right/outer) on single or multiple key columns with configurable suffixes.
-- Hash-indexed join path for larger joins.
+- Hash-indexed and sorted-index join paths for larger joins.
 - Pivot tables (single index/column/value with count/sum/mean/min/max).
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
