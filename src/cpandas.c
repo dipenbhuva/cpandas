@@ -33,6 +33,13 @@ CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
                                const uint8_t *mask,
                                size_t mask_len,
                                CpError *err);
+static void cp_sort_indices_merge_multi(size_t *indices,
+                                        size_t *tmp,
+                                        size_t left,
+                                        size_t right,
+                                        const CpSeries **keys,
+                                        const int *ascending,
+                                        size_t key_count);
 
 static const char *cp_dtype_name(CpDType dtype) {
   switch (dtype) {
@@ -1105,6 +1112,71 @@ static int cp_join_keys_equal(const CpSeries **left_keys,
     }
   }
   return 1;
+}
+
+static int cp_join_compare_lr(const CpSeries **left_keys,
+                              const CpSeries **right_keys,
+                              size_t key_count,
+                              size_t left_row,
+                              size_t right_row) {
+  if (!left_keys || !right_keys || key_count == 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < key_count; ++i) {
+    const CpSeries *lkey = left_keys[i];
+    const CpSeries *rkey = right_keys[i];
+    if (!lkey || !rkey) {
+      return 0;
+    }
+    if (lkey->dtype == CP_DTYPE_INT64) {
+      int64_t lhs = lkey->data.i64[left_row];
+      int64_t rhs = rkey->data.i64[right_row];
+      if (lhs < rhs) {
+        return -1;
+      }
+      if (lhs > rhs) {
+        return 1;
+      }
+    } else {
+      const char *lhs = lkey->data.str[left_row];
+      const char *rhs = rkey->data.str[right_row];
+      if (!lhs && !rhs) {
+        continue;
+      }
+      if (!lhs) {
+        return -1;
+      }
+      if (!rhs) {
+        return 1;
+      }
+      int cmp = strcmp(lhs, rhs);
+      if (cmp != 0) {
+        return cmp < 0 ? -1 : 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static size_t cp_join_lower_bound(const CpSeries **left_keys,
+                                  const CpSeries **right_keys,
+                                  size_t key_count,
+                                  size_t left_row,
+                                  const size_t *right_sorted,
+                                  size_t right_count) {
+  size_t lo = 0;
+  size_t hi = right_count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    size_t rrow = right_sorted[mid];
+    int cmp = cp_join_compare_lr(left_keys, right_keys, key_count, left_row, rrow);
+    if (cmp <= 0) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
 }
 
 typedef struct {
@@ -2659,6 +2731,11 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
   size_t total_rows = 0;
   CpJoinIndex hash_index;
   int use_hash = 0;
+  size_t *right_sorted = NULL;
+  size_t *right_tmp = NULL;
+  size_t right_sorted_count = 0;
+  int *sort_asc = NULL;
+  int use_index = 0;
 
   memset(&hash_index, 0, sizeof(hash_index));
 
@@ -2757,24 +2834,21 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     const char *base = left->cols[col]->name;
     int collision = cp_name_in_list(base, right_names, right_include_count);
     int force_suffix = collision && left_suffix_safe[0] != '\0';
-    if (!force_suffix) {
-      out_names[out_idx] = base;
-    } else {
-      int owned = 0;
-      const char *name = cp_join_format_name(base,
-                                             out_names,
-                                             out_idx,
-                                             left_suffix_safe,
-                                             1,
-                                             &owned,
-                                             err);
-      if (!name) {
-        goto cleanup;
-      }
-      out_names[out_idx] = name;
-      if (owned) {
-        name_owned[out_idx] = 1;
-      }
+    const char *suffix = force_suffix ? left_suffix_safe : "";
+    int owned = 0;
+    const char *name = cp_join_format_name(base,
+                                           out_names,
+                                           out_idx,
+                                           suffix,
+                                           force_suffix,
+                                           &owned,
+                                           err);
+    if (!name) {
+      goto cleanup;
+    }
+    out_names[out_idx] = name;
+    if (owned) {
+      name_owned[out_idx] = 1;
     }
     out_dtypes[out_idx] = left->cols[col]->dtype;
     out_sources[out_idx] = left->cols[col];
@@ -2847,6 +2921,44 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     }
   }
 
+  if (!use_hash && left->nrows > 0 && right->nrows > 0) {
+    use_index = 1;
+    for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+      if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
+        continue;
+      }
+      right_sorted_count += 1;
+    }
+    if (right_sorted_count > 0) {
+      right_sorted = (size_t *)malloc(right_sorted_count * sizeof(size_t));
+      right_tmp = (size_t *)malloc(right_sorted_count * sizeof(size_t));
+      sort_asc = (int *)malloc(key_count * sizeof(int));
+      if (!right_sorted || !right_tmp || !sort_asc) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        goto cleanup;
+      }
+      for (size_t i = 0; i < key_count; ++i) {
+        sort_asc[i] = 1;
+      }
+      size_t idx = 0;
+      for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
+        if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
+          continue;
+        }
+        right_sorted[idx++] = rrow;
+      }
+      if (right_sorted_count > 1) {
+        cp_sort_indices_merge_multi(right_sorted,
+                                    right_tmp,
+                                    0,
+                                    right_sorted_count,
+                                    right_key_series,
+                                    sort_asc,
+                                    key_count);
+      }
+    }
+  }
+
   total_rows = 0;
   for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
     if (cp_join_keys_any_null(left_key_series, key_count, lrow)) {
@@ -2876,6 +2988,28 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
               right_matched[rrow] = 1;
             }
           }
+        }
+      }
+    } else if (use_index) {
+      size_t start = cp_join_lower_bound(left_key_series,
+                                         right_key_series,
+                                         key_count,
+                                         lrow,
+                                         right_sorted,
+                                         right_sorted_count);
+      for (size_t pos = start; pos < right_sorted_count; ++pos) {
+        size_t rrow = right_sorted[pos];
+        int cmp = cp_join_compare_lr(left_key_series,
+                                     right_key_series,
+                                     key_count,
+                                     lrow,
+                                     rrow);
+        if (cmp != 0) {
+          break;
+        }
+        matches += 1;
+        if (right_matched) {
+          right_matched[rrow] = 1;
         }
       }
     } else {
@@ -2997,6 +3131,41 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
           }
         }
       }
+    } else if (use_index) {
+      size_t start = cp_join_lower_bound(left_key_series,
+                                         right_key_series,
+                                         key_count,
+                                         lrow,
+                                         right_sorted,
+                                         right_sorted_count);
+      for (size_t pos = start; pos < right_sorted_count; ++pos) {
+        size_t rrow = right_sorted[pos];
+        int cmp = cp_join_compare_lr(left_key_series,
+                                     right_key_series,
+                                     key_count,
+                                     lrow,
+                                     rrow);
+        if (cmp != 0) {
+          break;
+        }
+        matched = 1;
+        if (right_matched) {
+          right_matched[rrow] = 1;
+        }
+        if (!cp_join_append_row(out,
+                                out_sources,
+                                out_from_right,
+                                out_cols,
+                                lrow,
+                                rrow,
+                                1,
+                                1,
+                                err)) {
+          cp_df_free(out);
+          out = NULL;
+          goto cleanup;
+        }
+      }
     } else {
       for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
         if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
@@ -3068,6 +3237,9 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
 
 cleanup:
   cp_join_index_free(&hash_index);
+  free(right_sorted);
+  free(right_tmp);
+  free(sort_asc);
   free(left_key_series);
   free(right_key_series);
   free(right_include);
