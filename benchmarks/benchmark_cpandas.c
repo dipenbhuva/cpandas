@@ -59,7 +59,7 @@ static int parse_join_strategy(const char *value,
 static void print_usage(const char *prog) {
   fprintf(stderr,
           "Usage: %s [rows] [--join] [--strategy auto|nested|hash|sorted|all] "
-          "[--match-rate 0-1]\n",
+          "[--match-rate 0-1] [--key-dup-rate 0-1]\n",
           prog);
 }
 
@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
   CpJoinStrategy join_strategy = CP_JOIN_STRATEGY_AUTO;
   int join_all = 0;
   double match_rate = 1.0;
+  double key_dup_rate = 0.0;
   for (int i = 1; i < argc; ++i) {
     const char *arg = argv[i];
     if (strcmp(arg, "--join") == 0) {
@@ -102,6 +103,22 @@ int main(int argc, char **argv) {
         return 1;
       }
       match_rate = parsed;
+      run_join = 1;
+      i += 1;
+      continue;
+    }
+    if (strcmp(arg, "--key-dup-rate") == 0) {
+      if (i + 1 >= argc) {
+        print_usage(argv[0]);
+        return 1;
+      }
+      char *end = NULL;
+      double parsed = strtod(argv[i + 1], &end);
+      if (!end || *end != '\0' || parsed < 0.0 || parsed > 1.0) {
+        print_usage(argv[0]);
+        return 1;
+      }
+      key_dup_rate = parsed;
       run_join = 1;
       i += 1;
       continue;
@@ -185,9 +202,18 @@ int main(int argc, char **argv) {
     join_rows = 20000;
     printf("join rows capped at %zu for nested strategy\n", join_rows);
   }
-  size_t match_count = (size_t)((double)join_rows * match_rate);
-  if (match_count > join_rows) {
-    match_count = join_rows;
+  size_t match_rows = (size_t)((double)join_rows * match_rate);
+  if (match_rows > join_rows) {
+    match_rows = join_rows;
+  }
+  size_t dup_rows = (size_t)((double)match_rows * key_dup_rate);
+  if (dup_rows > match_rows) {
+    dup_rows = match_rows;
+  }
+  size_t unique_match_rows = match_rows - dup_rows;
+  if (match_rows > 0 && unique_match_rows == 0) {
+    unique_match_rows = 1;
+    dup_rows = match_rows - 1;
   }
 
   const char *join_left_names[] = {"id", "left_val"};
@@ -223,7 +249,17 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < join_rows; ++i) {
     char id_buf[32];
     char val_buf[32];
-    size_t key = i < match_count ? i : join_rows + (i - match_count);
+    size_t key = 0;
+    if (i < match_rows) {
+      if (i < unique_match_rows) {
+        key = i;
+      } else {
+        size_t base = i - unique_match_rows;
+        key = unique_match_rows > 0 ? (base % unique_match_rows) : 0;
+      }
+    } else {
+      key = join_rows + (i - match_rows);
+    }
     snprintf(id_buf, sizeof(id_buf), "%zu", key);
     snprintf(val_buf, sizeof(val_buf), "%zu", i * 3);
     const char *row[] = {id_buf, val_buf};
@@ -236,7 +272,11 @@ int main(int argc, char **argv) {
   }
 
   printf("join rows: %zu\n", join_rows);
-  printf("match rate: %.2f (matches: %zu)\n", match_rate, match_count);
+  printf("match rate: %.2f (match rows: %zu)\n", match_rate, match_rows);
+  printf("key dup rate: %.2f (unique keys: %zu, dup rows: %zu)\n",
+         key_dup_rate,
+         unique_match_rows,
+         dup_rows);
 
   CpJoinStrategy strategies[] = {CP_JOIN_STRATEGY_NESTED,
                                  CP_JOIN_STRATEGY_SORTED,
@@ -244,6 +284,9 @@ int main(int argc, char **argv) {
                                  CP_JOIN_STRATEGY_AUTO};
   size_t strategy_count = join_all ? 4 : 1;
 
+  printf("%-10s %10s %12s %10s\n", "strategy", "seconds", "rows/s", "out_rows");
+  printf("%-10s %10s %12s %10s\n", "----------", "----------", "------------",
+         "----------");
   for (size_t i = 0; i < strategy_count; ++i) {
     CpJoinStrategy strategy = join_all ? strategies[i] : join_strategy;
     clock_t start = clock();
@@ -262,7 +305,7 @@ int main(int argc, char **argv) {
       continue;
     }
     size_t out_rows = cp_df_nrows(joined);
-    printf("join %s: %.4fs (%.0f rows/s, out %zu)\n",
+    printf("%-10s %10.4f %12.0f %10zu\n",
            strategy_name(strategy),
            join_s,
            join_s > 0.0 ? (double)join_rows / join_s : 0.0,
