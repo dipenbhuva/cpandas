@@ -9,7 +9,7 @@ functionality with a low-level, performance-oriented API.
 - Typed columns: int64, float64, string.
 - CSV read/write with header support.
 - Aggregations: count, sum, mean, min, max (Series and DataFrame helpers).
-- Joins (inner/left/right/outer) with multi-key support and hash/sorted-index acceleration, plus pivot tables.
+- Joins (inner/left/right/outer) with multi-key support, strategy selection (auto/hash/sorted/nested), and pivot tables.
 - Tests and a simple benchmark target.
 
 ## Build
