@@ -58,7 +58,8 @@ static int parse_join_strategy(const char *value,
 
 static void print_usage(const char *prog) {
   fprintf(stderr,
-          "Usage: %s [rows] [--join] [--strategy auto|nested|hash|sorted|all]\n",
+          "Usage: %s [rows] [--join] [--strategy auto|nested|hash|sorted|all] "
+          "[--match-rate 0-1]\n",
           prog);
 }
 
@@ -67,6 +68,7 @@ int main(int argc, char **argv) {
   int run_join = 0;
   CpJoinStrategy join_strategy = CP_JOIN_STRATEGY_AUTO;
   int join_all = 0;
+  double match_rate = 1.0;
   for (int i = 1; i < argc; ++i) {
     const char *arg = argv[i];
     if (strcmp(arg, "--join") == 0) {
@@ -84,6 +86,23 @@ int main(int argc, char **argv) {
         return 1;
       }
       join_all = parsed_all;
+      run_join = 1;
+      i += 1;
+      continue;
+    }
+    if (strcmp(arg, "--match-rate") == 0) {
+      if (i + 1 >= argc) {
+        print_usage(argv[0]);
+        return 1;
+      }
+      char *end = NULL;
+      double parsed = strtod(argv[i + 1], &end);
+      if (!end || *end != '\0' || parsed < 0.0 || parsed > 1.0) {
+        print_usage(argv[0]);
+        return 1;
+      }
+      match_rate = parsed;
+      run_join = 1;
       i += 1;
       continue;
     }
@@ -166,6 +185,10 @@ int main(int argc, char **argv) {
     join_rows = 20000;
     printf("join rows capped at %zu for nested strategy\n", join_rows);
   }
+  size_t match_count = (size_t)((double)join_rows * match_rate);
+  if (match_count > join_rows) {
+    match_count = join_rows;
+  }
 
   const char *join_left_names[] = {"id", "left_val"};
   const char *join_right_names[] = {"id", "right_val"};
@@ -200,7 +223,8 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < join_rows; ++i) {
     char id_buf[32];
     char val_buf[32];
-    snprintf(id_buf, sizeof(id_buf), "%zu", i);
+    size_t key = i < match_count ? i : join_rows + (i - match_count);
+    snprintf(id_buf, sizeof(id_buf), "%zu", key);
     snprintf(val_buf, sizeof(val_buf), "%zu", i * 3);
     const char *row[] = {id_buf, val_buf};
     if (!cp_df_append_row(right, row, 2, &err)) {
@@ -212,6 +236,7 @@ int main(int argc, char **argv) {
   }
 
   printf("join rows: %zu\n", join_rows);
+  printf("match rate: %.2f (matches: %zu)\n", match_rate, match_count);
 
   CpJoinStrategy strategies[] = {CP_JOIN_STRATEGY_NESTED,
                                  CP_JOIN_STRATEGY_SORTED,
