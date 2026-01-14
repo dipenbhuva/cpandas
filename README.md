@@ -31,6 +31,7 @@ ctest --test-dir build
 ./build/cpandas_bench 500000
 ./build/cpandas_bench 50000 --join --strategy hash
 ./build/cpandas_bench 50000 --join --strategy all
+./build/cpandas_bench 50000 --join --strategy sorted --match-rate 0.5
 ```
 
 ## Status
