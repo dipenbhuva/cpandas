@@ -1409,7 +1409,14 @@ static void test_join_inner_left(void) {
   CHECK(cp_df_append_row(right, r4, 3, &err));
   CHECK(cp_df_append_row(right, r5, 3, &err));
 
-  CpDataFrame *inner = cp_df_join(left, right, "id", "id", CP_JOIN_INNER, &err);
+  CpDataFrame *inner =
+      cp_df_join_with_strategy(left,
+                               right,
+                               "id",
+                               "id",
+                               CP_JOIN_INNER,
+                               CP_JOIN_STRATEGY_HASH,
+                               &err);
   CHECK(inner != NULL);
   if (inner) {
     CHECK(cp_df_nrows(inner) == 6);
@@ -1771,6 +1778,113 @@ static void test_join_hash_path(void) {
   cp_df_free(left);
 }
 
+static void assert_join_strategy_result(CpDataFrame *df) {
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+  CHECK(cp_df_nrows(df) == 4);
+  CHECK(cp_df_ncols(df) == 3);
+
+  const CpSeries *id = cp_df_get_col(df, "id");
+  const CpSeries *left_val = cp_df_get_col(df, "left_val");
+  const CpSeries *right_val = cp_df_get_col(df, "right_val");
+  CHECK(id && left_val && right_val);
+
+  int64_t exp_id[] = {2, 2, 2, 2};
+  int64_t exp_left[] = {20, 20, 21, 21};
+  int64_t exp_right[] = {200, 201, 200, 201};
+
+  for (size_t i = 0; i < 4; ++i) {
+    int is_null = 0;
+    int64_t value = 0;
+    CHECK(cp_series_get_int64(id, i, &value, &is_null));
+    CHECK(!is_null && value == exp_id[i]);
+    CHECK(cp_series_get_int64(left_val, i, &value, &is_null));
+    CHECK(!is_null && value == exp_left[i]);
+    CHECK(cp_series_get_int64(right_val, i, &value, &is_null));
+    CHECK(!is_null && value == exp_right[i]);
+  }
+}
+
+static void test_join_strategy_forced(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *left_names[] = {"id", "left_val"};
+  CpDType left_types[] = {CP_DTYPE_INT64, CP_DTYPE_INT64};
+  CpDataFrame *left = cp_df_create(2, left_names, left_types, 0, &err);
+  CHECK(left != NULL);
+  if (!left) {
+    return;
+  }
+
+  const char *right_names[] = {"id", "right_val"};
+  CpDType right_types[] = {CP_DTYPE_INT64, CP_DTYPE_INT64};
+  CpDataFrame *right = cp_df_create(2, right_names, right_types, 0, &err);
+  CHECK(right != NULL);
+  if (!right) {
+    cp_df_free(left);
+    return;
+  }
+
+  const char *l0[] = {"1", "10"};
+  const char *l1[] = {"2", "20"};
+  const char *l2[] = {"2", "21"};
+  CHECK(cp_df_append_row(left, l0, 2, &err));
+  CHECK(cp_df_append_row(left, l1, 2, &err));
+  CHECK(cp_df_append_row(left, l2, 2, &err));
+
+  const char *r0[] = {"2", "200"};
+  const char *r1[] = {"2", "201"};
+  const char *r2[] = {"3", "300"};
+  CHECK(cp_df_append_row(right, r0, 2, &err));
+  CHECK(cp_df_append_row(right, r1, 2, &err));
+  CHECK(cp_df_append_row(right, r2, 2, &err));
+
+  CpDataFrame *nested =
+      cp_df_join_with_strategy(left,
+                               right,
+                               "id",
+                               "id",
+                               CP_JOIN_INNER,
+                               CP_JOIN_STRATEGY_NESTED,
+                               &err);
+  assert_join_strategy_result(nested);
+
+  CpDataFrame *sorted =
+      cp_df_join_with_strategy(left,
+                               right,
+                               "id",
+                               "id",
+                               CP_JOIN_INNER,
+                               CP_JOIN_STRATEGY_SORTED,
+                               &err);
+  assert_join_strategy_result(sorted);
+
+  CpDataFrame *hash =
+      cp_df_join_with_strategy(left,
+                               right,
+                               "id",
+                               "id",
+                               CP_JOIN_INNER,
+                               CP_JOIN_STRATEGY_HASH,
+                               &err);
+  assert_join_strategy_result(hash);
+
+  if (nested) {
+    cp_df_free(nested);
+  }
+  if (sorted) {
+    cp_df_free(sorted);
+  }
+  if (hash) {
+    cp_df_free(hash);
+  }
+  cp_df_free(right);
+  cp_df_free(left);
+}
+
 static void test_pivot_table(void) {
   CpError err;
   cp_error_clear(&err);
@@ -2082,6 +2196,7 @@ int main(void) {
   test_join_inner_left();
   test_join_multi_key();
   test_join_hash_path();
+  test_join_strategy_forced();
   test_pivot_table();
   test_predicate_filters();
 

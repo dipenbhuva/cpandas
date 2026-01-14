@@ -47,6 +47,13 @@ typedef enum {
   CP_JOIN_OUTER = 3
 } CpJoinType;
 
+typedef enum {
+  CP_JOIN_STRATEGY_AUTO = 0,
+  CP_JOIN_STRATEGY_NESTED = 1,
+  CP_JOIN_STRATEGY_HASH = 2,
+  CP_JOIN_STRATEGY_SORTED = 3
+} CpJoinStrategy;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -119,6 +126,13 @@ CpDataFrame *cp_df_join(const CpDataFrame *left,
                         const char *right_key,
                         CpJoinType how,
                         CpError *err);
+CpDataFrame *cp_df_join_with_strategy(const CpDataFrame *left,
+                                      const CpDataFrame *right,
+                                      const char *left_key,
+                                      const char *right_key,
+                                      CpJoinType how,
+                                      CpJoinStrategy strategy,
+                                      CpError *err);
 CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
                               const CpDataFrame *right,
                               const char **left_keys,
@@ -128,6 +142,16 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
                               const char *left_suffix,
                               const char *right_suffix,
                               CpError *err);
+CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
+                                            const CpDataFrame *right,
+                                            const char **left_keys,
+                                            const char **right_keys,
+                                            size_t key_count,
+                                            CpJoinType how,
+                                            const char *left_suffix,
+                                            const char *right_suffix,
+                                            CpJoinStrategy strategy,
+                                            CpError *err);
 int cp_df_mask_int64(const CpDataFrame *df,
                      const char *name,
                      CpCompareOp op,

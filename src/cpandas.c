@@ -2686,15 +2686,16 @@ static int cp_join_append_row(CpDataFrame *out,
   return 1;
 }
 
-CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
-                              const CpDataFrame *right,
-                              const char **left_keys,
-                              const char **right_keys,
-                              size_t key_count,
-                              CpJoinType how,
-                              const char *left_suffix,
-                              const char *right_suffix,
-                              CpError *err) {
+CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
+                                            const CpDataFrame *right,
+                                            const char **left_keys,
+                                            const char **right_keys,
+                                            size_t key_count,
+                                            CpJoinType how,
+                                            const char *left_suffix,
+                                            const char *right_suffix,
+                                            CpJoinStrategy strategy,
+                                            CpError *err) {
   if (!left || !right || !left_keys || !right_keys || key_count == 0) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join arguments");
     return NULL;
@@ -2706,6 +2707,13 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
   if (how != CP_JOIN_INNER && how != CP_JOIN_LEFT &&
       how != CP_JOIN_RIGHT && how != CP_JOIN_OUTER) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported join type");
+    return NULL;
+  }
+  if (strategy != CP_JOIN_STRATEGY_AUTO &&
+      strategy != CP_JOIN_STRATEGY_NESTED &&
+      strategy != CP_JOIN_STRATEGY_HASH &&
+      strategy != CP_JOIN_STRATEGY_SORTED) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported join strategy");
     return NULL;
   }
 
@@ -2899,10 +2907,20 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     }
   }
 
-  if (left->nrows > 0 && right->nrows > 0) {
-    size_t threshold = 1024;
-    if (left->nrows > threshold / right->nrows) {
-      use_hash = 1;
+  if (strategy == CP_JOIN_STRATEGY_HASH) {
+    use_hash = 1;
+  } else if (strategy == CP_JOIN_STRATEGY_SORTED) {
+    if (left->nrows > 0 && right->nrows > 0) {
+      use_index = 1;
+    }
+  } else if (strategy == CP_JOIN_STRATEGY_AUTO) {
+    if (left->nrows > 0 && right->nrows > 0) {
+      size_t threshold = 1024;
+      if (left->nrows > threshold / right->nrows) {
+        use_hash = 1;
+      } else {
+        use_index = 1;
+      }
     }
   }
 
@@ -2921,8 +2939,7 @@ CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
     }
   }
 
-  if (!use_hash && left->nrows > 0 && right->nrows > 0) {
-    use_index = 1;
+  if (use_index) {
     for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
       if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
         continue;
@@ -3261,27 +3278,65 @@ cleanup:
   return out;
 }
 
-CpDataFrame *cp_df_join(const CpDataFrame *left,
-                        const CpDataFrame *right,
-                        const char *left_key,
-                        const char *right_key,
-                        CpJoinType how,
-                        CpError *err) {
+CpDataFrame *cp_df_join_multi(const CpDataFrame *left,
+                              const CpDataFrame *right,
+                              const char **left_keys,
+                              const char **right_keys,
+                              size_t key_count,
+                              CpJoinType how,
+                              const char *left_suffix,
+                              const char *right_suffix,
+                              CpError *err) {
+  return cp_df_join_multi_with_strategy(left,
+                                        right,
+                                        left_keys,
+                                        right_keys,
+                                        key_count,
+                                        how,
+                                        left_suffix,
+                                        right_suffix,
+                                        CP_JOIN_STRATEGY_AUTO,
+                                        err);
+}
+
+CpDataFrame *cp_df_join_with_strategy(const CpDataFrame *left,
+                                      const CpDataFrame *right,
+                                      const char *left_key,
+                                      const char *right_key,
+                                      CpJoinType how,
+                                      CpJoinStrategy strategy,
+                                      CpError *err) {
   if (!left || !right || !left_key || !right_key) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join arguments");
     return NULL;
   }
   const char *left_keys[] = {left_key};
   const char *right_keys[] = {right_key};
-  return cp_df_join_multi(left,
-                          right,
-                          left_keys,
-                          right_keys,
-                          1,
-                          how,
-                          "",
-                          "_right",
-                          err);
+  return cp_df_join_multi_with_strategy(left,
+                                        right,
+                                        left_keys,
+                                        right_keys,
+                                        1,
+                                        how,
+                                        "",
+                                        "_right",
+                                        strategy,
+                                        err);
+}
+
+CpDataFrame *cp_df_join(const CpDataFrame *left,
+                        const CpDataFrame *right,
+                        const char *left_key,
+                        const char *right_key,
+                        CpJoinType how,
+                        CpError *err) {
+  return cp_df_join_with_strategy(left,
+                                  right,
+                                  left_key,
+                                  right_key,
+                                  how,
+                                  CP_JOIN_STRATEGY_AUTO,
+                                  err);
 }
 
 CpDataFrame *cp_df_pivot_table(const CpDataFrame *df,
