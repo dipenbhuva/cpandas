@@ -62,12 +62,24 @@ Implemented from the list
 - Sorting by column (`df.sort_values`).
 - Column drop/rename.
 - Missing value helpers (`isnull`, `dropna`, `fillna`).
+- `isna` alias for `isnull`.
+- Uniques/counts (`unique`, `nunique`, `value_counts`, `duplicated`, `drop_duplicates`).
+- Sampling/selection (`sample`, `nlargest`, `nsmallest`).
+- Conditional/replace (`where`, `mask`, `clip`, `replace`).
+- `concat`.
+- Query filtering (`query`).
+- Type/index helpers (`astype`, `set_index`, `reset_index`, `at`).
+- Apply/transform helpers (`apply`, `transform`) and iteration (`iterrows`, `iteritems`).
+- Stats (`median`, `std`, `corr`, `cov`, `rank`, `diff`).
+- Conversion/format (`to_numeric`, `to_datetime`, `to_string`).
 - Groupby and `agg`.
 - Merging (`pd.merge`).
 - Pivot tables.
+- Shape/metadata helpers (`shape`, `size`, `ndim`, `columns`).
+- DataFrame copy (`copy`).
 
 Remaining from the list
-None from the GeeksforGeeks list.
+- Conversion/format: `to_excel`, `to_sql`, `plot`.
 
 ## Remaining / Not Yet Implemented
 
@@ -77,7 +89,7 @@ Core DataFrame operations
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
 Joins
-- Hash-join or indexed join performance work.
+- Join performance tuning (parallelism, memory).
 
 Indexing and missing values
 - Index and index-based operations.
@@ -105,3 +117,19 @@ Advanced pandas features
 - CSV parsing is intentionally minimal for MVP and does not support multiline
   quoted fields.
 - dtype inference is not implemented; dtypes must be provided or default to string.
+- `query` supports a single predicate with basic comparison operators; it does not
+  yet support AND/OR chaining or complex expressions.
+- `set_index` stores a single column as index metadata (column remains in data and
+  must be int64 or string); `reset_index` clears it.
+- `at` uses index metadata when present, otherwise treats the row label as a
+  positional index.
+- `apply` returns a single-column DataFrame from a row callback; `transform`
+  replaces a single column via callback and keeps the same row count.
+- `median`/`std` skip nulls and NaNs; `corr`/`cov` use pairwise complete rows with
+  sample variance (ddof=1); `rank` uses average ties and `diff` compares to the
+  previous row.
+- `to_numeric` converts a single column to float64 using `astype` rules.
+- `to_datetime` parses `YYYY-MM-DD` or `YYYY/MM/DD` with optional
+  `HH:MM[:SS][.fff]` time and optional `Z` or `±HH:MM` offsets into int64 epoch
+  seconds (UTC); blanks are nulls.
+- `to_string` renders a space-aligned table with `null` for nulls.

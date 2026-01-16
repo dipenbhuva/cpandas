@@ -54,6 +54,17 @@ typedef enum {
   CP_JOIN_STRATEGY_SORTED = 3
 } CpJoinStrategy;
 
+typedef enum {
+  CP_DUP_KEEP_FIRST = 0,
+  CP_DUP_KEEP_LAST = 1,
+  CP_DUP_KEEP_NONE = 2
+} CpDuplicateKeep;
+
+typedef enum {
+  CP_CONCAT_ROWS = 0,
+  CP_CONCAT_COLS = 1
+} CpConcatAxis;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -73,8 +84,36 @@ typedef struct {
   size_t nulls;
 } CpAggFloat64;
 
+typedef struct {
+  int is_null;
+  union {
+    int64_t i64;
+    double f64;
+    const char *str;
+  } value;
+} CpValue;
+
 typedef struct CpSeries CpSeries;
 typedef struct CpDataFrame CpDataFrame;
+
+typedef int (*CpApplyFn)(const CpDataFrame *df,
+                         size_t row,
+                         void *user_data,
+                         CpValue *out,
+                         CpError *err);
+typedef int (*CpTransformFn)(const CpSeries *series,
+                             size_t row,
+                             void *user_data,
+                             CpValue *out,
+                             CpError *err);
+typedef int (*CpIterRowFn)(const CpDataFrame *df,
+                           size_t row,
+                           void *user_data,
+                           CpError *err);
+typedef int (*CpIterItemFn)(const CpSeries *series,
+                            size_t col,
+                            void *user_data,
+                            CpError *err);
 
 void cp_error_clear(CpError *err);
 
@@ -87,6 +126,17 @@ void cp_df_free(CpDataFrame *df);
 
 size_t cp_df_nrows(const CpDataFrame *df);
 size_t cp_df_ncols(const CpDataFrame *df);
+int cp_df_shape(const CpDataFrame *df,
+                size_t *out_rows,
+                size_t *out_cols,
+                CpError *err);
+size_t cp_df_size(const CpDataFrame *df);
+size_t cp_df_ndim(const CpDataFrame *df);
+int cp_df_columns(const CpDataFrame *df,
+                  const char **out,
+                  size_t out_len,
+                  CpError *err);
+CpDataFrame *cp_df_copy(const CpDataFrame *df, CpError *err);
 const CpSeries *cp_df_get_col(const CpDataFrame *df, const char *name);
 
 CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
@@ -107,6 +157,7 @@ CpDataFrame *cp_df_sort_values_multi(const CpDataFrame *df,
                                      const int *ascending,
                                      CpError *err);
 int cp_df_info(const CpDataFrame *df, FILE *out, CpError *err);
+char *cp_df_to_string(const CpDataFrame *df, CpError *err);
 CpDataFrame *cp_df_describe(const CpDataFrame *df, CpError *err);
 CpDataFrame *cp_df_groupby_agg(const CpDataFrame *df,
                                const char *key,
@@ -219,11 +270,140 @@ int cp_df_isnull_mask(const CpDataFrame *df,
                       uint8_t *out,
                       size_t out_len,
                       CpError *err);
+int cp_df_isna_mask(const CpDataFrame *df,
+                    uint8_t *out,
+                    size_t out_len,
+                    CpError *err);
 CpDataFrame *cp_df_dropna(const CpDataFrame *df, CpError *err);
 CpDataFrame *cp_df_fillna(const CpDataFrame *df,
                           const char **values,
                           size_t count,
                           CpError *err);
+CpDataFrame *cp_df_unique(const CpDataFrame *df,
+                          const char *name,
+                          CpError *err);
+int cp_df_nunique(const CpDataFrame *df,
+                  const char *name,
+                  size_t *out,
+                  CpError *err);
+CpDataFrame *cp_df_value_counts(const CpDataFrame *df,
+                                const char *name,
+                                CpError *err);
+int cp_df_duplicated(const CpDataFrame *df,
+                     const char *name,
+                     CpDuplicateKeep keep,
+                     uint8_t *out,
+                     size_t out_len,
+                     CpError *err);
+CpDataFrame *cp_df_drop_duplicates(const CpDataFrame *df,
+                                   const char *name,
+                                   CpDuplicateKeep keep,
+                                   CpError *err);
+CpDataFrame *cp_df_where(const CpDataFrame *df,
+                         const uint8_t *mask,
+                         size_t mask_len,
+                         const char **values,
+                         size_t count,
+                         CpError *err);
+CpDataFrame *cp_df_mask(const CpDataFrame *df,
+                        const uint8_t *mask,
+                        size_t mask_len,
+                        const char **values,
+                        size_t count,
+                        CpError *err);
+CpDataFrame *cp_df_clip(const CpDataFrame *df,
+                        const char *name,
+                        double lower,
+                        double upper,
+                        CpError *err);
+CpDataFrame *cp_df_replace(const CpDataFrame *df,
+                           const char *name,
+                           const char *old_value,
+                           const char *new_value,
+                           CpError *err);
+CpDataFrame *cp_df_astype(const CpDataFrame *df,
+                          const char *name,
+                          CpDType dtype,
+                          CpError *err);
+CpDataFrame *cp_df_to_numeric(const CpDataFrame *df,
+                              const char *name,
+                              CpError *err);
+CpDataFrame *cp_df_to_datetime(const CpDataFrame *df,
+                               const char *name,
+                               CpError *err);
+CpDataFrame *cp_df_set_index(const CpDataFrame *df,
+                             const char *name,
+                             CpError *err);
+CpDataFrame *cp_df_reset_index(const CpDataFrame *df,
+                               CpError *err);
+int cp_df_at_int64(const CpDataFrame *df,
+                   const char *row_label,
+                   const char *col_name,
+                   int64_t *out,
+                   int *is_null,
+                   CpError *err);
+int cp_df_at_float64(const CpDataFrame *df,
+                     const char *row_label,
+                     const char *col_name,
+                     double *out,
+                     int *is_null,
+                     CpError *err);
+int cp_df_at_string(const CpDataFrame *df,
+                    const char *row_label,
+                    const char *col_name,
+                    const char **out,
+                    int *is_null,
+                    CpError *err);
+CpDataFrame *cp_df_apply(const CpDataFrame *df,
+                         CpDType out_dtype,
+                         const char *out_name,
+                         CpApplyFn func,
+                         void *user_data,
+                         CpError *err);
+CpDataFrame *cp_df_transform(const CpDataFrame *df,
+                             const char *name,
+                             CpDType out_dtype,
+                             CpTransformFn func,
+                             void *user_data,
+                             CpError *err);
+int cp_df_iterrows(const CpDataFrame *df,
+                   CpIterRowFn func,
+                   void *user_data,
+                   CpError *err);
+int cp_df_iteritems(const CpDataFrame *df,
+                    CpIterItemFn func,
+                    void *user_data,
+                    CpError *err);
+CpDataFrame *cp_df_diff(const CpDataFrame *df,
+                        const char *name,
+                        CpError *err);
+CpDataFrame *cp_df_rank(const CpDataFrame *df,
+                        const char *name,
+                        CpError *err);
+CpDataFrame *cp_df_corr(const CpDataFrame *df,
+                        CpError *err);
+CpDataFrame *cp_df_cov(const CpDataFrame *df,
+                       CpError *err);
+CpDataFrame *cp_df_query(const CpDataFrame *df,
+                         const char *expr,
+                         CpError *err);
+CpDataFrame *cp_df_concat(const CpDataFrame **dfs,
+                          size_t count,
+                          CpConcatAxis axis,
+                          CpError *err);
+CpDataFrame *cp_df_sample(const CpDataFrame *df,
+                          size_t n,
+                          int replace,
+                          uint32_t seed,
+                          CpError *err);
+CpDataFrame *cp_df_nlargest(const CpDataFrame *df,
+                            const char *name,
+                            size_t n,
+                            CpError *err);
+CpDataFrame *cp_df_nsmallest(const CpDataFrame *df,
+                             const char *name,
+                             size_t n,
+                             CpError *err);
 
 int cp_df_append_row(CpDataFrame *df,
                      const char **values,
@@ -305,6 +485,18 @@ int cp_df_mean(const CpDataFrame *df,
                size_t *out_count,
                size_t *out_nulls,
                CpError *err);
+int cp_df_median(const CpDataFrame *df,
+                 const char *name,
+                 double *out,
+                 size_t *out_count,
+                 size_t *out_nulls,
+                 CpError *err);
+int cp_df_std(const CpDataFrame *df,
+              const char *name,
+              double *out,
+              size_t *out_count,
+              size_t *out_nulls,
+              CpError *err);
 int cp_df_min_int64(const CpDataFrame *df,
                     const char *name,
                     int64_t *out,
@@ -349,6 +541,18 @@ int cp_df_mean_at(const CpDataFrame *df,
                   size_t *out_count,
                   size_t *out_nulls,
                   CpError *err);
+int cp_df_median_at(const CpDataFrame *df,
+                    size_t col_idx,
+                    double *out,
+                    size_t *out_count,
+                    size_t *out_nulls,
+                    CpError *err);
+int cp_df_std_at(const CpDataFrame *df,
+                 size_t col_idx,
+                 double *out,
+                 size_t *out_count,
+                 size_t *out_nulls,
+                 CpError *err);
 int cp_df_min_int64_at(const CpDataFrame *df,
                        size_t col_idx,
                        int64_t *out,
