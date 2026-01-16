@@ -13,6 +13,9 @@ target_include_directories(cpandas
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+if(NOT WIN32)
+  target_link_libraries(cpandas PUBLIC m)
+endif()
 
 enable_testing()
 
