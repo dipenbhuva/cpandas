@@ -143,6 +143,12 @@ CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
                                const char **names,
                                size_t count,
                                CpError *err);
+CpDataFrame *cp_df_select_dtypes(const CpDataFrame *df,
+                                 const CpDType *include,
+                                 size_t include_count,
+                                 const CpDType *exclude,
+                                 size_t exclude_count,
+                                 CpError *err);
 CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
                                const uint8_t *mask,
                                size_t mask_len,

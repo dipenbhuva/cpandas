@@ -703,6 +703,85 @@ static void test_select_and_filter(void) {
   cp_df_free(df);
 }
 
+static void test_select_dtypes(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "10.5", "Alice"};
+  const char *row2[] = {"2", "", "Bob"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+
+  CpDType include_any[] = {CP_DTYPE_INT64, CP_DTYPE_STRING};
+  CpDataFrame *sel = cp_df_select_dtypes(df, include_any, 2, NULL, 0, &err);
+  CHECK(sel != NULL);
+  if (sel) {
+    CHECK(cp_df_ncols(sel) == 2);
+    const char *cols[2] = {0};
+    CHECK(cp_df_columns(sel, cols, 2, &err));
+    CHECK(cols[0] && strcmp(cols[0], "id") == 0);
+    CHECK(cols[1] && strcmp(cols[1], "name") == 0);
+  }
+
+  CpDType exclude_str[] = {CP_DTYPE_STRING};
+  CpDataFrame *sel_excl = cp_df_select_dtypes(df, NULL, 0, exclude_str, 1, &err);
+  CHECK(sel_excl != NULL);
+  if (sel_excl) {
+    CHECK(cp_df_ncols(sel_excl) == 2);
+    const char *cols[2] = {0};
+    CHECK(cp_df_columns(sel_excl, cols, 2, &err));
+    CHECK(cols[0] && strcmp(cols[0], "id") == 0);
+    CHECK(cols[1] && strcmp(cols[1], "score") == 0);
+  }
+
+  CpDType include_mix[] = {CP_DTYPE_INT64, CP_DTYPE_STRING};
+  CpDataFrame *sel_mix =
+      cp_df_select_dtypes(df, include_mix, 2, exclude_str, 1, &err);
+  CHECK(sel_mix != NULL);
+  if (sel_mix) {
+    CHECK(cp_df_ncols(sel_mix) == 1);
+    const char *cols[1] = {0};
+    CHECK(cp_df_columns(sel_mix, cols, 1, &err));
+    CHECK(cols[0] && strcmp(cols[0], "id") == 0);
+  }
+
+  cp_error_clear(&err);
+  CpDataFrame *bad = cp_df_select_dtypes(df, NULL, 0, NULL, 0, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  CpDataFrame *bad2 = cp_df_select_dtypes(df, NULL, 1, NULL, 0, &err);
+  CHECK(bad2 == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  CpDType only_str[] = {CP_DTYPE_STRING};
+  CpDataFrame *bad3 =
+      cp_df_select_dtypes(df, only_str, 1, only_str, 1, &err);
+  CHECK(bad3 == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (sel) {
+    cp_df_free(sel);
+  }
+  if (sel_excl) {
+    cp_df_free(sel_excl);
+  }
+  if (sel_mix) {
+    cp_df_free(sel_mix);
+  }
+  cp_df_free(df);
+}
+
 static void test_sort_values(void) {
   CpError err;
   cp_error_clear(&err);
@@ -3782,6 +3861,7 @@ int main(void) {
   test_aggregations();
   test_df_aggregation_helpers();
   test_select_and_filter();
+  test_select_dtypes();
   test_sort_values();
   test_sort_values_multi();
   test_head_tail();

@@ -3020,6 +3020,104 @@ CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
   return out;
 }
 
+static int cp_dtype_in_list(const CpDType *list,
+                            size_t count,
+                            CpDType dtype) {
+  if (!list || count == 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (list[i] == dtype) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+CpDataFrame *cp_df_select_dtypes(const CpDataFrame *df,
+                                 const CpDType *include,
+                                 size_t include_count,
+                                 const CpDType *exclude,
+                                 size_t exclude_count,
+                                 CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid selection");
+    return NULL;
+  }
+  if ((include_count > 0 && !include) || (exclude_count > 0 && !exclude)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid selection");
+    return NULL;
+  }
+  if (include_count == 0 && exclude_count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no selection criteria");
+    return NULL;
+  }
+
+  size_t ncols = df->ncols;
+  CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
+  const char **sel_names = (const char **)malloc(ncols * sizeof(const char *));
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(ncols * sizeof(const CpSeries *));
+  if (!dtypes || !sel_names || !src_cols) {
+    free(dtypes);
+    free(sel_names);
+    free(src_cols);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  size_t count = 0;
+  for (size_t col = 0; col < ncols; ++col) {
+    const CpSeries *series = df->cols[col];
+    if (!series) {
+      free(dtypes);
+      free(sel_names);
+      free(src_cols);
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "column not found");
+      return NULL;
+    }
+    int include_ok = include_count == 0 ||
+                     cp_dtype_in_list(include, include_count, series->dtype);
+    int exclude_ok = exclude_count == 0 ||
+                     !cp_dtype_in_list(exclude, exclude_count, series->dtype);
+    if (include_ok && exclude_ok) {
+      dtypes[count] = series->dtype;
+      sel_names[count] = series->name;
+      src_cols[count] = series;
+      count += 1;
+    }
+  }
+
+  if (count == 0) {
+    free(dtypes);
+    free(sel_names);
+    free(src_cols);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no columns selected");
+    return NULL;
+  }
+
+  CpDataFrame *out = cp_df_create(count, sel_names, dtypes, df->nrows, err);
+  if (!out) {
+    free(dtypes);
+    free(sel_names);
+    free(src_cols);
+    return NULL;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (!cp_df_append_row_from_sources(out, src_cols, count, row, err)) {
+      cp_df_free(out);
+      out = NULL;
+      break;
+    }
+  }
+
+  free(dtypes);
+  free(sel_names);
+  free(src_cols);
+  return out;
+}
+
 CpDataFrame *cp_df_head(const CpDataFrame *df, size_t n, CpError *err) {
   if (!df) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
