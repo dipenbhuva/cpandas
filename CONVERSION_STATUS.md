@@ -23,6 +23,7 @@ Data exploration
 Data operations
 - Column lookup by name.
 - Column selection by name.
+- Column selection by dtype.
 - Column drop and rename.
 - Row append with type parsing (int64/float64/string).
 - Row filtering by boolean mask.
@@ -84,7 +85,6 @@ Remaining from the list
 ## Remaining / Not Yet Implemented
 
 Core DataFrame operations
-- Column selection by dtype and projection API.
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
 Joins
