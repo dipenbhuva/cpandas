@@ -3684,6 +3684,60 @@ static void test_query(void) {
     CHECK(!is_null && id_val == 5);
   }
 
+  CpDataFrame *q6 = cp_df_query(df, "name == \"Bob\" AND score >= 4.0", &err);
+  CHECK(q6 != NULL);
+  if (q6) {
+    CHECK(cp_df_nrows(q6) == 1);
+    const CpSeries *id = cp_df_get_col(q6, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+  }
+
+  CpDataFrame *q7 = cp_df_query(df, "id == 1 or id == 4", &err);
+  CHECK(q7 != NULL);
+  if (q7) {
+    CHECK(cp_df_nrows(q7) == 2);
+    const CpSeries *id = cp_df_get_col(q7, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 4);
+  }
+
+  CpDataFrame *q8 =
+      cp_df_query(df, "id == 1 or id == 2 and score >= 3.0", &err);
+  CHECK(q8 != NULL);
+  if (q8) {
+    CHECK(cp_df_nrows(q8) == 2);
+    const CpSeries *id = cp_df_get_col(q8, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+  }
+
+  CpDataFrame *q9 =
+      cp_df_query(df, "(id == 1 or id == 2) and score >= 3.0", &err);
+  CHECK(q9 != NULL);
+  if (q9) {
+    CHECK(cp_df_nrows(q9) == 1);
+    const CpSeries *id = cp_df_get_col(q9, "id");
+    CHECK(id != NULL);
+    int64_t id_val = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+  }
+
   cp_error_clear(&err);
   CpDataFrame *bad = cp_df_query(df, "id ?? 3", &err);
   CHECK(bad == NULL);
@@ -3703,6 +3757,18 @@ static void test_query(void) {
   }
   if (q5) {
     cp_df_free(q5);
+  }
+  if (q6) {
+    cp_df_free(q6);
+  }
+  if (q7) {
+    cp_df_free(q7);
+  }
+  if (q8) {
+    cp_df_free(q8);
+  }
+  if (q9) {
+    cp_df_free(q9);
   }
   cp_df_free(df);
 }

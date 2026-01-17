@@ -40,6 +40,9 @@ static int cp_df_append_row_from_sources(CpDataFrame *df,
                                          size_t ncols,
                                          size_t row,
                                          CpError *err);
+static const CpSeries *cp_df_require_col(const CpDataFrame *df,
+                                         const char *name,
+                                         CpError *err);
 static void cp_sort_indices_merge(size_t *indices,
                                   size_t *tmp,
                                   size_t left,
@@ -432,136 +435,468 @@ static int cp_str_eq_ci(const char *a, const char *b) {
   return *a == '\0' && *b == '\0';
 }
 
-static int cp_parse_query_expr(const char *expr,
-                               char **out_col,
-                               CpCompareOp *out_op,
-                               char **out_val,
-                               int *out_val_quoted,
-                               CpError *err) {
-  if (!expr || !out_col || !out_op || !out_val || !out_val_quoted) {
+typedef enum {
+  CP_QUERY_NODE_PRED = 0,
+  CP_QUERY_NODE_AND = 1,
+  CP_QUERY_NODE_OR = 2
+} CpQueryNodeType;
+
+typedef struct CpQueryNode {
+  CpQueryNodeType type;
+  struct CpQueryNode *left;
+  struct CpQueryNode *right;
+  const CpSeries *series;
+  char *col;
+  char *value;
+  int value_quoted;
+  int is_null_literal;
+  int is_nan_literal;
+  CpCompareOp op;
+  int64_t i64_value;
+  double f64_value;
+} CpQueryNode;
+
+static void cp_query_node_free(CpQueryNode *node) {
+  if (!node) {
+    return;
+  }
+  cp_query_node_free(node->left);
+  cp_query_node_free(node->right);
+  free(node->col);
+  free(node->value);
+  free(node);
+}
+
+static int cp_query_match_keyword(const char **p, const char *kw) {
+  if (!p || !*p || !kw) {
+    return 0;
+  }
+  const char *s = cp_skip_space(*p);
+  if (!s) {
+    return 0;
+  }
+  size_t len = strlen(kw);
+  for (size_t i = 0; i < len; ++i) {
+    if (s[i] == '\0') {
+      return 0;
+    }
+    if (tolower((unsigned char)s[i]) != tolower((unsigned char)kw[i])) {
+      return 0;
+    }
+  }
+  if (s[len] != '\0' && cp_is_ident_char(s[len])) {
+    return 0;
+  }
+  *p = s + len;
+  return 1;
+}
+
+static CpQueryNode *cp_query_parse_expr(const CpDataFrame *df,
+                                        const char **p,
+                                        CpError *err);
+static CpQueryNode *cp_query_parse_or(const CpDataFrame *df,
+                                      const char **p,
+                                      CpError *err);
+static CpQueryNode *cp_query_parse_and(const CpDataFrame *df,
+                                       const char **p,
+                                       CpError *err);
+static CpQueryNode *cp_query_parse_term(const CpDataFrame *df,
+                                        const char **p,
+                                        CpError *err);
+static CpQueryNode *cp_query_parse_pred(const CpDataFrame *df,
+                                        const char **p,
+                                        CpError *err);
+
+static CpQueryNode *cp_query_parse_expr(const CpDataFrame *df,
+                                        const char **p,
+                                        CpError *err) {
+  return cp_query_parse_or(df, p, err);
+}
+
+static CpQueryNode *cp_query_parse_or(const CpDataFrame *df,
+                                      const char **p,
+                                      CpError *err) {
+  CpQueryNode *node = cp_query_parse_and(df, p, err);
+  if (!node) {
+    return NULL;
+  }
+  for (;;) {
+    const char *cursor = *p;
+    if (!cp_query_match_keyword(&cursor, "or")) {
+      break;
+    }
+    *p = cursor;
+    CpQueryNode *rhs = cp_query_parse_and(df, p, err);
+    if (!rhs) {
+      cp_query_node_free(node);
+      return NULL;
+    }
+    CpQueryNode *parent = (CpQueryNode *)calloc(1, sizeof(CpQueryNode));
+    if (!parent) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      cp_query_node_free(rhs);
+      cp_query_node_free(node);
+      return NULL;
+    }
+    parent->type = CP_QUERY_NODE_OR;
+    parent->left = node;
+    parent->right = rhs;
+    node = parent;
+  }
+  return node;
+}
+
+static CpQueryNode *cp_query_parse_and(const CpDataFrame *df,
+                                       const char **p,
+                                       CpError *err) {
+  CpQueryNode *node = cp_query_parse_term(df, p, err);
+  if (!node) {
+    return NULL;
+  }
+  for (;;) {
+    const char *cursor = *p;
+    if (!cp_query_match_keyword(&cursor, "and")) {
+      break;
+    }
+    *p = cursor;
+    CpQueryNode *rhs = cp_query_parse_term(df, p, err);
+    if (!rhs) {
+      cp_query_node_free(node);
+      return NULL;
+    }
+    CpQueryNode *parent = (CpQueryNode *)calloc(1, sizeof(CpQueryNode));
+    if (!parent) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      cp_query_node_free(rhs);
+      cp_query_node_free(node);
+      return NULL;
+    }
+    parent->type = CP_QUERY_NODE_AND;
+    parent->left = node;
+    parent->right = rhs;
+    node = parent;
+  }
+  return node;
+}
+
+static CpQueryNode *cp_query_parse_term(const CpDataFrame *df,
+                                        const char **p,
+                                        CpError *err) {
+  const char *cursor = cp_skip_space(*p);
+  if (!cursor || *cursor == '\0') {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing query term");
+    return NULL;
+  }
+  if (*cursor == '(') {
+    cursor++;
+    CpQueryNode *node = cp_query_parse_expr(df, &cursor, err);
+    if (!node) {
+      return NULL;
+    }
+    cursor = cp_skip_space(cursor);
+    if (!cursor || *cursor != ')') {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unterminated group");
+      cp_query_node_free(node);
+      return NULL;
+    }
+    cursor++;
+    *p = cursor;
+    return node;
+  }
+  return cp_query_parse_pred(df, p, err);
+}
+
+static CpQueryNode *cp_query_parse_pred(const CpDataFrame *df,
+                                        const char **p,
+                                        CpError *err) {
+  if (!df || !p || !*p) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid query");
-    return 0;
+    return NULL;
   }
-  *out_col = NULL;
-  *out_val = NULL;
-  *out_val_quoted = 0;
 
-  const char *p = cp_skip_space(expr);
-  if (!p || *p == '\0') {
+  const char *cursor = cp_skip_space(*p);
+  if (!cursor || *cursor == '\0') {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "empty query");
-    return 0;
-  }
-  const char *start = p;
-  while (*p && cp_is_ident_char(*p)) {
-    p++;
-  }
-  if (start == p) {
-    cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing column");
-    return 0;
-  }
-  *out_col = cp_strndup(start, (size_t)(p - start));
-  if (!*out_col) {
-    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-    return 0;
+    return NULL;
   }
 
-  p = cp_skip_space(p);
-  if (!p || *p == '\0') {
-    cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing operator");
-    free(*out_col);
-    *out_col = NULL;
-    return 0;
+  const char *start = cursor;
+  while (*cursor && cp_is_ident_char(*cursor)) {
+    cursor++;
   }
-  if (p[0] == '=' && p[1] == '=') {
-    *out_op = CP_OP_EQ;
-    p += 2;
-  } else if (p[0] == '!' && p[1] == '=') {
-    *out_op = CP_OP_NE;
-    p += 2;
-  } else if (p[0] == '<' && p[1] == '=') {
-    *out_op = CP_OP_LE;
-    p += 2;
-  } else if (p[0] == '>' && p[1] == '=') {
-    *out_op = CP_OP_GE;
-    p += 2;
-  } else if (p[0] == '<') {
-    *out_op = CP_OP_LT;
-    p += 1;
-  } else if (p[0] == '>') {
-    *out_op = CP_OP_GT;
-    p += 1;
-  } else if (p[0] == '=') {
-    *out_op = CP_OP_EQ;
-    p += 1;
+  if (start == cursor) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing column");
+    return NULL;
+  }
+  char *col = cp_strndup(start, (size_t)(cursor - start));
+  if (!col) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  const CpSeries *series = cp_df_require_col(df, col, err);
+  if (!series) {
+    free(col);
+    return NULL;
+  }
+
+  cursor = cp_skip_space(cursor);
+  if (!cursor || *cursor == '\0') {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing operator");
+    free(col);
+    return NULL;
+  }
+
+  CpCompareOp op = CP_OP_EQ;
+  if (cursor[0] == '=' && cursor[1] == '=') {
+    op = CP_OP_EQ;
+    cursor += 2;
+  } else if (cursor[0] == '!' && cursor[1] == '=') {
+    op = CP_OP_NE;
+    cursor += 2;
+  } else if (cursor[0] == '<' && cursor[1] == '=') {
+    op = CP_OP_LE;
+    cursor += 2;
+  } else if (cursor[0] == '>' && cursor[1] == '=') {
+    op = CP_OP_GE;
+    cursor += 2;
+  } else if (cursor[0] == '<') {
+    op = CP_OP_LT;
+    cursor += 1;
+  } else if (cursor[0] == '>') {
+    op = CP_OP_GT;
+    cursor += 1;
+  } else if (cursor[0] == '=') {
+    op = CP_OP_EQ;
+    cursor += 1;
   } else {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid operator");
-    free(*out_col);
-    *out_col = NULL;
-    return 0;
+    free(col);
+    return NULL;
   }
 
-  p = cp_skip_space(p);
-  if (!p || *p == '\0') {
+  cursor = cp_skip_space(cursor);
+  if (!cursor || *cursor == '\0') {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing value");
-    free(*out_col);
-    *out_col = NULL;
-    return 0;
+    free(col);
+    return NULL;
   }
 
-  if (*p == '"' || *p == '\'') {
-    char quote = *p;
-    p++;
-    start = p;
-    while (*p && *p != quote) {
-      p++;
+  char *value = NULL;
+  int value_quoted = 0;
+  if (*cursor == '"' || *cursor == '\'') {
+    char quote = *cursor;
+    cursor++;
+    start = cursor;
+    while (*cursor && *cursor != quote) {
+      cursor++;
     }
-    if (*p != quote) {
+    if (*cursor != quote) {
       cp_error_set(err, CP_ERR_INVALID, 0, 0, "unterminated string");
-      free(*out_col);
-      *out_col = NULL;
-      return 0;
+      free(col);
+      return NULL;
     }
-    *out_val = cp_strndup(start, (size_t)(p - start));
-    if (!*out_val) {
+    value = cp_strndup(start, (size_t)(cursor - start));
+    if (!value) {
       cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-      free(*out_col);
-      *out_col = NULL;
-      return 0;
+      free(col);
+      return NULL;
     }
-    *out_val_quoted = 1;
-    p++;
+    value_quoted = 1;
+    cursor++;
   } else {
-    start = p;
-    while (*p && !isspace((unsigned char)*p)) {
-      p++;
+    start = cursor;
+    while (*cursor && !isspace((unsigned char)*cursor) && *cursor != ')') {
+      cursor++;
     }
-    if (start == p) {
+    if (start == cursor) {
       cp_error_set(err, CP_ERR_INVALID, 0, 0, "missing value");
-      free(*out_col);
-      *out_col = NULL;
-      return 0;
+      free(col);
+      return NULL;
     }
-    *out_val = cp_strndup(start, (size_t)(p - start));
-    if (!*out_val) {
+    value = cp_strndup(start, (size_t)(cursor - start));
+    if (!value) {
       cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-      free(*out_col);
-      *out_col = NULL;
-      return 0;
+      free(col);
+      return NULL;
     }
-    *out_val_quoted = 0;
+    value_quoted = 0;
   }
 
-  p = cp_skip_space(p);
-  if (p && *p != '\0') {
-    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unexpected query content");
-    free(*out_col);
-    free(*out_val);
-    *out_col = NULL;
-    *out_val = NULL;
+  CpQueryNode *node = (CpQueryNode *)calloc(1, sizeof(CpQueryNode));
+  if (!node) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    free(col);
+    free(value);
+    return NULL;
+  }
+  node->type = CP_QUERY_NODE_PRED;
+  node->series = series;
+  node->col = col;
+  node->value = value;
+  node->value_quoted = value_quoted;
+  node->op = op;
+
+  if (!value_quoted && cp_str_eq_ci(value, "null")) {
+    if (op != CP_OP_EQ && op != CP_OP_NE) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                   "null comparison requires == or !=");
+      cp_query_node_free(node);
+      return NULL;
+    }
+    node->is_null_literal = 1;
+    *p = cursor;
+    return node;
+  }
+
+  if (!value_quoted && series->dtype == CP_DTYPE_FLOAT64 &&
+      cp_str_eq_ci(value, "nan")) {
+    if (op != CP_OP_EQ && op != CP_OP_NE) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                   "nan comparison requires == or !=");
+      cp_query_node_free(node);
+      return NULL;
+    }
+    node->is_nan_literal = 1;
+    *p = cursor;
+    return node;
+  }
+
+  switch (series->dtype) {
+    case CP_DTYPE_INT64: {
+      int is_null = 0;
+      if (!cp_parse_int64(value, &node->i64_value, &is_null, err, 0, 0)) {
+        cp_query_node_free(node);
+        return NULL;
+      }
+      if (is_null) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "query value is null");
+        cp_query_node_free(node);
+        return NULL;
+      }
+      break;
+    }
+    case CP_DTYPE_FLOAT64: {
+      int is_null = 0;
+      if (!cp_parse_float64(value, &node->f64_value, &is_null, err, 0, 0)) {
+        cp_query_node_free(node);
+        return NULL;
+      }
+      if (is_null) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "query value is null");
+        cp_query_node_free(node);
+        return NULL;
+      }
+      break;
+    }
+    case CP_DTYPE_STRING:
+      break;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported dtype");
+      cp_query_node_free(node);
+      return NULL;
+  }
+
+  *p = cursor;
+  return node;
+}
+
+static int cp_query_eval_node(const CpQueryNode *node,
+                              size_t row,
+                              int *out,
+                              CpError *err) {
+  if (!node || !out) {
+    cp_error_set(err, CP_ERR_INVALID, row, 0, "invalid query node");
     return 0;
   }
-
-  return 1;
+  switch (node->type) {
+    case CP_QUERY_NODE_PRED: {
+      const CpSeries *series = node->series;
+      if (!series) {
+        cp_error_set(err, CP_ERR_INVALID, row, 0, "column not found");
+        return 0;
+      }
+      if (node->is_null_literal) {
+        int is_null = series->is_null[row] ? 1 : 0;
+        *out = (node->op == CP_OP_EQ) ? is_null : !is_null;
+        return 1;
+      }
+      if (node->is_nan_literal) {
+        int is_nan =
+            !series->is_null[row] && isnan(series->data.f64[row]) ? 1 : 0;
+        *out = (node->op == CP_OP_EQ) ? is_nan : !is_nan;
+        return 1;
+      }
+      switch (series->dtype) {
+        case CP_DTYPE_INT64:
+          if (series->is_null[row]) {
+            *out = 0;
+            return 1;
+          }
+          return cp_eval_compare_int64(series->data.i64[row],
+                                       node->op,
+                                       node->i64_value,
+                                       out,
+                                       err);
+        case CP_DTYPE_FLOAT64:
+          if (series->is_null[row]) {
+            *out = 0;
+            return 1;
+          }
+          return cp_eval_compare_float64(series->data.f64[row],
+                                         node->op,
+                                         node->f64_value,
+                                         out,
+                                         err);
+        case CP_DTYPE_STRING: {
+          if (series->is_null[row]) {
+            *out = 0;
+            return 1;
+          }
+          const char *lhs = series->data.str[row] ? series->data.str[row] : "";
+          return cp_eval_compare_string(lhs, node->op, node->value, out, err);
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, 0, "unsupported dtype");
+          return 0;
+      }
+    }
+    case CP_QUERY_NODE_AND: {
+      int lhs = 0;
+      if (!cp_query_eval_node(node->left, row, &lhs, err)) {
+        return 0;
+      }
+      if (!lhs) {
+        *out = 0;
+        return 1;
+      }
+      int rhs = 0;
+      if (!cp_query_eval_node(node->right, row, &rhs, err)) {
+        return 0;
+      }
+      *out = rhs ? 1 : 0;
+      return 1;
+    }
+    case CP_QUERY_NODE_OR: {
+      int lhs = 0;
+      if (!cp_query_eval_node(node->left, row, &lhs, err)) {
+        return 0;
+      }
+      if (lhs) {
+        *out = 1;
+        return 1;
+      }
+      int rhs = 0;
+      if (!cp_query_eval_node(node->right, row, &rhs, err)) {
+        return 0;
+      }
+      *out = rhs ? 1 : 0;
+      return 1;
+    }
+    default:
+      cp_error_set(err, CP_ERR_INVALID, row, 0, "unsupported query node");
+      return 0;
+  }
 }
 
 static int cp_prepare_replacements(const CpDataFrame *df,
@@ -4865,124 +5200,41 @@ CpDataFrame *cp_df_query(const CpDataFrame *df,
     return NULL;
   }
 
-  char *col = NULL;
-  char *value = NULL;
-  int value_quoted = 0;
-  CpCompareOp op = CP_OP_EQ;
-  if (!cp_parse_query_expr(expr, &col, &op, &value, &value_quoted, err)) {
+  const char *cursor = expr;
+  CpQueryNode *root = cp_query_parse_expr(df, &cursor, err);
+  if (!root) {
+    return NULL;
+  }
+  cursor = cp_skip_space(cursor);
+  if (cursor && *cursor != '\0') {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unexpected query content");
+    cp_query_node_free(root);
     return NULL;
   }
 
-  const CpSeries *series = cp_df_require_col(df, col, err);
-  if (!series) {
-    free(col);
-    free(value);
+  size_t nrows = df->nrows;
+  if (nrows == 0) {
+    cp_query_node_free(root);
+    return cp_df_empty_like(df, err);
+  }
+  uint8_t *mask = (uint8_t *)calloc(nrows, sizeof(uint8_t));
+  if (!mask) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    cp_query_node_free(root);
     return NULL;
   }
-
-  if (!value_quoted && cp_str_eq_ci(value, "null")) {
-    if (op != CP_OP_EQ && op != CP_OP_NE) {
-      cp_error_set(err, CP_ERR_INVALID, 0, 0, "null comparison requires == or !=");
-      free(col);
-      free(value);
+  for (size_t row = 0; row < nrows; ++row) {
+    int match = 0;
+    if (!cp_query_eval_node(root, row, &match, err)) {
+      free(mask);
+      cp_query_node_free(root);
       return NULL;
     }
-    size_t nrows = df->nrows;
-    if (nrows == 0) {
-      free(col);
-      free(value);
-      return cp_df_empty_like(df, err);
-    }
-    uint8_t *mask = (uint8_t *)calloc(nrows, sizeof(uint8_t));
-    if (!mask) {
-      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-      free(col);
-      free(value);
-      return NULL;
-    }
-    for (size_t row = 0; row < nrows; ++row) {
-      int is_null = series->is_null[row] ? 1 : 0;
-      int match = op == CP_OP_EQ ? is_null : !is_null;
-      mask[row] = match ? 1 : 0;
-    }
-    CpDataFrame *out = cp_df_filter_mask(df, mask, nrows, err);
-    free(mask);
-    free(col);
-    free(value);
-    return out;
+    mask[row] = match ? 1 : 0;
   }
-
-  if (!value_quoted && series->dtype == CP_DTYPE_FLOAT64 &&
-      cp_str_eq_ci(value, "nan")) {
-    if (op != CP_OP_EQ && op != CP_OP_NE) {
-      cp_error_set(err, CP_ERR_INVALID, 0, 0, "nan comparison requires == or !=");
-      free(col);
-      free(value);
-      return NULL;
-    }
-    size_t nrows = df->nrows;
-    if (nrows == 0) {
-      free(col);
-      free(value);
-      return cp_df_empty_like(df, err);
-    }
-    uint8_t *mask = (uint8_t *)calloc(nrows, sizeof(uint8_t));
-    if (!mask) {
-      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-      free(col);
-      free(value);
-      return NULL;
-    }
-    for (size_t row = 0; row < nrows; ++row) {
-      int is_nan = !series->is_null[row] && isnan(series->data.f64[row]);
-      int match = op == CP_OP_EQ ? is_nan : !is_nan;
-      mask[row] = match ? 1 : 0;
-    }
-    CpDataFrame *out = cp_df_filter_mask(df, mask, nrows, err);
-    free(mask);
-    free(col);
-    free(value);
-    return out;
-  }
-
-  CpDataFrame *out = NULL;
-  switch (series->dtype) {
-    case CP_DTYPE_INT64: {
-      int64_t v = 0;
-      int is_null = 0;
-      if (!cp_parse_int64(value, &v, &is_null, err, 0, 0)) {
-        break;
-      }
-      if (is_null) {
-        cp_error_set(err, CP_ERR_INVALID, 0, 0, "query value is null");
-        break;
-      }
-      out = cp_df_filter_int64(df, col, op, v, err);
-      break;
-    }
-    case CP_DTYPE_FLOAT64: {
-      double v = 0.0;
-      int is_null = 0;
-      if (!cp_parse_float64(value, &v, &is_null, err, 0, 0)) {
-        break;
-      }
-      if (is_null) {
-        cp_error_set(err, CP_ERR_INVALID, 0, 0, "query value is null");
-        break;
-      }
-      out = cp_df_filter_float64(df, col, op, v, err);
-      break;
-    }
-    case CP_DTYPE_STRING:
-      out = cp_df_filter_string(df, col, op, value, err);
-      break;
-    default:
-      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported dtype");
-      break;
-  }
-
-  free(col);
-  free(value);
+  CpDataFrame *out = cp_df_filter_mask(df, mask, nrows, err);
+  free(mask);
+  cp_query_node_free(root);
   return out;
 }
 
