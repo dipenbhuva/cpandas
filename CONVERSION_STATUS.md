@@ -85,7 +85,6 @@ Remaining from the list
 
 Core DataFrame operations
 - Column selection by dtype and projection API.
-- Multi-column predicate composition (AND/OR) and expression evaluation.
 - Vectorized arithmetic and comparison ops beyond aggregations.
 
 Joins
@@ -117,8 +116,8 @@ Advanced pandas features
 - CSV parsing is intentionally minimal for MVP and does not support multiline
   quoted fields.
 - dtype inference is not implemented; dtypes must be provided or default to string.
-- `query` supports a single predicate with basic comparison operators; it does not
-  yet support AND/OR chaining or complex expressions.
+- `query` supports `AND`/`OR` chaining with parentheses and basic comparison
+  operators; it does not support functions or complex expressions.
 - `set_index` stores a single column as index metadata (column remains in data and
   must be int64 or string); `reset_index` clears it.
 - `at` uses index metadata when present, otherwise treats the row label as a
