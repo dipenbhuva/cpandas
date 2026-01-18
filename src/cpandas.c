@@ -8536,6 +8536,12 @@ int cp_df_write_csv(const CpDataFrame *df,
   return 1;
 }
 
+int cp_df_to_excel(const CpDataFrame *df,
+                   const char *path,
+                   CpError *err) {
+  return cp_df_write_csv(df, path, '\t', 1, err);
+}
+
 static const char *cp_sql_dtype_name(CpDType dtype) {
   switch (dtype) {
     case CP_DTYPE_INT64:
@@ -8712,6 +8718,266 @@ int cp_df_to_sql(const CpDataFrame *df,
   }
 
   fclose(fp);
+  return 1;
+}
+
+static int cp_xml_write_text(FILE *fp, const char *s) {
+  if (!fp) {
+    return 0;
+  }
+  if (!s) {
+    return 1;
+  }
+  for (const char *p = s; *p; ++p) {
+    switch (*p) {
+      case '&':
+        if (fputs("&amp;", fp) < 0) {
+          return 0;
+        }
+        break;
+      case '<':
+        if (fputs("&lt;", fp) < 0) {
+          return 0;
+        }
+        break;
+      case '>':
+        if (fputs("&gt;", fp) < 0) {
+          return 0;
+        }
+        break;
+      case '"':
+        if (fputs("&quot;", fp) < 0) {
+          return 0;
+        }
+        break;
+      case '\'':
+        if (fputs("&apos;", fp) < 0) {
+          return 0;
+        }
+        break;
+      default:
+        if (fputc(*p, fp) == EOF) {
+          return 0;
+        }
+        break;
+    }
+  }
+  return 1;
+}
+
+int cp_df_plot(const CpDataFrame *df,
+               const char *path,
+               CpError *err) {
+  if (!df || !path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid plot arguments");
+    return 0;
+  }
+  if (df->nrows == 0 || df->ncols == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "empty dataframe");
+    return 0;
+  }
+
+  size_t ncols = df->ncols;
+  size_t *num_cols = (size_t *)malloc(ncols * sizeof(size_t));
+  if (!num_cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  size_t num_count = 0;
+  for (size_t col = 0; col < ncols; ++col) {
+    CpSeries *series = df->cols[col];
+    if (!series) {
+      free(num_cols);
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "column not found");
+      return 0;
+    }
+    if (series->dtype == CP_DTYPE_INT64 || series->dtype == CP_DTYPE_FLOAT64) {
+      num_cols[num_count++] = col;
+    }
+  }
+  if (num_count == 0) {
+    free(num_cols);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no numeric columns");
+    return 0;
+  }
+
+  int has_value = 0;
+  double min_val = 0.0;
+  double max_val = 0.0;
+  for (size_t i = 0; i < num_count; ++i) {
+    const CpSeries *series = df->cols[num_cols[i]];
+    for (size_t row = 0; row < df->nrows; ++row) {
+      double v = 0.0;
+      if (!cp_series_get_numeric(series, row, &v)) {
+        continue;
+      }
+      if (!has_value) {
+        min_val = v;
+        max_val = v;
+        has_value = 1;
+      } else {
+        if (v < min_val) {
+          min_val = v;
+        }
+        if (v > max_val) {
+          max_val = v;
+        }
+      }
+    }
+  }
+  if (!has_value) {
+    free(num_cols);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no numeric values");
+    return 0;
+  }
+
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    free(num_cols);
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return 0;
+  }
+
+  const double width = 640.0;
+  const double height = 360.0;
+  const double margin = 40.0;
+  const double plot_width = width - margin * 2.0;
+  const double plot_height = height - margin * 2.0;
+  const double x0 = margin;
+  const double y0 = margin + plot_height;
+  double range = max_val - min_val;
+  if (range == 0.0) {
+    range = 1.0;
+  }
+  double x_step = 0.0;
+  if (df->nrows > 1) {
+    x_step = plot_width / (double)(df->nrows - 1);
+  }
+
+  if (fprintf(fp,
+              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+              "<svg xmlns=\"http://www.w3.org/2000/svg\" "
+              "width=\"%.0f\" height=\"%.0f\" viewBox=\"0 0 %.0f %.0f\">\n",
+              width,
+              height,
+              width,
+              height) < 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+    fclose(fp);
+    free(num_cols);
+    return 0;
+  }
+  if (fprintf(fp,
+              "<rect x=\"0\" y=\"0\" width=\"%.0f\" height=\"%.0f\" "
+              "fill=\"white\"/>\n",
+              width,
+              height) < 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+    fclose(fp);
+    free(num_cols);
+    return 0;
+  }
+  if (fprintf(fp,
+              "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" "
+              "stroke=\"#444\" stroke-width=\"1\"/>\n",
+              x0,
+              y0,
+              x0 + plot_width,
+              y0) < 0 ||
+      fprintf(fp,
+              "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" "
+              "stroke=\"#444\" stroke-width=\"1\"/>\n",
+              x0,
+              y0,
+              x0,
+              y0 - plot_height) < 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+    fclose(fp);
+    free(num_cols);
+    return 0;
+  }
+
+  static const char *colors[] = {
+      "#1f77b4",
+      "#ff7f0e",
+      "#2ca02c",
+      "#d62728",
+      "#9467bd",
+      "#8c564b"};
+  size_t color_count = sizeof(colors) / sizeof(colors[0]);
+
+  for (size_t i = 0; i < num_count; ++i) {
+    const CpSeries *series = df->cols[num_cols[i]];
+    const char *color = colors[i % color_count];
+    int has_points = 0;
+    for (size_t row = 0; row < df->nrows; ++row) {
+      double v = 0.0;
+      if (!cp_series_get_numeric(series, row, &v)) {
+        continue;
+      }
+      double x = x0 + x_step * (double)row;
+      double y = y0 - ((v - min_val) / range) * plot_height;
+      if (!has_points) {
+        if (fprintf(fp,
+                    "<polyline fill=\"none\" stroke=\"%s\" "
+                    "stroke-width=\"1.5\" points=\"",
+                    color) < 0) {
+          cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+          fclose(fp);
+          free(num_cols);
+          return 0;
+        }
+        has_points = 1;
+      }
+      if (fprintf(fp, "%.2f,%.2f ", x, y) < 0) {
+        cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+        fclose(fp);
+        free(num_cols);
+        return 0;
+      }
+    }
+    if (has_points) {
+      if (fputs("\"/>\n", fp) < 0) {
+        cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+        fclose(fp);
+        free(num_cols);
+        return 0;
+      }
+    }
+  }
+
+  double legend_x = x0 + 4.0;
+  double legend_y = margin - 12.0;
+  if (legend_y < 12.0) {
+    legend_y = 12.0;
+  }
+  for (size_t i = 0; i < num_count; ++i) {
+    const CpSeries *series = df->cols[num_cols[i]];
+    const char *color = colors[i % color_count];
+    if (fprintf(fp,
+                "<text x=\"%.2f\" y=\"%.2f\" fill=\"%s\" "
+                "font-size=\"12\" font-family=\"sans-serif\">",
+                legend_x,
+                legend_y + (double)i * 14.0,
+                color) < 0 ||
+        !cp_xml_write_text(fp, series->name ? series->name : "") ||
+        fputs("</text>\n", fp) < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+      fclose(fp);
+      free(num_cols);
+      return 0;
+    }
+  }
+
+  if (fputs("</svg>\n", fp) < 0 || ferror(fp)) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write plot");
+    fclose(fp);
+    free(num_cols);
+    return 0;
+  }
+
+  fclose(fp);
+  free(num_cols);
   return 1;
 }
 

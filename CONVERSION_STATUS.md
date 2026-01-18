@@ -72,7 +72,8 @@ Implemented from the list
 - Type/index helpers (`astype`, `set_index`, `reset_index`, `at`).
 - Apply/transform helpers (`apply`, `transform`) and iteration (`iterrows`, `iteritems`).
 - Stats (`median`, `std`, `corr`, `cov`, `rank`, `diff`).
-- Conversion/format (`to_numeric`, `to_datetime`, `to_string`).
+- Conversion/format (`to_numeric`, `to_datetime`, `to_string`, `to_excel`, `to_sql`).
+- Plotting (`plot`).
 - Groupby and `agg`.
 - Merging (`pd.merge`).
 - Pivot tables.
@@ -80,7 +81,7 @@ Implemented from the list
 - DataFrame copy (`copy`).
 
 Remaining from the list
-- Conversion/format: `to_excel`, `plot`.
+- None.
 
 ## Remaining / Not Yet Implemented
 
@@ -134,3 +135,5 @@ Advanced pandas features
 - `to_string` renders a space-aligned table with `null` for nulls.
 - `to_sql` writes a SQL script (CREATE TABLE + INSERT statements) with identifiers
   quoted and string values escaped via doubled single quotes.
+- `to_excel` writes a tab-separated text file with a header for Excel import.
+- `plot` renders a simple SVG polyline chart of numeric columns vs row index.
