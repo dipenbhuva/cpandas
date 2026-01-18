@@ -96,7 +96,7 @@ Joins
 Indexing and missing values
 - Index and index-based operations.
 - Missing value handling beyond blank/whitespace parsing and null flags
-  (e.g., custom NA tokens, column-wise strategies).
+  (e.g., column-wise strategies).
 
 I/O and formats
 - Parquet/JSON or other formats.
@@ -140,3 +140,4 @@ Advanced pandas features
 - `plot` renders a simple SVG polyline chart of numeric columns vs row index.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
+- `read_csv_with_na`/`read_tsv_with_na` accept custom NA tokens for parsing.
