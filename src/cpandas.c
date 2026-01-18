@@ -217,6 +217,37 @@ static int cp_eval_compare_string(const char *lhs,
   }
 }
 
+static int cp_apply_arith(double lhs,
+                          double rhs,
+                          CpArithOp op,
+                          double *out,
+                          CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arithmetic output");
+    return 0;
+  }
+  switch (op) {
+    case CP_ARITH_ADD:
+      *out = lhs + rhs;
+      return 1;
+    case CP_ARITH_SUB:
+      *out = lhs - rhs;
+      return 1;
+    case CP_ARITH_MUL:
+      *out = lhs * rhs;
+      return 1;
+    case CP_ARITH_DIV:
+      if (rhs == 0.0) {
+        return 0;
+      }
+      *out = lhs / rhs;
+      return 1;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arithmetic op");
+      return 0;
+  }
+}
+
 static uint32_t cp_rand_next(uint32_t *state) {
   uint32_t x = state ? *state : 0;
   if (x == 0) {
@@ -4939,6 +4970,138 @@ int cp_df_iteritems(const CpDataFrame *df,
   return 1;
 }
 
+CpDataFrame *cp_df_arith_scalar(const CpDataFrame *df,
+                                const char *name,
+                                CpArithOp op,
+                                double value,
+                                const char *out_name,
+                                CpError *err) {
+  if (!df || !name) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arithmetic");
+    return NULL;
+  }
+  if (!isfinite(value)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "scalar must be finite");
+    return NULL;
+  }
+  const CpSeries *series = cp_df_require_col(df, name, err);
+  if (!series) {
+    return NULL;
+  }
+  if (series->dtype != CP_DTYPE_INT64 && series->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported dtype");
+    return NULL;
+  }
+
+  const char *col_name =
+      (out_name && out_name[0] != '\0') ? out_name : series->name;
+  const char *names[1] = {col_name};
+  CpDType dtypes[1] = {CP_DTYPE_FLOAT64};
+  CpDataFrame *out = cp_df_create(1, names, dtypes, df->nrows, err);
+  if (!out) {
+    return NULL;
+  }
+  if (df->has_index && df->index_col < df->ncols &&
+      df->cols[df->index_col] == series) {
+    out->has_index = 1;
+    out->index_col = 0;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    double lhs = 0.0;
+    int ok = 0;
+    if (!cp_series_get_numeric(series, row, &lhs)) {
+      ok = cp_series_append_null(out->cols[0], err);
+    } else {
+      double result = 0.0;
+      int applied = cp_apply_arith(lhs, value, op, &result, err);
+      if (!applied) {
+        if (err && err->code != CP_OK) {
+          cp_df_free(out);
+          return NULL;
+        }
+        ok = cp_series_append_null(out->cols[0], err);
+      } else {
+        ok = cp_series_append_float64(out->cols[0], result, 0, err);
+      }
+    }
+    if (!ok) {
+      cp_df_free(out);
+      return NULL;
+    }
+    out->nrows += 1;
+  }
+
+  return out;
+}
+
+CpDataFrame *cp_df_arith_cols(const CpDataFrame *df,
+                              const char *left,
+                              const char *right,
+                              CpArithOp op,
+                              const char *out_name,
+                              CpError *err) {
+  if (!df || !left || !right) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arithmetic");
+    return NULL;
+  }
+  const CpSeries *lhs = cp_df_require_col(df, left, err);
+  if (!lhs) {
+    return NULL;
+  }
+  const CpSeries *rhs = cp_df_require_col(df, right, err);
+  if (!rhs) {
+    return NULL;
+  }
+  if ((lhs->dtype != CP_DTYPE_INT64 && lhs->dtype != CP_DTYPE_FLOAT64) ||
+      (rhs->dtype != CP_DTYPE_INT64 && rhs->dtype != CP_DTYPE_FLOAT64)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported dtype");
+    return NULL;
+  }
+
+  const char *col_name = (out_name && out_name[0] != '\0') ? out_name : lhs->name;
+  const char *names[1] = {col_name};
+  CpDType dtypes[1] = {CP_DTYPE_FLOAT64};
+  CpDataFrame *out = cp_df_create(1, names, dtypes, df->nrows, err);
+  if (!out) {
+    return NULL;
+  }
+  if (df->has_index && df->index_col < df->ncols &&
+      df->cols[df->index_col] == lhs) {
+    out->has_index = 1;
+    out->index_col = 0;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    double lval = 0.0;
+    double rval = 0.0;
+    int ok = 0;
+    if (!cp_series_get_numeric(lhs, row, &lval) ||
+        !cp_series_get_numeric(rhs, row, &rval)) {
+      ok = cp_series_append_null(out->cols[0], err);
+    } else {
+      double result = 0.0;
+      int applied = cp_apply_arith(lval, rval, op, &result, err);
+      if (!applied) {
+        if (err && err->code != CP_OK) {
+          cp_df_free(out);
+          return NULL;
+        }
+        ok = cp_series_append_null(out->cols[0], err);
+      } else {
+        ok = cp_series_append_float64(out->cols[0], result, 0, err);
+      }
+    }
+    if (!ok) {
+      cp_df_free(out);
+      return NULL;
+    }
+    out->nrows += 1;
+  }
+
+  return out;
+}
+
 CpDataFrame *cp_df_diff(const CpDataFrame *df,
                         const char *name,
                         CpError *err) {
@@ -7739,6 +7902,94 @@ int cp_df_mask_string(const CpDataFrame *df,
     out[row] = match ? 1 : 0;
   }
   return 1;
+}
+
+int cp_df_mask_cols(const CpDataFrame *df,
+                    const char *left,
+                    CpCompareOp op,
+                    const char *right,
+                    uint8_t *out,
+                    size_t out_len,
+                    CpError *err) {
+  if (!df || !left || !right || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  if (out_len < df->nrows) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "output buffer too small");
+    return 0;
+  }
+  const CpSeries *lhs = cp_df_require_col(df, left, err);
+  if (!lhs) {
+    return 0;
+  }
+  const CpSeries *rhs = cp_df_require_col(df, right, err);
+  if (!rhs) {
+    return 0;
+  }
+
+  int lhs_num = lhs->dtype == CP_DTYPE_INT64 || lhs->dtype == CP_DTYPE_FLOAT64;
+  int rhs_num = rhs->dtype == CP_DTYPE_INT64 || rhs->dtype == CP_DTYPE_FLOAT64;
+  if (lhs_num && rhs_num) {
+    for (size_t row = 0; row < df->nrows; ++row) {
+      if (lhs->is_null[row] || rhs->is_null[row]) {
+        out[row] = 0;
+        continue;
+      }
+      if (lhs->dtype == CP_DTYPE_FLOAT64 &&
+          isnan(lhs->data.f64[row])) {
+        out[row] = 0;
+        continue;
+      }
+      if (rhs->dtype == CP_DTYPE_FLOAT64 &&
+          isnan(rhs->data.f64[row])) {
+        out[row] = 0;
+        continue;
+      }
+      int match = 0;
+      if (lhs->dtype == CP_DTYPE_INT64 && rhs->dtype == CP_DTYPE_INT64) {
+        if (!cp_eval_compare_int64(lhs->data.i64[row],
+                                   op,
+                                   rhs->data.i64[row],
+                                   &match,
+                                   err)) {
+          return 0;
+        }
+      } else {
+        double lval = lhs->dtype == CP_DTYPE_INT64
+                          ? (double)lhs->data.i64[row]
+                          : lhs->data.f64[row];
+        double rval = rhs->dtype == CP_DTYPE_INT64
+                          ? (double)rhs->data.i64[row]
+                          : rhs->data.f64[row];
+        if (!cp_eval_compare_float64(lval, op, rval, &match, err)) {
+          return 0;
+        }
+      }
+      out[row] = match ? 1 : 0;
+    }
+    return 1;
+  }
+
+  if (lhs->dtype == CP_DTYPE_STRING && rhs->dtype == CP_DTYPE_STRING) {
+    for (size_t row = 0; row < df->nrows; ++row) {
+      if (lhs->is_null[row] || rhs->is_null[row]) {
+        out[row] = 0;
+        continue;
+      }
+      const char *lval = lhs->data.str[row] ? lhs->data.str[row] : "";
+      const char *rval = rhs->data.str[row] ? rhs->data.str[row] : "";
+      int match = 0;
+      if (!cp_eval_compare_string(lval, op, rval, &match, err)) {
+        return 0;
+      }
+      out[row] = match ? 1 : 0;
+    }
+    return 1;
+  }
+
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
+  return 0;
 }
 
 CpDataFrame *cp_df_filter_int64(const CpDataFrame *df,

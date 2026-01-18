@@ -25,6 +25,7 @@ Data operations
 - Column selection by name.
 - Column selection by dtype.
 - Column drop and rename.
+- Vectorized arithmetic helpers and column-to-column comparisons.
 - Row append with type parsing (int64/float64/string).
 - Row filtering by boolean mask.
 - Row/column selection by position and name (`iloc`, `loc`).
@@ -86,7 +87,7 @@ Remaining from the list
 ## Remaining / Not Yet Implemented
 
 Core DataFrame operations
-- Vectorized arithmetic and comparison ops beyond aggregations.
+- None.
 
 Joins
 - Join performance tuning (parallelism, memory).
@@ -137,3 +138,5 @@ Advanced pandas features
   quoted and string values escaped via doubled single quotes.
 - `to_excel` writes a tab-separated text file with a header for Excel import.
 - `plot` renders a simple SVG polyline chart of numeric columns vs row index.
+- Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
+  zero yields nulls.

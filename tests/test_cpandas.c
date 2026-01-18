@@ -3814,6 +3814,129 @@ static void test_predicate_filters(void) {
   cp_df_free(df);
 }
 
+static void test_vector_ops(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name", "tag"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64,
+                      CP_DTYPE_STRING, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(4, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "2.0", "Alice", "Alice"};
+  const char *row2[] = {"2", "", "Bob", ""};
+  const char *row3[] = {"3", "nan", "Cara", "Dana"};
+  const char *row4[] = {"", "4.0", "", ""};
+  CHECK(cp_df_append_row(df, row1, 4, &err));
+  CHECK(cp_df_append_row(df, row2, 4, &err));
+  CHECK(cp_df_append_row(df, row3, 4, &err));
+  CHECK(cp_df_append_row(df, row4, 4, &err));
+
+  CpDataFrame *add_scalar =
+      cp_df_arith_scalar(df, "id", CP_ARITH_ADD, 2.0, "id_plus", &err);
+  CHECK(add_scalar != NULL);
+  if (add_scalar) {
+    CHECK(cp_df_nrows(add_scalar) == 4);
+    const CpSeries *col = cp_df_get_col(add_scalar, "id_plus");
+    CHECK(col != NULL);
+    double v = 0.0;
+    int is_null = 0;
+    CHECK(cp_series_get_float64(col, 0, &v, &is_null));
+    CHECK(!is_null && fabs(v - 3.0) < 1e-9);
+    CHECK(cp_series_get_float64(col, 1, &v, &is_null));
+    CHECK(!is_null && fabs(v - 4.0) < 1e-9);
+    CHECK(cp_series_get_float64(col, 2, &v, &is_null));
+    CHECK(!is_null && fabs(v - 5.0) < 1e-9);
+    CHECK(cp_series_get_float64(col, 3, &v, &is_null));
+    CHECK(is_null);
+  }
+
+  CpDataFrame *add_cols =
+      cp_df_arith_cols(df, "id", "score", CP_ARITH_ADD, NULL, &err);
+  CHECK(add_cols != NULL);
+  if (add_cols) {
+    CHECK(cp_df_nrows(add_cols) == 4);
+    const CpSeries *col = cp_df_get_col(add_cols, "id");
+    CHECK(col != NULL);
+    double v = 0.0;
+    int is_null = 0;
+    CHECK(cp_series_get_float64(col, 0, &v, &is_null));
+    CHECK(!is_null && fabs(v - 3.0) < 1e-9);
+    CHECK(cp_series_get_float64(col, 1, &v, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_float64(col, 2, &v, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_float64(col, 3, &v, &is_null));
+    CHECK(is_null);
+  }
+
+  CpDataFrame *div_zero =
+      cp_df_arith_scalar(df, "id", CP_ARITH_DIV, 0.0, "div", &err);
+  CHECK(div_zero != NULL);
+  if (div_zero) {
+    const CpSeries *col = cp_df_get_col(div_zero, "div");
+    CHECK(col != NULL);
+    for (size_t row = 0; row < cp_df_nrows(div_zero); ++row) {
+      double v = 0.0;
+      int is_null = 0;
+      CHECK(cp_series_get_float64(col, row, &v, &is_null));
+      CHECK(is_null);
+    }
+  }
+
+  uint8_t mask[4] = {0};
+  CHECK(cp_df_mask_cols(df, "id", CP_OP_LT, "score", mask, 4, &err));
+  CHECK(mask[0] == 1);
+  CHECK(mask[1] == 0);
+  CHECK(mask[2] == 0);
+  CHECK(mask[3] == 0);
+
+  uint8_t mask2[4] = {0};
+  CHECK(cp_df_mask_cols(df, "name", CP_OP_EQ, "tag", mask2, 4, &err));
+  CHECK(mask2[0] == 1);
+  CHECK(mask2[1] == 0);
+  CHECK(mask2[2] == 0);
+  CHECK(mask2[3] == 0);
+
+  cp_error_clear(&err);
+  double nan_val = NAN;
+  CpDataFrame *bad_scalar =
+      cp_df_arith_scalar(df, "id", CP_ARITH_ADD, nan_val, "bad", &err);
+  CHECK(bad_scalar == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  CpDataFrame *bad_cols =
+      cp_df_arith_cols(df, "name", "tag", CP_ARITH_ADD, NULL, &err);
+  CHECK(bad_cols == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  CHECK(!cp_df_mask_cols(df, "id", CP_OP_EQ, "name", mask, 4, &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (add_scalar) {
+    cp_df_free(add_scalar);
+  }
+  if (add_cols) {
+    cp_df_free(add_cols);
+  }
+  if (div_zero) {
+    cp_df_free(div_zero);
+  }
+  if (bad_scalar) {
+    cp_df_free(bad_scalar);
+  }
+  if (bad_cols) {
+    cp_df_free(bad_cols);
+  }
+  cp_df_free(df);
+}
+
 static void test_query(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4029,6 +4152,7 @@ int main(void) {
   test_join_strategy_forced();
   test_pivot_table();
   test_predicate_filters();
+  test_vector_ops();
   test_query();
 
   if (tests_failed != 0) {

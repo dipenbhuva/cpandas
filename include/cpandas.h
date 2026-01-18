@@ -33,6 +33,13 @@ typedef enum {
 } CpCompareOp;
 
 typedef enum {
+  CP_ARITH_ADD = 0,
+  CP_ARITH_SUB = 1,
+  CP_ARITH_MUL = 2,
+  CP_ARITH_DIV = 3
+} CpArithOp;
+
+typedef enum {
   CP_AGG_COUNT = 0,
   CP_AGG_SUM = 1,
   CP_AGG_MEAN = 2,
@@ -230,6 +237,13 @@ int cp_df_mask_string(const CpDataFrame *df,
                       uint8_t *out,
                       size_t out_len,
                       CpError *err);
+int cp_df_mask_cols(const CpDataFrame *df,
+                    const char *left,
+                    CpCompareOp op,
+                    const char *right,
+                    uint8_t *out,
+                    size_t out_len,
+                    CpError *err);
 CpDataFrame *cp_df_filter_int64(const CpDataFrame *df,
                                 const char *name,
                                 CpCompareOp op,
@@ -380,6 +394,18 @@ int cp_df_iteritems(const CpDataFrame *df,
                     CpIterItemFn func,
                     void *user_data,
                     CpError *err);
+CpDataFrame *cp_df_arith_scalar(const CpDataFrame *df,
+                                const char *name,
+                                CpArithOp op,
+                                double value,
+                                const char *out_name,
+                                CpError *err);
+CpDataFrame *cp_df_arith_cols(const CpDataFrame *df,
+                              const char *left,
+                              const char *right,
+                              CpArithOp op,
+                              const char *out_name,
+                              CpError *err);
 CpDataFrame *cp_df_diff(const CpDataFrame *df,
                         const char *name,
                         CpError *err);
