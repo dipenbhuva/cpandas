@@ -8667,6 +8667,14 @@ CpDataFrame *cp_df_read_csv(const char *path,
   return df;
 }
 
+CpDataFrame *cp_df_read_tsv(const char *path,
+                            int has_header,
+                            const CpDType *dtypes,
+                            size_t dtype_count,
+                            CpError *err) {
+  return cp_df_read_csv(path, '\t', has_header, dtypes, dtype_count, err);
+}
+
 static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {
   int needs_quotes = 0;
   for (const char *p = s; *p; ++p) {
@@ -8785,6 +8793,13 @@ int cp_df_write_csv(const CpDataFrame *df,
 
   fclose(fp);
   return 1;
+}
+
+int cp_df_write_tsv(const CpDataFrame *df,
+                    const char *path,
+                    int include_header,
+                    CpError *err) {
+  return cp_df_write_csv(df, path, '\t', include_header, err);
 }
 
 int cp_df_to_excel(const CpDataFrame *df,
