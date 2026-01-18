@@ -2977,6 +2977,108 @@ static void test_loc_iloc(void) {
   cp_df_free(df);
 }
 
+static void test_loc_labels_slice(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"10", "1.0", "A"};
+  const char *row2[] = {"20", "2.0", "B"};
+  const char *row3[] = {"30", "3.0", "C"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  CpDataFrame *indexed = cp_df_set_index(df, "id", &err);
+  CHECK(indexed != NULL);
+  if (indexed) {
+    const char *labels[] = {"20", "10"};
+    CpDataFrame *loc =
+        cp_df_loc_labels(indexed, labels, 2, NULL, 0, &err);
+    CHECK(loc != NULL);
+    if (loc) {
+      CHECK(cp_df_nrows(loc) == 2);
+      const CpSeries *id = cp_df_get_col(loc, "id");
+      CHECK(id != NULL);
+      int64_t id_val = 0;
+      int is_null = 0;
+      CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+      CHECK(!is_null && id_val == 20);
+      CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+      CHECK(!is_null && id_val == 10);
+    }
+
+    CpDataFrame *slice =
+        cp_df_loc_slice(indexed, "20", "30", NULL, 0, &err);
+    CHECK(slice != NULL);
+    if (slice) {
+      CHECK(cp_df_nrows(slice) == 2);
+      const CpSeries *id = cp_df_get_col(slice, "id");
+      CHECK(id != NULL);
+      int64_t id_val = 0;
+      int is_null = 0;
+      CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+      CHECK(!is_null && id_val == 20);
+      CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+      CHECK(!is_null && id_val == 30);
+    }
+
+    cp_error_clear(&err);
+    CpDataFrame *bad = cp_df_loc_slice(indexed, "30", "10", NULL, 0, &err);
+    CHECK(bad == NULL);
+    CHECK(err.code == CP_ERR_INVALID);
+
+    if (loc) {
+      cp_df_free(loc);
+    }
+    if (slice) {
+      cp_df_free(slice);
+    }
+    if (bad) {
+      cp_df_free(bad);
+    }
+  }
+
+  CpDataFrame *str_index = cp_df_set_index(df, "name", &err);
+  CHECK(str_index != NULL);
+  if (str_index) {
+    const char *labels[] = {"B", "C"};
+    const char *cols[] = {"id"};
+    CpDataFrame *loc =
+        cp_df_loc_labels(str_index, labels, 2, cols, 1, &err);
+    CHECK(loc != NULL);
+    if (loc) {
+      CHECK(cp_df_nrows(loc) == 2);
+      const CpSeries *id = cp_df_get_col(loc, "id");
+      CHECK(id != NULL);
+      int64_t id_val = 0;
+      int is_null = 0;
+      CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+      CHECK(!is_null && id_val == 20);
+      CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+      CHECK(!is_null && id_val == 30);
+    }
+    if (loc) {
+      cp_df_free(loc);
+    }
+  }
+
+  if (indexed) {
+    cp_df_free(indexed);
+  }
+  if (str_index) {
+    cp_df_free(str_index);
+  }
+  cp_df_free(df);
+}
+
 static void test_groupby_agg(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4264,6 +4366,7 @@ int main(void) {
   test_isnull_dropna();
   test_info_describe();
   test_loc_iloc();
+  test_loc_labels_slice();
   test_groupby_agg();
   test_join_inner_left();
   test_join_multi_key();

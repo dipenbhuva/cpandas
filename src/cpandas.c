@@ -3105,6 +3105,90 @@ CpDataFrame *cp_df_loc(const CpDataFrame *df,
   return out;
 }
 
+CpDataFrame *cp_df_loc_labels(const CpDataFrame *df,
+                              const char **row_labels,
+                              size_t row_count,
+                              const char **names,
+                              size_t name_count,
+                              CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (!row_labels) {
+    if (row_count != 0) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid row labels");
+      return NULL;
+    }
+    return cp_df_loc(df, NULL, 0, names, name_count, err);
+  }
+  if (row_count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no rows selected");
+    return NULL;
+  }
+
+  size_t *row_indices = (size_t *)malloc(row_count * sizeof(size_t));
+  if (!row_indices) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  for (size_t i = 0; i < row_count; ++i) {
+    if (!cp_df_find_row_label(df, row_labels[i], &row_indices[i], err)) {
+      free(row_indices);
+      return NULL;
+    }
+  }
+
+  CpDataFrame *out = cp_df_loc(df, row_indices, row_count,
+                               names, name_count, err);
+  free(row_indices);
+  return out;
+}
+
+CpDataFrame *cp_df_loc_slice(const CpDataFrame *df,
+                             const char *start_label,
+                             const char *end_label,
+                             const char **names,
+                             size_t name_count,
+                             CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (df->nrows == 0) {
+    return cp_df_empty_like(df, err);
+  }
+  size_t start_idx = 0;
+  size_t end_idx = df->nrows - 1;
+  if (start_label) {
+    if (!cp_df_find_row_label(df, start_label, &start_idx, err)) {
+      return NULL;
+    }
+  }
+  if (end_label) {
+    if (!cp_df_find_row_label(df, end_label, &end_idx, err)) {
+      return NULL;
+    }
+  }
+  if (start_idx > end_idx) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "slice start after end");
+    return NULL;
+  }
+  size_t count = end_idx - start_idx + 1;
+  size_t *row_indices = (size_t *)malloc(count * sizeof(size_t));
+  if (!row_indices) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    row_indices[i] = start_idx + i;
+  }
+  CpDataFrame *out = cp_df_loc(df, row_indices, count,
+                               names, name_count, err);
+  free(row_indices);
+  return out;
+}
+
 CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
                                const char **names,
                                size_t count,

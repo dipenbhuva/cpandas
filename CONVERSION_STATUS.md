@@ -94,7 +94,7 @@ Joins
 - Join performance tuning (parallelism, memory).
 
 Indexing and missing values
-- Index and index-based operations.
+- Index-based label selection helpers (`loc` by labels and slices).
 - Missing value handling beyond blank/whitespace parsing and null flags
   (e.g., column-wise strategies).
 
@@ -140,4 +140,6 @@ Advanced pandas features
 - `plot` renders a simple SVG polyline chart of numeric columns vs row index.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
+- `loc_labels`/`loc_slice` use the index metadata when present and positional
+  indices otherwise; duplicate index labels return the first match.
 - `read_csv_with_na`/`read_tsv_with_na` accept custom NA tokens for parsing.
