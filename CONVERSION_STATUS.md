@@ -14,6 +14,7 @@ I/O
 - CSV read/write with delimiter selection and optional header.
 - Basic CSV quoting/escaping for commas, quotes, and newlines.
 - TSV convenience wrappers for read/write.
+- JSON read/write (array-of-objects).
 
 Data exploration
 - `head` / `tail` row slicing helpers.
@@ -94,12 +95,11 @@ Joins
 - Join performance tuning (parallelism, memory).
 
 Indexing and missing values
-- Index-based label selection helpers (`loc` by labels and slices).
 - Missing value handling beyond blank/whitespace parsing and null flags
   (e.g., column-wise strategies).
 
 I/O and formats
-- Parquet/JSON or other formats.
+- Parquet or other formats.
 
 Performance and scalability
 - SIMD or parallel ops.
@@ -138,6 +138,9 @@ Advanced pandas features
   quoted and string values escaped via doubled single quotes.
 - `to_excel` writes a tab-separated text file with a header for Excel import.
 - `plot` renders a simple SVG polyline chart of numeric columns vs row index.
+- `read_json`/`write_json` handle arrays of JSON objects with primitive values;
+  nested objects/arrays and non-ASCII unicode escapes are rejected.
+- `read_parquet`/`write_parquet` are stubbed pending external library support.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional

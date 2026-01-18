@@ -8710,6 +8710,733 @@ static char **cp_make_default_names(size_t ncols, CpError *err) {
   return names;
 }
 
+typedef enum {
+  CP_JSON_NULL = 0,
+  CP_JSON_BOOL = 1,
+  CP_JSON_STRING = 2,
+  CP_JSON_NUMBER = 3
+} CpJsonType;
+
+typedef struct {
+  CpJsonType type;
+  char *str;
+  int boolean;
+} CpJsonValue;
+
+typedef struct {
+  int present;
+  CpJsonValue value;
+} CpJsonCell;
+
+typedef struct {
+  char *key;
+  CpJsonValue value;
+} CpJsonPair;
+
+typedef struct {
+  const char *src;
+  size_t len;
+  size_t pos;
+  size_t line;
+  size_t col;
+} CpJsonCursor;
+
+static char *cp_read_file_all(const char *path, size_t *out_len, CpError *err) {
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return NULL;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read file");
+    return NULL;
+  }
+  long size = ftell(fp);
+  if (size < 0) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read file");
+    return NULL;
+  }
+  if (fseek(fp, 0, SEEK_SET) != 0) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read file");
+    return NULL;
+  }
+  char *buf = (char *)malloc((size_t)size + 1);
+  if (!buf) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  size_t read = fread(buf, 1, (size_t)size, fp);
+  fclose(fp);
+  if (read != (size_t)size) {
+    free(buf);
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read file");
+    return NULL;
+  }
+  buf[size] = '\0';
+  if (out_len) {
+    *out_len = (size_t)size;
+  }
+  return buf;
+}
+
+static char cp_json_peek(const CpJsonCursor *cur) {
+  if (!cur || cur->pos >= cur->len) {
+    return '\0';
+  }
+  return cur->src[cur->pos];
+}
+
+static char cp_json_next(CpJsonCursor *cur) {
+  char ch = cp_json_peek(cur);
+  if (ch == '\0') {
+    return '\0';
+  }
+  cur->pos += 1;
+  if (ch == '\n') {
+    cur->line += 1;
+    cur->col = 1;
+  } else {
+    cur->col += 1;
+  }
+  return ch;
+}
+
+static void cp_json_skip_ws(CpJsonCursor *cur) {
+  while (isspace((unsigned char)cp_json_peek(cur))) {
+    cp_json_next(cur);
+  }
+}
+
+static void cp_json_set_error(CpError *err,
+                              const CpJsonCursor *cur,
+                              const char *msg) {
+  size_t line = cur ? cur->line : 0;
+  size_t col = cur ? cur->col : 0;
+  cp_error_set(err, CP_ERR_PARSE, 0, 0,
+               "json parse error at line %zu col %zu: %s",
+               line, col, msg ? msg : "invalid json");
+}
+
+static int cp_json_expect(CpJsonCursor *cur, char expected, CpError *err) {
+  if (cp_json_peek(cur) != expected) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "expected '%c'", expected);
+    cp_json_set_error(err, cur, msg);
+    return 0;
+  }
+  cp_json_next(cur);
+  return 1;
+}
+
+static int cp_json_hex_value(char ch, int *out) {
+  if (ch >= '0' && ch <= '9') {
+    *out = ch - '0';
+    return 1;
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    *out = 10 + (ch - 'a');
+    return 1;
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    *out = 10 + (ch - 'A');
+    return 1;
+  }
+  return 0;
+}
+
+static int cp_json_parse_string(CpJsonCursor *cur, char **out, CpError *err) {
+  if (!out) {
+    cp_json_set_error(err, cur, "invalid string output");
+    return 0;
+  }
+  if (cp_json_peek(cur) != '"') {
+    cp_json_set_error(err, cur, "expected string");
+    return 0;
+  }
+  cp_json_next(cur);
+  CpStrBuf buf;
+  if (!cp_strbuf_init(&buf, 32, err)) {
+    return 0;
+  }
+  while (1) {
+    char ch = cp_json_peek(cur);
+    if (ch == '\0') {
+      cp_strbuf_free(&buf);
+      cp_json_set_error(err, cur, "unterminated string");
+      return 0;
+    }
+    if (ch == '"') {
+      cp_json_next(cur);
+      break;
+    }
+    if ((unsigned char)ch < 0x20) {
+      cp_strbuf_free(&buf);
+      cp_json_set_error(err, cur, "control character in string");
+      return 0;
+    }
+    if (ch == '\\') {
+      cp_json_next(cur);
+      char esc = cp_json_peek(cur);
+      if (esc == '\0') {
+        cp_strbuf_free(&buf);
+        cp_json_set_error(err, cur, "unterminated escape");
+        return 0;
+      }
+      cp_json_next(cur);
+      switch (esc) {
+        case '"':
+        case '\\':
+        case '/':
+          if (!cp_strbuf_append_char(&buf, esc, err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        case 'b':
+          if (!cp_strbuf_append_char(&buf, '\b', err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        case 'f':
+          if (!cp_strbuf_append_char(&buf, '\f', err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        case 'n':
+          if (!cp_strbuf_append_char(&buf, '\n', err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        case 'r':
+          if (!cp_strbuf_append_char(&buf, '\r', err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        case 't':
+          if (!cp_strbuf_append_char(&buf, '\t', err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        case 'u': {
+          int code = 0;
+          for (int i = 0; i < 4; ++i) {
+            char hex = cp_json_peek(cur);
+            int value = 0;
+            if (hex == '\0' || !cp_json_hex_value(hex, &value)) {
+              cp_strbuf_free(&buf);
+              cp_json_set_error(err, cur, "invalid unicode escape");
+              return 0;
+            }
+            cp_json_next(cur);
+            code = (code << 4) | value;
+          }
+          if (code > 0x7f) {
+            cp_strbuf_free(&buf);
+            cp_json_set_error(err, cur, "unicode escape out of range");
+            return 0;
+          }
+          if (!cp_strbuf_append_char(&buf, (char)code, err)) {
+            cp_strbuf_free(&buf);
+            return 0;
+          }
+          break;
+        }
+        default:
+          cp_strbuf_free(&buf);
+          cp_json_set_error(err, cur, "invalid escape");
+          return 0;
+      }
+      continue;
+    }
+    cp_json_next(cur);
+    if (!cp_strbuf_append_char(&buf, ch, err)) {
+      cp_strbuf_free(&buf);
+      return 0;
+    }
+  }
+  *out = buf.data;
+  return 1;
+}
+
+static int cp_json_parse_number(CpJsonCursor *cur, char **out, CpError *err) {
+  if (!out) {
+    cp_json_set_error(err, cur, "invalid number output");
+    return 0;
+  }
+  size_t start = cur->pos;
+  char ch = cp_json_peek(cur);
+  if (ch == '-') {
+    cp_json_next(cur);
+  }
+  ch = cp_json_peek(cur);
+  if (ch == '0') {
+    cp_json_next(cur);
+  } else if (isdigit((unsigned char)ch)) {
+    while (isdigit((unsigned char)cp_json_peek(cur))) {
+      cp_json_next(cur);
+    }
+  } else {
+    cp_json_set_error(err, cur, "invalid number");
+    return 0;
+  }
+  if (cp_json_peek(cur) == '.') {
+    cp_json_next(cur);
+    if (!isdigit((unsigned char)cp_json_peek(cur))) {
+      cp_json_set_error(err, cur, "invalid number");
+      return 0;
+    }
+    while (isdigit((unsigned char)cp_json_peek(cur))) {
+      cp_json_next(cur);
+    }
+  }
+  ch = cp_json_peek(cur);
+  if (ch == 'e' || ch == 'E') {
+    cp_json_next(cur);
+    ch = cp_json_peek(cur);
+    if (ch == '+' || ch == '-') {
+      cp_json_next(cur);
+    }
+    if (!isdigit((unsigned char)cp_json_peek(cur))) {
+      cp_json_set_error(err, cur, "invalid number");
+      return 0;
+    }
+    while (isdigit((unsigned char)cp_json_peek(cur))) {
+      cp_json_next(cur);
+    }
+  }
+  size_t end = cur->pos;
+  if (end <= start) {
+    cp_json_set_error(err, cur, "invalid number");
+    return 0;
+  }
+  char *num = cp_strndup(cur->src + start, end - start);
+  if (!num) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  *out = num;
+  return 1;
+}
+
+static int cp_json_match_literal(CpJsonCursor *cur,
+                                 const char *literal) {
+  size_t len = strlen(literal);
+  if (!cur || cur->pos + len > cur->len) {
+    return 0;
+  }
+  if (strncmp(cur->src + cur->pos, literal, len) != 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    cp_json_next(cur);
+  }
+  return 1;
+}
+
+static void cp_json_value_free(CpJsonValue *value) {
+  if (!value) {
+    return;
+  }
+  free(value->str);
+  value->str = NULL;
+}
+
+static void cp_json_cells_clear(CpJsonCell *cells, size_t count) {
+  if (!cells) {
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (cells[i].present) {
+      cp_json_value_free(&cells[i].value);
+      cells[i].present = 0;
+    }
+  }
+}
+
+static void cp_json_pairs_free(CpJsonPair *pairs, size_t count) {
+  if (!pairs) {
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    free(pairs[i].key);
+    cp_json_value_free(&pairs[i].value);
+  }
+  free(pairs);
+}
+
+static int cp_json_pairs_push(CpJsonPair **pairs,
+                              size_t *count,
+                              size_t *cap,
+                              char *key,
+                              const CpJsonValue *value,
+                              CpError *err) {
+  if (*count >= *cap) {
+    size_t new_cap = *cap == 0 ? 4 : (*cap * 2);
+    CpJsonPair *new_pairs =
+        (CpJsonPair *)realloc(*pairs, new_cap * sizeof(CpJsonPair));
+    if (!new_pairs) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+    *pairs = new_pairs;
+    *cap = new_cap;
+  }
+  (*pairs)[*count].key = key;
+  (*pairs)[*count].value = *value;
+  *count += 1;
+  return 1;
+}
+
+static int cp_json_parse_value(CpJsonCursor *cur,
+                               CpJsonValue *out,
+                               CpError *err) {
+  if (!out) {
+    cp_json_set_error(err, cur, "invalid value output");
+    return 0;
+  }
+  cp_json_skip_ws(cur);
+  char ch = cp_json_peek(cur);
+  if (ch == '"') {
+    char *s = NULL;
+    if (!cp_json_parse_string(cur, &s, err)) {
+      return 0;
+    }
+    out->type = CP_JSON_STRING;
+    out->str = s;
+    out->boolean = 0;
+    return 1;
+  }
+  if (ch == '-' || isdigit((unsigned char)ch)) {
+    char *num = NULL;
+    if (!cp_json_parse_number(cur, &num, err)) {
+      return 0;
+    }
+    out->type = CP_JSON_NUMBER;
+    out->str = num;
+    out->boolean = 0;
+    return 1;
+  }
+  if (ch == 't') {
+    if (!cp_json_match_literal(cur, "true")) {
+      cp_json_set_error(err, cur, "invalid literal");
+      return 0;
+    }
+    out->type = CP_JSON_BOOL;
+    out->str = NULL;
+    out->boolean = 1;
+    return 1;
+  }
+  if (ch == 'f') {
+    if (!cp_json_match_literal(cur, "false")) {
+      cp_json_set_error(err, cur, "invalid literal");
+      return 0;
+    }
+    out->type = CP_JSON_BOOL;
+    out->str = NULL;
+    out->boolean = 0;
+    return 1;
+  }
+  if (ch == 'n') {
+    if (!cp_json_match_literal(cur, "null")) {
+      cp_json_set_error(err, cur, "invalid literal");
+      return 0;
+    }
+    out->type = CP_JSON_NULL;
+    out->str = NULL;
+    out->boolean = 0;
+    return 1;
+  }
+  if (ch == '{' || ch == '[') {
+    cp_json_set_error(err, cur, "nested json values are not supported");
+    return 0;
+  }
+  cp_json_set_error(err, cur, "invalid value");
+  return 0;
+}
+
+static int cp_json_parse_object_pairs(CpJsonCursor *cur,
+                                      CpJsonPair **out_pairs,
+                                      size_t *out_count,
+                                      CpError *err) {
+  if (!out_pairs || !out_count) {
+    cp_json_set_error(err, cur, "invalid object output");
+    return 0;
+  }
+  if (!cp_json_expect(cur, '{', err)) {
+    return 0;
+  }
+  cp_json_skip_ws(cur);
+  if (cp_json_peek(cur) == '}') {
+    cp_json_next(cur);
+    *out_pairs = NULL;
+    *out_count = 0;
+    return 1;
+  }
+  CpJsonPair *pairs = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+  while (1) {
+    char *key = NULL;
+    if (!cp_json_parse_string(cur, &key, err)) {
+      cp_json_pairs_free(pairs, count);
+      return 0;
+    }
+    for (size_t i = 0; i < count; ++i) {
+      if (strcmp(pairs[i].key, key) == 0) {
+        free(key);
+        cp_json_pairs_free(pairs, count);
+        cp_json_set_error(err, cur, "duplicate key in object");
+        return 0;
+      }
+    }
+    cp_json_skip_ws(cur);
+    if (!cp_json_expect(cur, ':', err)) {
+      free(key);
+      cp_json_pairs_free(pairs, count);
+      return 0;
+    }
+    cp_json_skip_ws(cur);
+    CpJsonValue value;
+    if (!cp_json_parse_value(cur, &value, err)) {
+      free(key);
+      cp_json_pairs_free(pairs, count);
+      return 0;
+    }
+    if (!cp_json_pairs_push(&pairs, &count, &cap, key, &value, err)) {
+      free(key);
+      cp_json_value_free(&value);
+      cp_json_pairs_free(pairs, count);
+      return 0;
+    }
+    cp_json_skip_ws(cur);
+    char ch = cp_json_peek(cur);
+    if (ch == ',') {
+      cp_json_next(cur);
+      cp_json_skip_ws(cur);
+      continue;
+    }
+    if (ch == '}') {
+      cp_json_next(cur);
+      break;
+    }
+    cp_json_pairs_free(pairs, count);
+    cp_json_set_error(err, cur, "expected ',' or '}'");
+    return 0;
+  }
+  *out_pairs = pairs;
+  *out_count = count;
+  return 1;
+}
+
+static size_t cp_json_find_col(const CpDataFrame *df, const char *key) {
+  if (!df || !key) {
+    return SIZE_MAX;
+  }
+  for (size_t i = 0; i < df->ncols; ++i) {
+    if (df->cols[i]->name && strcmp(df->cols[i]->name, key) == 0) {
+      return i;
+    }
+  }
+  return SIZE_MAX;
+}
+
+static int cp_json_parse_object_row(CpJsonCursor *cur,
+                                    const CpDataFrame *df,
+                                    CpJsonCell *cells,
+                                    CpError *err) {
+  if (!df || !cells) {
+    cp_json_set_error(err, cur, "invalid row output");
+    return 0;
+  }
+  if (!cp_json_expect(cur, '{', err)) {
+    return 0;
+  }
+  cp_json_skip_ws(cur);
+  if (cp_json_peek(cur) == '}') {
+    cp_json_next(cur);
+    return 1;
+  }
+  while (1) {
+    char *key = NULL;
+    if (!cp_json_parse_string(cur, &key, err)) {
+      return 0;
+    }
+    cp_json_skip_ws(cur);
+    if (!cp_json_expect(cur, ':', err)) {
+      free(key);
+      return 0;
+    }
+    cp_json_skip_ws(cur);
+    CpJsonValue value;
+    if (!cp_json_parse_value(cur, &value, err)) {
+      free(key);
+      return 0;
+    }
+    size_t idx = cp_json_find_col(df, key);
+    if (idx == SIZE_MAX) {
+      cp_error_set(err, CP_ERR_PARSE, df->nrows, 0,
+                   "unknown json key '%s'", key);
+      free(key);
+      cp_json_value_free(&value);
+      return 0;
+    }
+    if (cells[idx].present) {
+      cp_error_set(err, CP_ERR_PARSE, df->nrows, idx,
+                   "duplicate json key '%s'", key);
+      free(key);
+      cp_json_value_free(&value);
+      return 0;
+    }
+    cells[idx].present = 1;
+    cells[idx].value = value;
+    free(key);
+    cp_json_skip_ws(cur);
+    char ch = cp_json_peek(cur);
+    if (ch == ',') {
+      cp_json_next(cur);
+      cp_json_skip_ws(cur);
+      continue;
+    }
+    if (ch == '}') {
+      cp_json_next(cur);
+      break;
+    }
+    cp_json_set_error(err, cur, "expected ',' or '}'");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_json_append_cell(CpSeries *series,
+                               const CpJsonValue *value,
+                               int present,
+                               size_t row,
+                               size_t col,
+                               CpError *err) {
+  if (!series) {
+    cp_error_set(err, CP_ERR_INVALID, row, col, "invalid series");
+    return 0;
+  }
+  if (!present || !value || value->type == CP_JSON_NULL) {
+    return cp_series_append_null(series, err);
+  }
+  switch (series->dtype) {
+    case CP_DTYPE_INT64: {
+      if (value->type == CP_JSON_BOOL) {
+        int64_t v = value->boolean ? 1 : 0;
+        return cp_series_append_int64(series, v, 0, err);
+      }
+      if (value->type == CP_JSON_NUMBER || value->type == CP_JSON_STRING) {
+        int64_t v = 0;
+        int is_null = 0;
+        const char *s = value->str ? value->str : "";
+        if (!cp_parse_int64(s, &v, &is_null, err, row, col)) {
+          return 0;
+        }
+        return cp_series_append_int64(series, v, is_null, err);
+      }
+      cp_error_set(err, CP_ERR_PARSE, row, col,
+                   "invalid json value for int64");
+      return 0;
+    }
+    case CP_DTYPE_FLOAT64: {
+      if (value->type == CP_JSON_BOOL) {
+        double v = value->boolean ? 1.0 : 0.0;
+        return cp_series_append_float64(series, v, 0, err);
+      }
+      if (value->type == CP_JSON_NUMBER || value->type == CP_JSON_STRING) {
+        double v = 0.0;
+        int is_null = 0;
+        const char *s = value->str ? value->str : "";
+        if (!cp_parse_float64(s, &v, &is_null, err, row, col)) {
+          return 0;
+        }
+        return cp_series_append_float64(series, v, is_null, err);
+      }
+      cp_error_set(err, CP_ERR_PARSE, row, col,
+                   "invalid json value for float64");
+      return 0;
+    }
+    case CP_DTYPE_STRING: {
+      const char *s = NULL;
+      if (value->type == CP_JSON_BOOL) {
+        s = value->boolean ? "true" : "false";
+      } else if (value->type == CP_JSON_STRING ||
+                 value->type == CP_JSON_NUMBER) {
+        s = value->str ? value->str : "";
+      } else {
+        cp_error_set(err, CP_ERR_PARSE, row, col,
+                     "invalid json value for string");
+        return 0;
+      }
+      return cp_series_append_string(series, s, 0, err);
+    }
+    default:
+      cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
+      return 0;
+  }
+}
+
+static int cp_json_append_row_from_pairs(CpDataFrame *df,
+                                         const CpJsonPair *pairs,
+                                         size_t count,
+                                         CpError *err) {
+  if (!df || !pairs || count != df->ncols) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid json row");
+    return 0;
+  }
+  size_t row = df->nrows;
+  for (size_t col = 0; col < df->ncols; ++col) {
+    if (!cp_json_append_cell(df->cols[col],
+                             &pairs[col].value,
+                             1,
+                             row,
+                             col,
+                             err)) {
+      for (size_t j = 0; j < col; ++j) {
+        cp_series_pop(df->cols[j]);
+      }
+      return 0;
+    }
+  }
+  df->nrows += 1;
+  return 1;
+}
+
+static int cp_json_append_row_from_cells(CpDataFrame *df,
+                                         const CpJsonCell *cells,
+                                         CpError *err) {
+  if (!df || !cells) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid json row");
+    return 0;
+  }
+  size_t row = df->nrows;
+  for (size_t col = 0; col < df->ncols; ++col) {
+    if (!cp_json_append_cell(df->cols[col],
+                             &cells[col].value,
+                             cells[col].present,
+                             row,
+                             col,
+                             err)) {
+      for (size_t j = 0; j < col; ++j) {
+        cp_series_pop(df->cols[j]);
+      }
+      return 0;
+    }
+  }
+  df->nrows += 1;
+  return 1;
+}
+
 static CpDataFrame *cp_df_read_csv_internal(const char *path,
                                             char delimiter,
                                             int has_header,
@@ -8932,6 +9659,170 @@ CpDataFrame *cp_df_read_tsv_with_na(const char *path,
                                  dtypes, dtype_count, na_values, na_count, err);
 }
 
+CpDataFrame *cp_df_read_json(const char *path,
+                             const CpDType *dtypes,
+                             size_t dtype_count,
+                             CpError *err) {
+  if (!path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
+    return NULL;
+  }
+  size_t len = 0;
+  char *data = cp_read_file_all(path, &len, err);
+  if (!data) {
+    return NULL;
+  }
+
+  CpJsonCursor cur = {data, len, 0, 1, 1};
+  cp_json_skip_ws(&cur);
+  if (!cp_json_expect(&cur, '[', err)) {
+    free(data);
+    return NULL;
+  }
+  cp_json_skip_ws(&cur);
+  if (cp_json_peek(&cur) == ']') {
+    cp_json_next(&cur);
+    free(data);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "empty json array");
+    return NULL;
+  }
+
+  CpJsonPair *pairs = NULL;
+  size_t count = 0;
+  if (!cp_json_parse_object_pairs(&cur, &pairs, &count, err)) {
+    free(data);
+    return NULL;
+  }
+  if (count == 0) {
+    cp_json_pairs_free(pairs, count);
+    free(data);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "json object has no keys");
+    return NULL;
+  }
+
+  CpDType *local_dtypes = NULL;
+  if (dtypes) {
+    if (dtype_count != count) {
+      cp_json_pairs_free(pairs, count);
+      free(data);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype count mismatch");
+      return NULL;
+    }
+  } else {
+    local_dtypes = (CpDType *)malloc(count * sizeof(CpDType));
+    if (!local_dtypes) {
+      cp_json_pairs_free(pairs, count);
+      free(data);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    for (size_t i = 0; i < count; ++i) {
+      local_dtypes[i] = CP_DTYPE_STRING;
+    }
+    dtypes = local_dtypes;
+    dtype_count = count;
+  }
+
+  const char **name_ptrs = (const char **)malloc(count * sizeof(const char *));
+  if (!name_ptrs) {
+    cp_json_pairs_free(pairs, count);
+    free(local_dtypes);
+    free(data);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    name_ptrs[i] = pairs[i].key;
+  }
+  CpDataFrame *df = cp_df_create(count, name_ptrs, dtypes, 0, err);
+  free(name_ptrs);
+  if (!df) {
+    cp_json_pairs_free(pairs, count);
+    free(local_dtypes);
+    free(data);
+    return NULL;
+  }
+
+  if (!cp_json_append_row_from_pairs(df, pairs, count, err)) {
+    cp_json_pairs_free(pairs, count);
+    cp_df_free(df);
+    free(local_dtypes);
+    free(data);
+    return NULL;
+  }
+  cp_json_pairs_free(pairs, count);
+  pairs = NULL;
+
+  cp_json_skip_ws(&cur);
+  while (1) {
+    char ch = cp_json_peek(&cur);
+    if (ch == ',') {
+      cp_json_next(&cur);
+      cp_json_skip_ws(&cur);
+      CpJsonCell *cells =
+          (CpJsonCell *)calloc(df->ncols, sizeof(CpJsonCell));
+      if (!cells) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        cp_df_free(df);
+        free(local_dtypes);
+        free(data);
+        return NULL;
+      }
+      if (!cp_json_parse_object_row(&cur, df, cells, err)) {
+        cp_json_cells_clear(cells, df->ncols);
+        free(cells);
+        cp_df_free(df);
+        free(local_dtypes);
+        free(data);
+        return NULL;
+      }
+      if (!cp_json_append_row_from_cells(df, cells, err)) {
+        cp_json_cells_clear(cells, df->ncols);
+        free(cells);
+        cp_df_free(df);
+        free(local_dtypes);
+        free(data);
+        return NULL;
+      }
+      cp_json_cells_clear(cells, df->ncols);
+      free(cells);
+      cp_json_skip_ws(&cur);
+      continue;
+    }
+    if (ch == ']') {
+      cp_json_next(&cur);
+      break;
+    }
+    cp_json_set_error(err, &cur, "expected ',' or ']'");
+    cp_df_free(df);
+    free(local_dtypes);
+    free(data);
+    return NULL;
+  }
+  cp_json_skip_ws(&cur);
+  if (cp_json_peek(&cur) != '\0') {
+    cp_json_set_error(err, &cur, "trailing data after json array");
+    cp_df_free(df);
+    free(local_dtypes);
+    free(data);
+    return NULL;
+  }
+
+  free(local_dtypes);
+  free(data);
+  return df;
+}
+
+CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
+  if (!path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
+    return NULL;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0,
+               "parquet support not built");
+  return NULL;
+}
+
 static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {
   int needs_quotes = 0;
   for (const char *p = s; *p; ++p) {
@@ -9057,6 +9948,187 @@ int cp_df_write_tsv(const CpDataFrame *df,
                     int include_header,
                     CpError *err) {
   return cp_df_write_csv(df, path, '\t', include_header, err);
+}
+
+static int cp_write_json_string(FILE *fp, const char *s) {
+  if (!fp) {
+    return 0;
+  }
+  if (fputc('"', fp) == EOF) {
+    return 0;
+  }
+  if (s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+      unsigned char ch = *p;
+      switch (ch) {
+        case '"':
+          if (fputs("\\\"", fp) < 0) {
+            return 0;
+          }
+          break;
+        case '\\':
+          if (fputs("\\\\", fp) < 0) {
+            return 0;
+          }
+          break;
+        case '\b':
+          if (fputs("\\b", fp) < 0) {
+            return 0;
+          }
+          break;
+        case '\f':
+          if (fputs("\\f", fp) < 0) {
+            return 0;
+          }
+          break;
+        case '\n':
+          if (fputs("\\n", fp) < 0) {
+            return 0;
+          }
+          break;
+        case '\r':
+          if (fputs("\\r", fp) < 0) {
+            return 0;
+          }
+          break;
+        case '\t':
+          if (fputs("\\t", fp) < 0) {
+            return 0;
+          }
+          break;
+        default:
+          if (ch < 0x20) {
+            if (fprintf(fp, "\\u%04x", ch) < 0) {
+              return 0;
+            }
+          } else {
+            if (fputc((int)ch, fp) == EOF) {
+              return 0;
+            }
+          }
+      }
+    }
+  }
+  return fputc('"', fp) != EOF;
+}
+
+int cp_df_write_json(const CpDataFrame *df,
+                     const char *path,
+                     CpError *err) {
+  if (!df || !path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return 0;
+  }
+  if (fputc('[', fp) == EOF) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write json");
+    fclose(fp);
+    return 0;
+  }
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (row > 0 && fputc(',', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write json");
+      fclose(fp);
+      return 0;
+    }
+    if (fputc('{', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write json");
+      fclose(fp);
+      return 0;
+    }
+    for (size_t col = 0; col < df->ncols; ++col) {
+      if (col > 0 && fputc(',', fp) == EOF) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+        fclose(fp);
+        return 0;
+      }
+      const char *name = df->cols[col]->name ? df->cols[col]->name : "";
+      if (!cp_write_json_string(fp, name)) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+        fclose(fp);
+        return 0;
+      }
+      if (fputc(':', fp) == EOF) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+        fclose(fp);
+        return 0;
+      }
+      CpSeries *series = df->cols[col];
+      if (series->is_null[row]) {
+        if (fputs("null", fp) < 0) {
+          cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+          fclose(fp);
+          return 0;
+        }
+        continue;
+      }
+      switch (series->dtype) {
+        case CP_DTYPE_INT64:
+          if (fprintf(fp, "%" PRId64, series->data.i64[row]) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        case CP_DTYPE_FLOAT64: {
+          double value = series->data.f64[row];
+          if (isnan(value) || isinf(value)) {
+            if (fputs("null", fp) < 0) {
+              cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+              fclose(fp);
+              return 0;
+            }
+          } else if (fprintf(fp, "%.17g", value) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        case CP_DTYPE_STRING: {
+          const char *value = series->data.str[row];
+          if (!cp_write_json_string(fp, value ? value : "")) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write json");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
+          fclose(fp);
+          return 0;
+      }
+    }
+    if (fputc('}', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write json");
+      fclose(fp);
+      return 0;
+    }
+  }
+  if (fputc(']', fp) == EOF || fputc('\n', fp) == EOF) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write json");
+    fclose(fp);
+    return 0;
+  }
+  fclose(fp);
+  return 1;
+}
+
+int cp_df_write_parquet(const CpDataFrame *df,
+                        const char *path,
+                        CpError *err) {
+  if (!df || !path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0,
+               "parquet support not built");
+  return 0;
 }
 
 int cp_df_to_excel(const CpDataFrame *df,

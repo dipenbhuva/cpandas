@@ -480,6 +480,11 @@ CpDataFrame *cp_df_read_tsv_with_na(const char *path,
                                     const char **na_values,
                                     size_t na_count,
                                     CpError *err);
+CpDataFrame *cp_df_read_json(const char *path,
+                             const CpDType *dtypes,
+                             size_t dtype_count,
+                             CpError *err);
+CpDataFrame *cp_df_read_parquet(const char *path, CpError *err);
 int cp_df_write_csv(const CpDataFrame *df,
                     const char *path,
                     char delimiter,
@@ -489,6 +494,12 @@ int cp_df_write_tsv(const CpDataFrame *df,
                     const char *path,
                     int include_header,
                     CpError *err);
+int cp_df_write_json(const CpDataFrame *df,
+                     const char *path,
+                     CpError *err);
+int cp_df_write_parquet(const CpDataFrame *df,
+                        const char *path,
+                        CpError *err);
 int cp_df_to_excel(const CpDataFrame *df,
                    const char *path,
                    CpError *err);
