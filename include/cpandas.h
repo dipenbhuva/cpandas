@@ -271,6 +271,18 @@ CpDataFrame *cp_df_loc(const CpDataFrame *df,
                        const char **names,
                        size_t name_count,
                        CpError *err);
+CpDataFrame *cp_df_loc_labels(const CpDataFrame *df,
+                              const char **row_labels,
+                              size_t row_count,
+                              const char **names,
+                              size_t name_count,
+                              CpError *err);
+CpDataFrame *cp_df_loc_slice(const CpDataFrame *df,
+                             const char *start_label,
+                             const char *end_label,
+                             const char **names,
+                             size_t name_count,
+                             CpError *err);
 CpDataFrame *cp_df_head(const CpDataFrame *df, size_t n, CpError *err);
 CpDataFrame *cp_df_tail(const CpDataFrame *df, size_t n, CpError *err);
 int cp_df_dtypes(const CpDataFrame *df,
