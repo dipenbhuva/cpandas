@@ -322,6 +322,84 @@ static void test_read_csv_no_header(void) {
   free(path);
 }
 
+static void test_tsv_wrappers(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (!path) {
+    return;
+  }
+
+  const char *tsv = "id\tscore\tname\n1\t2.5\tAlice\n2\t\tBob\n";
+  CHECK(write_file(path, tsv));
+
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_read_tsv(path, 1, dtypes, 3, &err);
+  CHECK(df != NULL);
+  if (df) {
+    CHECK(cp_df_nrows(df) == 2);
+    const CpSeries *id = cp_df_get_col(df, "id");
+    const CpSeries *score = cp_df_get_col(df, "score");
+    const CpSeries *name = cp_df_get_col(df, "name");
+    CHECK(id && score && name);
+    int64_t id_val = 0;
+    double score_val = 0.0;
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(!is_null && id_val == 1);
+    CHECK(cp_series_get_float64(score, 0, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 2.5) < 1e-9);
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 2);
+    CHECK(cp_series_get_float64(score, 1, &score_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+  }
+
+  if (df) {
+    cp_df_free(df);
+  }
+  remove(path);
+  free(path);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDataFrame *out = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(out != NULL);
+  if (!out) {
+    return;
+  }
+  const char *row1[] = {"1", "2.5", "Alice"};
+  const char *row2[] = {"2", "", ""};
+  CHECK(cp_df_append_row(out, row1, 3, &err));
+  CHECK(cp_df_append_row(out, row2, 3, &err));
+
+  char *path2 = make_temp_path();
+  CHECK(path2 != NULL);
+  if (path2) {
+    CHECK(cp_df_write_tsv(out, path2, 1, &err));
+    char *contents = read_file(path2);
+    CHECK(contents != NULL);
+    const char *expected =
+        "id\tscore\tname\n"
+        "1\t2.5\tAlice\n"
+        "2\t\t\n";
+    if (contents) {
+      CHECK(strcmp(contents, expected) == 0);
+    }
+    free(contents);
+    remove(path2);
+    free(path2);
+  }
+
+  cp_df_free(out);
+}
+
 static void test_to_excel(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4116,6 +4194,7 @@ static void test_query(void) {
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
+  test_tsv_wrappers();
   test_to_excel();
   test_to_sql();
   test_plot();

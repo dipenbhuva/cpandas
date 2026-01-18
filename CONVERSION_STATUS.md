@@ -13,6 +13,7 @@ Core structures and API
 I/O
 - CSV read/write with delimiter selection and optional header.
 - Basic CSV quoting/escaping for commas, quotes, and newlines.
+- TSV convenience wrappers for read/write.
 
 Data exploration
 - `head` / `tail` row slicing helpers.
@@ -98,7 +99,6 @@ Indexing and missing values
   (e.g., custom NA tokens, column-wise strategies).
 
 I/O and formats
-- TSV convenience wrappers.
 - Parquet/JSON or other formats.
 
 Performance and scalability

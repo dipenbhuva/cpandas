@@ -448,9 +448,18 @@ CpDataFrame *cp_df_read_csv(const char *path,
                             const CpDType *dtypes,
                             size_t dtype_count,
                             CpError *err);
+CpDataFrame *cp_df_read_tsv(const char *path,
+                            int has_header,
+                            const CpDType *dtypes,
+                            size_t dtype_count,
+                            CpError *err);
 int cp_df_write_csv(const CpDataFrame *df,
                     const char *path,
                     char delimiter,
+                    int include_header,
+                    CpError *err);
+int cp_df_write_tsv(const CpDataFrame *df,
+                    const char *path,
                     int include_header,
                     CpError *err);
 int cp_df_to_excel(const CpDataFrame *df,
