@@ -322,6 +322,49 @@ static void test_read_csv_no_header(void) {
   free(path);
 }
 
+static void test_to_sql(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "2.5", "O'Brien"};
+  const char *row2[] = {"", "", "Bob"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (path) {
+    CHECK(cp_df_to_sql(df, path, "people", &err));
+    char *contents = read_file(path);
+    CHECK(contents != NULL);
+    if (contents) {
+      CHECK(strstr(contents, "CREATE TABLE \"people\"") != NULL);
+      CHECK(strstr(contents, "\"id\" INTEGER") != NULL);
+      CHECK(strstr(contents, "\"score\" REAL") != NULL);
+      CHECK(strstr(contents, "\"name\" TEXT") != NULL);
+      CHECK(strstr(contents, "O''Brien") != NULL);
+      CHECK(strstr(contents, "NULL") != NULL);
+    }
+    free(contents);
+    remove(path);
+    free(path);
+  }
+
+  cp_error_clear(&err);
+  CHECK(!cp_df_to_sql(df, "tmp.sql", "", &err));
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_df_free(df);
+}
+
 static void test_write_csv_header(void) {
   CpError err;
   cp_error_clear(&err);
@@ -3855,6 +3898,7 @@ static void test_query(void) {
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
+  test_to_sql();
   test_write_csv_header();
   test_append_row_errors();
   test_read_csv_mismatch();
