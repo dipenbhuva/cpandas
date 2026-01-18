@@ -466,6 +466,54 @@ static int cp_str_eq_ci(const char *a, const char *b) {
   return *a == '\0' && *b == '\0';
 }
 
+static int cp_trimmed_eq_ci(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  const char *a_start = cp_skip_space(a);
+  const char *b_start = cp_skip_space(b);
+  if (!a_start || !b_start) {
+    return 0;
+  }
+  const char *a_end = a_start + strlen(a_start);
+  const char *b_end = b_start + strlen(b_start);
+  while (a_end > a_start && isspace((unsigned char)a_end[-1])) {
+    a_end--;
+  }
+  while (b_end > b_start && isspace((unsigned char)b_end[-1])) {
+    b_end--;
+  }
+  size_t a_len = (size_t)(a_end - a_start);
+  size_t b_len = (size_t)(b_end - b_start);
+  if (a_len != b_len) {
+    return 0;
+  }
+  for (size_t i = 0; i < a_len; ++i) {
+    if (tolower((unsigned char)a_start[i]) !=
+        tolower((unsigned char)b_start[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int cp_is_na_token(const char *s,
+                          const char **na_values,
+                          size_t na_count) {
+  if (!s || !na_values || na_count == 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < na_count; ++i) {
+    if (!na_values[i]) {
+      continue;
+    }
+    if (cp_trimmed_eq_ci(s, na_values[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 typedef enum {
   CP_QUERY_NODE_PRED = 0,
   CP_QUERY_NODE_AND = 1,
@@ -1591,6 +1639,69 @@ static int cp_parse_string(const char *s,
                            const char **out,
                            int *is_null) {
   if (cp_is_blank(s)) {
+    if (out) {
+      *out = NULL;
+    }
+    if (is_null) {
+      *is_null = 1;
+    }
+    return 1;
+  }
+  if (out) {
+    *out = s;
+  }
+  if (is_null) {
+    *is_null = 0;
+  }
+  return 1;
+}
+
+static int cp_parse_int64_with_na(const char *s,
+                                  int64_t *out,
+                                  int *is_null,
+                                  const char **na_values,
+                                  size_t na_count,
+                                  CpError *err,
+                                  size_t row,
+                                  size_t col) {
+  if (cp_is_blank(s) || cp_is_na_token(s, na_values, na_count)) {
+    if (out) {
+      *out = 0;
+    }
+    if (is_null) {
+      *is_null = 1;
+    }
+    return 1;
+  }
+  return cp_parse_int64(s, out, is_null, err, row, col);
+}
+
+static int cp_parse_float64_with_na(const char *s,
+                                    double *out,
+                                    int *is_null,
+                                    const char **na_values,
+                                    size_t na_count,
+                                    CpError *err,
+                                    size_t row,
+                                    size_t col) {
+  if (cp_is_blank(s) || cp_is_na_token(s, na_values, na_count)) {
+    if (out) {
+      *out = 0.0;
+    }
+    if (is_null) {
+      *is_null = 1;
+    }
+    return 1;
+  }
+  return cp_parse_float64(s, out, is_null, err, row, col);
+}
+
+static int cp_parse_string_with_na(const char *s,
+                                   const char **out,
+                                   int *is_null,
+                                   const char **na_values,
+                                   size_t na_count) {
+  if (cp_is_blank(s) || cp_is_na_token(s, na_values, na_count)) {
     if (out) {
       *out = NULL;
     }
@@ -8418,10 +8529,12 @@ CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
   return cp_df_sort_values_multi(df, names, 1, asc, err);
 }
 
-int cp_df_append_row(CpDataFrame *df,
-                     const char **values,
-                     size_t nvalues,
-                     CpError *err) {
+static int cp_df_append_row_internal(CpDataFrame *df,
+                                     const char **values,
+                                     size_t nvalues,
+                                     const char **na_values,
+                                     size_t na_count,
+                                     CpError *err) {
   if (!df || !values || nvalues != df->ncols) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid row data");
     return 0;
@@ -8434,7 +8547,8 @@ int cp_df_append_row(CpDataFrame *df,
       case CP_DTYPE_INT64: {
         int64_t v = 0;
         int is_null = 0;
-        ok = cp_parse_int64(values[i], &v, &is_null, err, row, i);
+        ok = cp_parse_int64_with_na(values[i], &v, &is_null,
+                                    na_values, na_count, err, row, i);
         if (ok) {
           ok = cp_series_append_int64(col, v, is_null, err);
         }
@@ -8443,7 +8557,8 @@ int cp_df_append_row(CpDataFrame *df,
       case CP_DTYPE_FLOAT64: {
         double v = 0.0;
         int is_null = 0;
-        ok = cp_parse_float64(values[i], &v, &is_null, err, row, i);
+        ok = cp_parse_float64_with_na(values[i], &v, &is_null,
+                                      na_values, na_count, err, row, i);
         if (ok) {
           ok = cp_series_append_float64(col, v, is_null, err);
         }
@@ -8452,7 +8567,8 @@ int cp_df_append_row(CpDataFrame *df,
       case CP_DTYPE_STRING: {
         const char *v = NULL;
         int is_null = 0;
-        ok = cp_parse_string(values[i], &v, &is_null);
+        ok = cp_parse_string_with_na(values[i], &v, &is_null,
+                                     na_values, na_count);
         if (ok) {
           ok = cp_series_append_string(col, v, is_null, err);
         }
@@ -8472,6 +8588,13 @@ int cp_df_append_row(CpDataFrame *df,
   }
   df->nrows += 1;
   return 1;
+}
+
+int cp_df_append_row(CpDataFrame *df,
+                     const char **values,
+                     size_t nvalues,
+                     CpError *err) {
+  return cp_df_append_row_internal(df, values, nvalues, NULL, 0, err);
 }
 
 static int cp_is_line_blank(const char *line) {
@@ -8503,15 +8626,29 @@ static char **cp_make_default_names(size_t ncols, CpError *err) {
   return names;
 }
 
-CpDataFrame *cp_df_read_csv(const char *path,
-                            char delimiter,
-                            int has_header,
-                            const CpDType *dtypes,
-                            size_t dtype_count,
-                            CpError *err) {
+static CpDataFrame *cp_df_read_csv_internal(const char *path,
+                                            char delimiter,
+                                            int has_header,
+                                            const CpDType *dtypes,
+                                            size_t dtype_count,
+                                            const char **na_values,
+                                            size_t na_count,
+                                            CpError *err) {
   if (!path) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
     return NULL;
+  }
+  if (na_count > 0) {
+    if (!na_values) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "na values missing");
+      return NULL;
+    }
+    for (size_t i = 0; i < na_count; ++i) {
+      if (!na_values[i]) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "na token is null");
+        return NULL;
+      }
+    }
   }
   FILE *fp = fopen(path, "r");
   if (!fp) {
@@ -8613,7 +8750,8 @@ CpDataFrame *cp_df_read_csv(const char *path,
   } else {
     cp_free_fields(col_names, ncols);
     const char **row_values = (const char **)fields;
-    if (!cp_df_append_row(df, row_values, ncols, err)) {
+    if (!cp_df_append_row_internal(df, row_values, ncols,
+                                   na_values, na_count, err)) {
       cp_free_fields(fields, ncols);
       cp_df_free(df);
       free(local_dtypes);
@@ -8652,7 +8790,8 @@ CpDataFrame *cp_df_read_csv(const char *path,
     }
 
     const char **row_values = (const char **)row_fields;
-    if (!cp_df_append_row(df, row_values, field_count, err)) {
+    if (!cp_df_append_row_internal(df, row_values, field_count,
+                                   na_values, na_count, err)) {
       cp_free_fields(row_fields, field_count);
       cp_df_free(df);
       free(local_dtypes);
@@ -8667,12 +8806,46 @@ CpDataFrame *cp_df_read_csv(const char *path,
   return df;
 }
 
+CpDataFrame *cp_df_read_csv(const char *path,
+                            char delimiter,
+                            int has_header,
+                            const CpDType *dtypes,
+                            size_t dtype_count,
+                            CpError *err) {
+  return cp_df_read_csv_internal(path, delimiter, has_header,
+                                 dtypes, dtype_count, NULL, 0, err);
+}
+
+CpDataFrame *cp_df_read_csv_with_na(const char *path,
+                                    char delimiter,
+                                    int has_header,
+                                    const CpDType *dtypes,
+                                    size_t dtype_count,
+                                    const char **na_values,
+                                    size_t na_count,
+                                    CpError *err) {
+  return cp_df_read_csv_internal(path, delimiter, has_header,
+                                 dtypes, dtype_count, na_values, na_count, err);
+}
+
 CpDataFrame *cp_df_read_tsv(const char *path,
                             int has_header,
                             const CpDType *dtypes,
                             size_t dtype_count,
                             CpError *err) {
-  return cp_df_read_csv(path, '\t', has_header, dtypes, dtype_count, err);
+  return cp_df_read_csv_internal(path, '\t', has_header,
+                                 dtypes, dtype_count, NULL, 0, err);
+}
+
+CpDataFrame *cp_df_read_tsv_with_na(const char *path,
+                                    int has_header,
+                                    const CpDType *dtypes,
+                                    size_t dtype_count,
+                                    const char **na_values,
+                                    size_t na_count,
+                                    CpError *err) {
+  return cp_df_read_csv_internal(path, '\t', has_header,
+                                 dtypes, dtype_count, na_values, na_count, err);
 }
 
 static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {

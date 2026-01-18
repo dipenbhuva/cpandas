@@ -368,6 +368,46 @@ static void test_tsv_wrappers(void) {
   remove(path);
   free(path);
 
+  const char *na_tokens[] = {"NA", "N/A"};
+  char *path_na = make_temp_path();
+  CHECK(path_na != NULL);
+  if (!path_na) {
+    return;
+  }
+  const char *tsv_na = "id\tscore\tname\nNA\tN/A\tNA\n4\t3.0\tN/A\n";
+  CHECK(write_file(path_na, tsv_na));
+  CpDataFrame *df_na = cp_df_read_tsv_with_na(path_na, 1, dtypes, 3,
+                                              na_tokens, 2, &err);
+  CHECK(df_na != NULL);
+  if (df_na) {
+    CHECK(cp_df_nrows(df_na) == 2);
+    const CpSeries *id = cp_df_get_col(df_na, "id");
+    const CpSeries *score = cp_df_get_col(df_na, "score");
+    const CpSeries *name = cp_df_get_col(df_na, "name");
+    CHECK(id && score && name);
+    int64_t id_val = 0;
+    double score_val = 0.0;
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_float64(score, 0, &score_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+    CHECK(!is_null && id_val == 4);
+    CHECK(cp_series_get_float64(score, 1, &score_val, &is_null));
+    CHECK(!is_null && fabs(score_val - 3.0) < 1e-9);
+    CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+    CHECK(is_null);
+  }
+  if (df_na) {
+    cp_df_free(df_na);
+  }
+  remove(path_na);
+  free(path_na);
+
   const char *names[] = {"id", "score", "name"};
   CpDataFrame *out = cp_df_create(3, names, dtypes, 0, &err);
   CHECK(out != NULL);
