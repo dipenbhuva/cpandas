@@ -322,6 +322,49 @@ static void test_read_csv_no_header(void) {
   free(path);
 }
 
+static void test_to_excel(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "2.5", "Alice"};
+  const char *row2[] = {"2", "", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (!path) {
+    cp_df_free(df);
+    return;
+  }
+
+  CHECK(cp_df_to_excel(df, path, &err));
+  char *contents = read_file(path);
+  CHECK(contents != NULL);
+
+  const char *expected =
+      "id\tscore\tname\n"
+      "1\t2.5\tAlice\n"
+      "2\t\t\n";
+
+  if (contents) {
+    CHECK(strcmp(contents, expected) == 0);
+  }
+
+  free(contents);
+  remove(path);
+  free(path);
+  cp_df_free(df);
+}
+
 static void test_to_sql(void) {
   CpError err;
   cp_error_clear(&err);
@@ -361,6 +404,58 @@ static void test_to_sql(void) {
   cp_error_clear(&err);
   CHECK(!cp_df_to_sql(df, "tmp.sql", "", &err));
   CHECK(err.code == CP_ERR_INVALID);
+
+  cp_df_free(df);
+}
+
+static void test_plot(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "2.5", "Alice"};
+  const char *row2[] = {"2", "4.0", "Bob"};
+  const char *row3[] = {"3", "", "Cara"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (path) {
+    CHECK(cp_df_plot(df, path, &err));
+    char *contents = read_file(path);
+    CHECK(contents != NULL);
+    if (contents) {
+      CHECK(strstr(contents, "<svg") != NULL);
+      CHECK(strstr(contents, "<polyline") != NULL);
+      CHECK(strstr(contents, "id") != NULL);
+      CHECK(strstr(contents, "score") != NULL);
+    }
+    free(contents);
+    remove(path);
+    free(path);
+  }
+
+  cp_error_clear(&err);
+  const char *s_names[] = {"name"};
+  CpDType s_dtypes[] = {CP_DTYPE_STRING};
+  CpDataFrame *df2 = cp_df_create(1, s_names, s_dtypes, 0, &err);
+  CHECK(df2 != NULL);
+  if (df2) {
+    const char *row[] = {"Alice"};
+    CHECK(cp_df_append_row(df2, row, 1, &err));
+    CHECK(!cp_df_plot(df2, "tmp.svg", &err));
+    CHECK(err.code == CP_ERR_INVALID);
+    cp_df_free(df2);
+  }
 
   cp_df_free(df);
 }
@@ -3898,7 +3993,9 @@ static void test_query(void) {
 int main(void) {
   test_read_csv_header();
   test_read_csv_no_header();
+  test_to_excel();
   test_to_sql();
+  test_plot();
   test_write_csv_header();
   test_append_row_errors();
   test_read_csv_mismatch();
