@@ -8536,6 +8536,185 @@ int cp_df_write_csv(const CpDataFrame *df,
   return 1;
 }
 
+static const char *cp_sql_dtype_name(CpDType dtype) {
+  switch (dtype) {
+    case CP_DTYPE_INT64:
+      return "INTEGER";
+    case CP_DTYPE_FLOAT64:
+      return "REAL";
+    case CP_DTYPE_STRING:
+      return "TEXT";
+    default:
+      return "TEXT";
+  }
+}
+
+static int cp_sql_write_ident(FILE *fp, const char *s) {
+  if (!fp || !s) {
+    return 0;
+  }
+  if (fputc('"', fp) == EOF) {
+    return 0;
+  }
+  for (const char *p = s; *p; ++p) {
+    if (*p == '"') {
+      if (fputc('"', fp) == EOF) {
+        return 0;
+      }
+    }
+    if (fputc(*p, fp) == EOF) {
+      return 0;
+    }
+  }
+  return fputc('"', fp) != EOF;
+}
+
+static int cp_sql_write_string(FILE *fp, const char *s) {
+  if (!fp) {
+    return 0;
+  }
+  if (fputc('\'', fp) == EOF) {
+    return 0;
+  }
+  if (s) {
+    for (const char *p = s; *p; ++p) {
+      if (*p == '\'') {
+        if (fputc('\'', fp) == EOF) {
+          return 0;
+        }
+      }
+      if (fputc(*p, fp) == EOF) {
+        return 0;
+      }
+    }
+  }
+  return fputc('\'', fp) != EOF;
+}
+
+int cp_df_to_sql(const CpDataFrame *df,
+                 const char *path,
+                 const char *table,
+                 CpError *err) {
+  if (!df || !path || !table || table[0] == '\0') {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid to_sql arguments");
+    return 0;
+  }
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return 0;
+  }
+
+  if (fputs("CREATE TABLE ", fp) < 0 ||
+      !cp_sql_write_ident(fp, table) ||
+      fputc('(', fp) == EOF) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write sql");
+    fclose(fp);
+    return 0;
+  }
+  for (size_t col = 0; col < df->ncols; ++col) {
+    if (col > 0 && fputs(", ", fp) < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write sql");
+      fclose(fp);
+      return 0;
+    }
+    const char *name = df->cols[col]->name ? df->cols[col]->name : "";
+    if (!cp_sql_write_ident(fp, name) ||
+        fputc(' ', fp) == EOF ||
+        fputs(cp_sql_dtype_name(df->cols[col]->dtype), fp) < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write sql");
+      fclose(fp);
+      return 0;
+    }
+  }
+  if (fputs(");\n", fp) < 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write sql");
+    fclose(fp);
+    return 0;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (fputs("INSERT INTO ", fp) < 0 ||
+        !cp_sql_write_ident(fp, table) ||
+        fputs(" (", fp) < 0) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write sql");
+      fclose(fp);
+      return 0;
+    }
+    for (size_t col = 0; col < df->ncols; ++col) {
+      if (col > 0 && fputs(", ", fp) < 0) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+        fclose(fp);
+        return 0;
+      }
+      const char *name = df->cols[col]->name ? df->cols[col]->name : "";
+      if (!cp_sql_write_ident(fp, name)) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+        fclose(fp);
+        return 0;
+      }
+    }
+    if (fputs(") VALUES (", fp) < 0) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write sql");
+      fclose(fp);
+      return 0;
+    }
+    for (size_t col = 0; col < df->ncols; ++col) {
+      if (col > 0 && fputs(", ", fp) < 0) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+        fclose(fp);
+        return 0;
+      }
+      CpSeries *series = df->cols[col];
+      if (series->is_null[row]) {
+        if (fputs("NULL", fp) < 0) {
+          cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+          fclose(fp);
+          return 0;
+        }
+        continue;
+      }
+      switch (series->dtype) {
+        case CP_DTYPE_INT64:
+          if (fprintf(fp, "%" PRId64, series->data.i64[row]) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        case CP_DTYPE_FLOAT64:
+          if (fprintf(fp, "%.17g", series->data.f64[row]) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        case CP_DTYPE_STRING: {
+          const char *value = series->data.str[row];
+          if (!cp_sql_write_string(fp, value ? value : "")) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write sql");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
+          fclose(fp);
+          return 0;
+      }
+    }
+    if (fputs(");\n", fp) < 0) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write sql");
+      fclose(fp);
+      return 0;
+    }
+  }
+
+  fclose(fp);
+  return 1;
+}
+
 const char *cp_series_name(const CpSeries *s) {
   return s ? s->name : NULL;
 }

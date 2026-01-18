@@ -427,6 +427,10 @@ int cp_df_write_csv(const CpDataFrame *df,
                     char delimiter,
                     int include_header,
                     CpError *err);
+int cp_df_to_sql(const CpDataFrame *df,
+                 const char *path,
+                 const char *table,
+                 CpError *err);
 
 const char *cp_series_name(const CpSeries *s);
 CpDType cp_series_dtype(const CpSeries *s);
