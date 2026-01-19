@@ -817,12 +817,15 @@ static void test_parquet_io(void) {
     return;
   }
 
-  const char *row1[] = {"1", "2.5", "Alice"};
-  const char *row2[] = {"2", "", "Bob"};
-  const char *row3[] = {"", "3.75", ""};
-  CHECK(cp_df_append_row(df, row1, 3, &err));
-  CHECK(cp_df_append_row(df, row2, 3, &err));
-  CHECK(cp_df_append_row(df, row3, 3, &err));
+  const size_t total_rows = 70000;
+  for (size_t i = 0; i < total_rows; ++i) {
+    char id_buf[32];
+    snprintf(id_buf, sizeof(id_buf), "%zu", i + 1);
+    const char *score = (i % 10 == 0) ? "" : ((i % 3 == 0) ? "1.5" : "2.5");
+    const char *name = (i % 5 == 0) ? "" : ((i % 2 == 0) ? "Alice" : "Bob");
+    const char *row[] = {id_buf, score, name};
+    CHECK(cp_df_append_row(df, row, 3, &err));
+  }
 
   char *path = make_temp_path();
   CHECK(path != NULL);
@@ -833,6 +836,7 @@ static void test_parquet_io(void) {
     CpDataFrame *df2 = cp_df_read_parquet(path, &err);
     CHECK(df2 != NULL);
     if (df2) {
+      CHECK(cp_df_nrows(df2) == total_rows);
       const CpSeries *id = cp_df_get_col(df2, "id");
       const CpSeries *score = cp_df_get_col(df2, "score");
       const CpSeries *name = cp_df_get_col(df2, "name");
@@ -843,26 +847,28 @@ static void test_parquet_io(void) {
       const char *name_val = NULL;
       int is_null = 0;
 
-      CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
-      CHECK(!is_null && id_val == 1);
-      CHECK(cp_series_get_float64(score, 0, &score_val, &is_null));
-      CHECK(!is_null && fabs(score_val - 2.5) < 1e-9);
-      CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
-      CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+      size_t probe_rows[] = {0, 65535, 65536, total_rows - 1};
+      for (size_t i = 0; i < 4; ++i) {
+        size_t row = probe_rows[i];
+        CHECK(cp_series_get_int64(id, row, &id_val, &is_null));
+        CHECK(!is_null && id_val == (int64_t)(row + 1));
 
-      CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
-      CHECK(!is_null && id_val == 2);
-      CHECK(cp_series_get_float64(score, 1, &score_val, &is_null));
-      CHECK(is_null);
-      CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
-      CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+        CHECK(cp_series_get_float64(score, row, &score_val, &is_null));
+        if (row % 10 == 0) {
+          CHECK(is_null);
+        } else {
+          double expected = (row % 3 == 0) ? 1.5 : 2.5;
+          CHECK(!is_null && fabs(score_val - expected) < 1e-9);
+        }
 
-      CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
-      CHECK(is_null);
-      CHECK(cp_series_get_float64(score, 2, &score_val, &is_null));
-      CHECK(!is_null && fabs(score_val - 3.75) < 1e-9);
-      CHECK(cp_series_get_string(name, 2, &name_val, &is_null));
-      CHECK(is_null);
+        CHECK(cp_series_get_string(name, row, &name_val, &is_null));
+        if (row % 5 == 0) {
+          CHECK(is_null);
+        } else {
+          const char *expected = (row % 2 == 0) ? "Alice" : "Bob";
+          CHECK(!is_null && strcmp(name_val, expected) == 0);
+        }
+      }
       cp_df_free(df2);
     }
     remove(path);
