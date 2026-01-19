@@ -9813,6 +9813,177 @@ CpDataFrame *cp_df_read_json(const char *path,
   return df;
 }
 
+CpDataFrame *cp_df_read_ndjson(const char *path,
+                               const CpDType *dtypes,
+                               size_t dtype_count,
+                               CpError *err) {
+  if (!path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
+    return NULL;
+  }
+  FILE *fp = fopen(path, "r");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return NULL;
+  }
+
+  size_t line_no = 0;
+  char *line = NULL;
+  while ((line = cp_read_line(fp, err)) != NULL) {
+    line_no += 1;
+    if (!cp_is_line_blank(line)) {
+      break;
+    }
+    free(line);
+    line = NULL;
+  }
+
+  if (!line) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "empty ndjson");
+    return NULL;
+  }
+
+  CpJsonPair *pairs = NULL;
+  size_t count = 0;
+  CpJsonCursor cur = {line, strlen(line), 0, line_no, 1};
+  cp_json_skip_ws(&cur);
+  if (!cp_json_parse_object_pairs(&cur, &pairs, &count, err)) {
+    free(line);
+    fclose(fp);
+    return NULL;
+  }
+  cp_json_skip_ws(&cur);
+  if (cp_json_peek(&cur) != '\0') {
+    cp_json_set_error(err, &cur, "trailing data after json object");
+    cp_json_pairs_free(pairs, count);
+    free(line);
+    fclose(fp);
+    return NULL;
+  }
+  free(line);
+  line = NULL;
+
+  if (count == 0) {
+    cp_json_pairs_free(pairs, count);
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "json object has no keys");
+    return NULL;
+  }
+
+  CpDType *local_dtypes = NULL;
+  if (dtypes) {
+    if (dtype_count != count) {
+      cp_json_pairs_free(pairs, count);
+      fclose(fp);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype count mismatch");
+      return NULL;
+    }
+  } else {
+    local_dtypes = (CpDType *)malloc(count * sizeof(CpDType));
+    if (!local_dtypes) {
+      cp_json_pairs_free(pairs, count);
+      fclose(fp);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    for (size_t i = 0; i < count; ++i) {
+      local_dtypes[i] = CP_DTYPE_STRING;
+    }
+    dtypes = local_dtypes;
+    dtype_count = count;
+  }
+
+  const char **name_ptrs = (const char **)malloc(count * sizeof(const char *));
+  if (!name_ptrs) {
+    cp_json_pairs_free(pairs, count);
+    free(local_dtypes);
+    fclose(fp);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    name_ptrs[i] = pairs[i].key;
+  }
+  CpDataFrame *df = cp_df_create(count, name_ptrs, dtypes, 0, err);
+  free(name_ptrs);
+  if (!df) {
+    cp_json_pairs_free(pairs, count);
+    free(local_dtypes);
+    fclose(fp);
+    return NULL;
+  }
+
+  if (!cp_json_append_row_from_pairs(df, pairs, count, err)) {
+    cp_json_pairs_free(pairs, count);
+    cp_df_free(df);
+    free(local_dtypes);
+    fclose(fp);
+    return NULL;
+  }
+  cp_json_pairs_free(pairs, count);
+  pairs = NULL;
+
+  while ((line = cp_read_line(fp, err)) != NULL) {
+    line_no += 1;
+    if (cp_is_line_blank(line)) {
+      free(line);
+      line = NULL;
+      continue;
+    }
+    CpJsonCursor row_cur = {line, strlen(line), 0, line_no, 1};
+    cp_json_skip_ws(&row_cur);
+    CpJsonCell *cells =
+        (CpJsonCell *)calloc(df->ncols, sizeof(CpJsonCell));
+    if (!cells) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      free(line);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    if (!cp_json_parse_object_row(&row_cur, df, cells, err)) {
+      cp_json_cells_clear(cells, df->ncols);
+      free(cells);
+      free(line);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    cp_json_skip_ws(&row_cur);
+    if (cp_json_peek(&row_cur) != '\0') {
+      cp_json_set_error(err, &row_cur, "trailing data after json object");
+      cp_json_cells_clear(cells, df->ncols);
+      free(cells);
+      free(line);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    if (!cp_json_append_row_from_cells(df, cells, err)) {
+      cp_json_cells_clear(cells, df->ncols);
+      free(cells);
+      free(line);
+      cp_df_free(df);
+      free(local_dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    cp_json_cells_clear(cells, df->ncols);
+    free(cells);
+    free(line);
+    line = NULL;
+  }
+
+  fclose(fp);
+  free(local_dtypes);
+  return df;
+}
+
+#ifndef CPANDAS_WITH_ARROW
 CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
   if (!path) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
@@ -9822,6 +9993,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
                "parquet support not built");
   return NULL;
 }
+#endif
 
 static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {
   int needs_quotes = 0;
@@ -10119,6 +10291,99 @@ int cp_df_write_json(const CpDataFrame *df,
   return 1;
 }
 
+int cp_df_write_ndjson(const CpDataFrame *df,
+                       const char *path,
+                       CpError *err) {
+  if (!df || !path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return 0;
+  }
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (fputc('{', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write ndjson");
+      fclose(fp);
+      return 0;
+    }
+    for (size_t col = 0; col < df->ncols; ++col) {
+      if (col > 0 && fputc(',', fp) == EOF) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+        fclose(fp);
+        return 0;
+      }
+      const char *name = df->cols[col]->name ? df->cols[col]->name : "";
+      if (!cp_write_json_string(fp, name)) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+        fclose(fp);
+        return 0;
+      }
+      if (fputc(':', fp) == EOF) {
+        cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+        fclose(fp);
+        return 0;
+      }
+      CpSeries *series = df->cols[col];
+      if (series->is_null[row]) {
+        if (fputs("null", fp) < 0) {
+          cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+          fclose(fp);
+          return 0;
+        }
+        continue;
+      }
+      switch (series->dtype) {
+        case CP_DTYPE_INT64:
+          if (fprintf(fp, "%" PRId64, series->data.i64[row]) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        case CP_DTYPE_FLOAT64: {
+          double value = series->data.f64[row];
+          if (isnan(value) || isinf(value)) {
+            if (fputs("null", fp) < 0) {
+              cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+              fclose(fp);
+              return 0;
+            }
+          } else if (fprintf(fp, "%.17g", value) < 0) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        case CP_DTYPE_STRING: {
+          const char *value = series->data.str[row];
+          if (!cp_write_json_string(fp, value ? value : "")) {
+            cp_error_set(err, CP_ERR_IO, row, col, "failed to write ndjson");
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
+          fclose(fp);
+          return 0;
+      }
+    }
+    if (fputc('}', fp) == EOF || fputc('\n', fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, row, 0, "failed to write ndjson");
+      fclose(fp);
+      return 0;
+    }
+  }
+  fclose(fp);
+  return 1;
+}
+
+#ifndef CPANDAS_WITH_ARROW
 int cp_df_write_parquet(const CpDataFrame *df,
                         const char *path,
                         CpError *err) {
@@ -10130,6 +10395,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                "parquet support not built");
   return 0;
 }
+#endif
 
 int cp_df_to_excel(const CpDataFrame *df,
                    const char *path,
