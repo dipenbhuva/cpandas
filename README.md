@@ -9,14 +9,15 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - Columnar data C storage with typed columns (int64, float64, string).
 - DataFrame and Series API with selection, sorting, joins, groupby, and pivot tables.
 - Aggregations (count, sum, mean, min, max, median, std, corr, cov, rank, diff).
-- CSV/TSV/JSON/NDJSON read/write, TSV export (`to_excel`), SQL script export (`to_sql`), optional Parquet via Apache Arrow.
+- CSV/TSV/JSON/NDJSON read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
+- Pure C11 core (no C++ dependencies required).
 - Query filtering with AND/OR and parentheses.
 - Vectorized arithmetic helpers and column-to-column comparisons.
 - Tests and benchmarks for correctness and performance.
 
 ## Apache Arrow comparison
 
-Apache Arrow is a columnar in-memory data format and cross-language standard for interchange. cpandas is a pandas-like DataFrame library written in C that focuses on operations inside C programs. If you need zero-copy IPC or broad language interoperability, Arrow is the better fit; if you need a lightweight pandas alternative C for in-process analytics, cpandas is a good choice. Parquet read/write is available when building with Apache Arrow.
+Apache Arrow is a columnar in-memory data format and cross-language standard for interchange. cpandas is a pandas-like DataFrame library written in C that focuses on operations inside C programs. If you need zero-copy IPC or broad language interoperability, Arrow is the better fit; if you need a lightweight pandas alternative C for in-process analytics, cpandas is a good choice. Parquet read/write is not built in yet.
 
 ## Build
 
@@ -25,14 +26,6 @@ cmake -S . -B build
 cmake --build build
 ```
 
-## Parquet (optional)
-
-Parquet IO is enabled with Apache Arrow installed:
-
-```sh
-cmake -S . -B build -DCPANDAS_WITH_ARROW=ON
-cmake --build build
-```
 
 ## Test
 

@@ -16,7 +16,7 @@ I/O
 - TSV convenience wrappers for read/write.
 - JSON read/write (array-of-objects).
 - NDJSON read/write (line-delimited objects).
-- Parquet read/write via optional Apache Arrow backend.
+- Parquet read/write stubs (not implemented).
 
 Data exploration
 - `head` / `tail` row slicing helpers.
@@ -101,7 +101,7 @@ Indexing and missing values
   (e.g., column-wise strategies).
 
 I/O and formats
-- Additional formats or Parquet support without Apache Arrow.
+- Parquet or other formats.
 
 Performance and scalability
 - SIMD or parallel ops.
@@ -144,8 +144,7 @@ Advanced pandas features
   nested objects/arrays and non-ASCII unicode escapes are rejected.
 - `read_ndjson`/`write_ndjson` handle line-delimited JSON objects with the same
   primitive-only constraints as `read_json`.
-- `read_parquet`/`write_parquet` require Apache Arrow and are enabled via
-  `-DCPANDAS_WITH_ARROW=ON`.
+- `read_parquet`/`write_parquet` are stubbed pending an all-C implementation.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional
