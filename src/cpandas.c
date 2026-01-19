@@ -9983,7 +9983,6 @@ CpDataFrame *cp_df_read_ndjson(const char *path,
   return df;
 }
 
-#ifndef CPANDAS_WITH_ARROW
 CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
   if (!path) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
@@ -9993,7 +9992,6 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
                "parquet support not built");
   return NULL;
 }
-#endif
 
 static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {
   int needs_quotes = 0;
@@ -10383,7 +10381,6 @@ int cp_df_write_ndjson(const CpDataFrame *df,
   return 1;
 }
 
-#ifndef CPANDAS_WITH_ARROW
 int cp_df_write_parquet(const CpDataFrame *df,
                         const char *path,
                         CpError *err) {
@@ -10395,7 +10392,6 @@ int cp_df_write_parquet(const CpDataFrame *df,
                "parquet support not built");
   return 0;
 }
-#endif
 
 int cp_df_to_excel(const CpDataFrame *df,
                    const char *path,
