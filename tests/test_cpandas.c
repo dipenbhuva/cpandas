@@ -805,28 +805,66 @@ static void test_cpd_io(void) {
   }
 }
 
-static void test_parquet_stub(void) {
+static void test_parquet_io(void) {
   CpError err;
   cp_error_clear(&err);
 
-  const char *names[] = {"id"};
-  CpDType dtypes[] = {CP_DTYPE_INT64};
-  CpDataFrame *df = cp_df_create(1, names, dtypes, 0, &err);
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
   CHECK(df != NULL);
   if (!df) {
     return;
   }
 
+  const char *row1[] = {"1", "2.5", "Alice"};
+  const char *row2[] = {"2", "", "Bob"};
+  const char *row3[] = {"", "3.75", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
   char *path = make_temp_path();
   CHECK(path != NULL);
   if (path) {
     cp_error_clear(&err);
-    CHECK(!cp_df_write_parquet(df, path, &err));
-    CHECK(err.code == CP_ERR_INVALID);
-
+    CHECK(cp_df_write_parquet(df, path, &err));
     cp_error_clear(&err);
-    CHECK(cp_df_read_parquet(path, &err) == NULL);
-    CHECK(err.code == CP_ERR_INVALID);
+    CpDataFrame *df2 = cp_df_read_parquet(path, &err);
+    CHECK(df2 != NULL);
+    if (df2) {
+      const CpSeries *id = cp_df_get_col(df2, "id");
+      const CpSeries *score = cp_df_get_col(df2, "score");
+      const CpSeries *name = cp_df_get_col(df2, "name");
+      CHECK(id && score && name);
+
+      int64_t id_val = 0;
+      double score_val = 0.0;
+      const char *name_val = NULL;
+      int is_null = 0;
+
+      CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+      CHECK(!is_null && id_val == 1);
+      CHECK(cp_series_get_float64(score, 0, &score_val, &is_null));
+      CHECK(!is_null && fabs(score_val - 2.5) < 1e-9);
+      CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+      CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+
+      CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+      CHECK(!is_null && id_val == 2);
+      CHECK(cp_series_get_float64(score, 1, &score_val, &is_null));
+      CHECK(is_null);
+      CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+      CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+
+      CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+      CHECK(is_null);
+      CHECK(cp_series_get_float64(score, 2, &score_val, &is_null));
+      CHECK(!is_null && fabs(score_val - 3.75) < 1e-9);
+      CHECK(cp_series_get_string(name, 2, &name_val, &is_null));
+      CHECK(is_null);
+      cp_df_free(df2);
+    }
     remove(path);
     free(path);
   }
@@ -4649,7 +4687,7 @@ int main(void) {
   test_json_io();
   test_ndjson_io();
   test_cpd_io();
-  test_parquet_stub();
+  test_parquet_io();
   test_plot();
   test_write_csv_header();
   test_append_row_errors();

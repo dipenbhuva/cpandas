@@ -9,7 +9,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - Columnar data C storage with typed columns (int64, float64, string).
 - DataFrame and Series API with selection, sorting, joins, groupby, and pivot tables.
 - Aggregations (count, sum, mean, min, max, median, std, corr, cov, rank, diff).
-- CSV/TSV/JSON/NDJSON/CPD read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
+- CSV/TSV/JSON/NDJSON/Parquet/CPD read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
 - Pure C11 core (no C++ dependencies required).
 - Query filtering with AND/OR and parentheses.
 - Vectorized arithmetic helpers and column-to-column comparisons.
@@ -17,7 +17,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 
 ## Apache Arrow comparison
 
-Apache Arrow is a columnar in-memory data format and cross-language standard for interchange. cpandas is a pandas-like DataFrame library written in C that focuses on operations inside C programs. If you need zero-copy IPC or broad language interoperability, Arrow is the better fit; if you need a lightweight pandas alternative C for in-process analytics, cpandas is a good choice. Parquet read/write is not built in yet.
+Apache Arrow is a columnar in-memory data format and cross-language standard for interchange. cpandas is a pandas-like DataFrame library written in C that focuses on operations inside C programs. If you need zero-copy IPC or broad language interoperability, Arrow is the better fit; if you need a lightweight pandas alternative C for in-process analytics, cpandas is a good choice. Parquet read/write is available with a minimal C-only implementation.
 
 ## Build
 
@@ -51,6 +51,13 @@ See `CONVERSION_STATUS.md` for a checklist of implemented and remaining pandas f
 
 CPD is a compact little-endian binary format used by cpandas for fast load/save of
 typed, columnar data with null masks. It is intended for C-to-C workflows.
+
+## Parquet support
+
+cpandas supports a minimal Parquet subset: single row group, uncompressed data
+pages, PLAIN encoding, and primitive columns (int64, float64, string/UTF8) with
+optional nulls. Dictionary encoding, compression, nested schemas, and multiple
+row groups are not supported yet.
 
 ## Repo metadata (SEO)
 
