@@ -484,6 +484,10 @@ CpDataFrame *cp_df_read_json(const char *path,
                              const CpDType *dtypes,
                              size_t dtype_count,
                              CpError *err);
+CpDataFrame *cp_df_read_ndjson(const char *path,
+                               const CpDType *dtypes,
+                               size_t dtype_count,
+                               CpError *err);
 CpDataFrame *cp_df_read_parquet(const char *path, CpError *err);
 int cp_df_write_csv(const CpDataFrame *df,
                     const char *path,
@@ -497,6 +501,9 @@ int cp_df_write_tsv(const CpDataFrame *df,
 int cp_df_write_json(const CpDataFrame *df,
                      const char *path,
                      CpError *err);
+int cp_df_write_ndjson(const CpDataFrame *df,
+                       const char *path,
+                       CpError *err);
 int cp_df_write_parquet(const CpDataFrame *df,
                         const char *path,
                         CpError *err);
