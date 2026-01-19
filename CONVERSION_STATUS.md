@@ -16,6 +16,7 @@ I/O
 - TSV convenience wrappers for read/write.
 - JSON read/write (array-of-objects).
 - NDJSON read/write (line-delimited objects).
+- CPD binary read/write (cpandas columnar format).
 - Parquet read/write stubs (not implemented).
 
 Data exploration
@@ -101,7 +102,7 @@ Indexing and missing values
   (e.g., column-wise strategies).
 
 I/O and formats
-- Parquet or other formats.
+- Parquet (C-only) or additional formats.
 
 Performance and scalability
 - SIMD or parallel ops.
@@ -144,6 +145,8 @@ Advanced pandas features
   nested objects/arrays and non-ASCII unicode escapes are rejected.
 - `read_ndjson`/`write_ndjson` handle line-delimited JSON objects with the same
   primitive-only constraints as `read_json`.
+- `read_cpd`/`write_cpd` support a little-endian binary columnar format with
+  schema, null masks, and per-column data blocks.
 - `read_parquet`/`write_parquet` are stubbed pending an all-C implementation.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
