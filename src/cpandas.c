@@ -8711,6 +8711,7 @@ static char **cp_make_default_names(size_t ncols, CpError *err) {
 }
 
 static const unsigned char cp_cpd_magic[4] = {'C', 'P', 'D', '1'};
+static const unsigned char cp_parquet_magic[4] = {'P', 'A', 'R', '1'};
 
 static int cp_write_bytes(FILE *fp,
                           const void *data,
@@ -8836,6 +8837,1930 @@ static int cp_read_f64(FILE *fp, double *out, CpError *err) {
   }
   if (out) {
     memcpy(out, &bits, sizeof(bits));
+  }
+  return 1;
+}
+
+#define CP_THRIFT_STOP 0
+#define CP_THRIFT_BOOL_TRUE 1
+#define CP_THRIFT_BOOL_FALSE 2
+#define CP_THRIFT_BYTE 3
+#define CP_THRIFT_I16 4
+#define CP_THRIFT_I32 5
+#define CP_THRIFT_I64 6
+#define CP_THRIFT_DOUBLE 7
+#define CP_THRIFT_BINARY 8
+#define CP_THRIFT_LIST 9
+#define CP_THRIFT_SET 10
+#define CP_THRIFT_MAP 11
+#define CP_THRIFT_STRUCT 12
+
+static int cp_buf_append_u8(CpStrBuf *buf, unsigned char value, CpError *err) {
+  return cp_strbuf_append(buf, (const char *)&value, 1, err);
+}
+
+static int cp_thrift_write_uvarint(CpStrBuf *buf, uint64_t value, CpError *err) {
+  while (value >= 0x80) {
+    unsigned char byte = (unsigned char)((value & 0x7f) | 0x80);
+    if (!cp_buf_append_u8(buf, byte, err)) {
+      return 0;
+    }
+    value >>= 7;
+  }
+  return cp_buf_append_u8(buf, (unsigned char)value, err);
+}
+
+static uint64_t cp_thrift_zigzag64(int64_t value) {
+  return ((uint64_t)value << 1) ^ (uint64_t)(value >> 63);
+}
+
+static int cp_thrift_write_varint(CpStrBuf *buf, int64_t value, CpError *err) {
+  return cp_thrift_write_uvarint(buf, cp_thrift_zigzag64(value), err);
+}
+
+static int cp_thrift_write_i16(CpStrBuf *buf, int16_t value, CpError *err) {
+  return cp_thrift_write_varint(buf, value, err);
+}
+
+static int cp_thrift_write_i32(CpStrBuf *buf, int32_t value, CpError *err) {
+  return cp_thrift_write_varint(buf, value, err);
+}
+
+static int cp_thrift_write_i64(CpStrBuf *buf, int64_t value, CpError *err) {
+  return cp_thrift_write_varint(buf, value, err);
+}
+
+static int cp_thrift_write_double(CpStrBuf *buf, double value, CpError *err) {
+  uint64_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  unsigned char bytes[8];
+  for (int i = 0; i < 8; ++i) {
+    bytes[i] = (unsigned char)((bits >> (i * 8)) & 0xffu);
+  }
+  return cp_strbuf_append(buf, (const char *)bytes, sizeof(bytes), err);
+}
+
+static int cp_thrift_write_binary(CpStrBuf *buf,
+                                  const unsigned char *data,
+                                  size_t len,
+                                  CpError *err) {
+  if (!cp_thrift_write_uvarint(buf, (uint64_t)len, err)) {
+    return 0;
+  }
+  if (len == 0) {
+    return 1;
+  }
+  return cp_strbuf_append(buf, (const char *)data, len, err);
+}
+
+static int cp_thrift_write_field_begin(CpStrBuf *buf,
+                                       uint8_t type,
+                                       int16_t field_id,
+                                       int16_t *last_id,
+                                       CpError *err) {
+  int16_t delta = 0;
+  if (last_id) {
+    delta = (int16_t)(field_id - *last_id);
+  }
+  if (delta > 0 && delta <= 15) {
+    unsigned char header = (unsigned char)((delta << 4) | type);
+    if (!cp_buf_append_u8(buf, header, err)) {
+      return 0;
+    }
+  } else {
+    if (!cp_buf_append_u8(buf, (unsigned char)type, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_i16(buf, field_id, err)) {
+      return 0;
+    }
+  }
+  if (last_id) {
+    *last_id = field_id;
+  }
+  return 1;
+}
+
+static int cp_thrift_write_field_i32(CpStrBuf *buf,
+                                     int16_t field_id,
+                                     int32_t value,
+                                     int16_t *last_id,
+                                     CpError *err) {
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_I32,
+                                   field_id, last_id, err)) {
+    return 0;
+  }
+  return cp_thrift_write_i32(buf, value, err);
+}
+
+static int cp_thrift_write_field_i64(CpStrBuf *buf,
+                                     int16_t field_id,
+                                     int64_t value,
+                                     int16_t *last_id,
+                                     CpError *err) {
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_I64,
+                                   field_id, last_id, err)) {
+    return 0;
+  }
+  return cp_thrift_write_i64(buf, value, err);
+}
+
+static int cp_thrift_write_field_binary(CpStrBuf *buf,
+                                        int16_t field_id,
+                                        const char *value,
+                                        int16_t *last_id,
+                                        CpError *err) {
+  const unsigned char *bytes = (const unsigned char *)(value ? value : "");
+  size_t len = value ? strlen(value) : 0;
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_BINARY,
+                                   field_id, last_id, err)) {
+    return 0;
+  }
+  return cp_thrift_write_binary(buf, bytes, len, err);
+}
+
+static int cp_thrift_write_list_header(CpStrBuf *buf,
+                                       uint8_t elem_type,
+                                       size_t size,
+                                       CpError *err) {
+  if (size <= 14) {
+    unsigned char header = (unsigned char)((size << 4) | elem_type);
+    return cp_buf_append_u8(buf, header, err);
+  }
+  unsigned char header = (unsigned char)(0xf0 | elem_type);
+  if (!cp_buf_append_u8(buf, header, err)) {
+    return 0;
+  }
+  return cp_thrift_write_uvarint(buf, (uint64_t)size, err);
+}
+
+static int cp_thrift_write_stop(CpStrBuf *buf, CpError *err) {
+  return cp_buf_append_u8(buf, CP_THRIFT_STOP, err);
+}
+
+typedef struct {
+  const unsigned char *data;
+  size_t len;
+  size_t pos;
+} CpThriftReader;
+
+static int cp_thrift_read_byte(CpThriftReader *r,
+                               unsigned char *out,
+                               CpError *err) {
+  if (!r || r->pos >= r->len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "truncated thrift data");
+    return 0;
+  }
+  if (out) {
+    *out = r->data[r->pos];
+  }
+  r->pos += 1;
+  return 1;
+}
+
+static int cp_thrift_read_uvarint(CpThriftReader *r,
+                                  uint64_t *out,
+                                  CpError *err) {
+  uint64_t result = 0;
+  int shift = 0;
+  while (1) {
+    unsigned char byte = 0;
+    if (!cp_thrift_read_byte(r, &byte, err)) {
+      return 0;
+    }
+    result |= ((uint64_t)(byte & 0x7f) << shift);
+    if ((byte & 0x80) == 0) {
+      break;
+    }
+    shift += 7;
+    if (shift > 63) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid thrift varint");
+      return 0;
+    }
+  }
+  if (out) {
+    *out = result;
+  }
+  return 1;
+}
+
+static int64_t cp_thrift_unzigzag64(uint64_t value) {
+  return (int64_t)((value >> 1) ^ (~(value & 1) + 1));
+}
+
+static int cp_thrift_read_varint(CpThriftReader *r,
+                                 int64_t *out,
+                                 CpError *err) {
+  uint64_t value = 0;
+  if (!cp_thrift_read_uvarint(r, &value, err)) {
+    return 0;
+  }
+  if (out) {
+    *out = cp_thrift_unzigzag64(value);
+  }
+  return 1;
+}
+
+static int cp_thrift_read_i16(CpThriftReader *r,
+                              int16_t *out,
+                              CpError *err) {
+  int64_t value = 0;
+  if (!cp_thrift_read_varint(r, &value, err)) {
+    return 0;
+  }
+  if (value < INT16_MIN || value > INT16_MAX) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "thrift i16 out of range");
+    return 0;
+  }
+  if (out) {
+    *out = (int16_t)value;
+  }
+  return 1;
+}
+
+static int cp_thrift_read_i32(CpThriftReader *r,
+                              int32_t *out,
+                              CpError *err) {
+  int64_t value = 0;
+  if (!cp_thrift_read_varint(r, &value, err)) {
+    return 0;
+  }
+  if (value < INT32_MIN || value > INT32_MAX) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "thrift i32 out of range");
+    return 0;
+  }
+  if (out) {
+    *out = (int32_t)value;
+  }
+  return 1;
+}
+
+static int cp_thrift_read_i64(CpThriftReader *r,
+                              int64_t *out,
+                              CpError *err) {
+  return cp_thrift_read_varint(r, out, err);
+}
+
+static int cp_thrift_read_double(CpThriftReader *r,
+                                 double *out,
+                                 CpError *err) {
+  if (!r || r->pos + 8 > r->len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "truncated thrift double");
+    return 0;
+  }
+  uint64_t bits = 0;
+  for (int i = 0; i < 8; ++i) {
+    bits |= ((uint64_t)r->data[r->pos + i] << (i * 8));
+  }
+  r->pos += 8;
+  if (out) {
+    memcpy(out, &bits, sizeof(bits));
+  }
+  return 1;
+}
+
+static int cp_thrift_read_binary(CpThriftReader *r,
+                                 unsigned char **out,
+                                 size_t *out_len,
+                                 CpError *err) {
+  uint64_t len = 0;
+  if (!cp_thrift_read_uvarint(r, &len, err)) {
+    return 0;
+  }
+  if (len > SIZE_MAX || r->pos + len > r->len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid thrift binary length");
+    return 0;
+  }
+  unsigned char *buf = NULL;
+  if (len > 0) {
+    buf = (unsigned char *)malloc((size_t)len);
+    if (!buf) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+    memcpy(buf, r->data + r->pos, (size_t)len);
+  }
+  r->pos += (size_t)len;
+  if (out) {
+    *out = buf;
+  } else {
+    free(buf);
+  }
+  if (out_len) {
+    *out_len = (size_t)len;
+  }
+  return 1;
+}
+
+static int cp_thrift_read_string(CpThriftReader *r,
+                                 char **out,
+                                 CpError *err) {
+  unsigned char *buf = NULL;
+  size_t len = 0;
+  if (!cp_thrift_read_binary(r, &buf, &len, err)) {
+    return 0;
+  }
+  char *str = (char *)malloc(len + 1);
+  if (!str) {
+    free(buf);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  if (len > 0) {
+    memcpy(str, buf, len);
+  }
+  str[len] = '\0';
+  free(buf);
+  if (out) {
+    *out = str;
+  } else {
+    free(str);
+  }
+  return 1;
+}
+
+static int cp_thrift_read_list_header(CpThriftReader *r,
+                                      uint8_t *elem_type,
+                                      size_t *size,
+                                      CpError *err) {
+  unsigned char header = 0;
+  if (!cp_thrift_read_byte(r, &header, err)) {
+    return 0;
+  }
+  uint8_t type = header & 0x0f;
+  uint8_t count = header >> 4;
+  size_t list_size = 0;
+  if (count == 15) {
+    uint64_t big_size = 0;
+    if (!cp_thrift_read_uvarint(r, &big_size, err)) {
+      return 0;
+    }
+    if (big_size > SIZE_MAX) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "thrift list too large");
+      return 0;
+    }
+    list_size = (size_t)big_size;
+  } else {
+    list_size = (size_t)count;
+  }
+  if (elem_type) {
+    *elem_type = type;
+  }
+  if (size) {
+    *size = list_size;
+  }
+  return 1;
+}
+
+static int cp_thrift_read_field_header(CpThriftReader *r,
+                                       uint8_t *type,
+                                       int16_t *field_id,
+                                       int16_t *last_id,
+                                       CpError *err) {
+  unsigned char header = 0;
+  if (!cp_thrift_read_byte(r, &header, err)) {
+    return 0;
+  }
+  if (header == CP_THRIFT_STOP) {
+    if (type) {
+      *type = CP_THRIFT_STOP;
+    }
+    if (field_id) {
+      *field_id = 0;
+    }
+    return 1;
+  }
+  uint8_t field_type = header & 0x0f;
+  uint8_t delta = header >> 4;
+  int16_t id = 0;
+  if (delta != 0) {
+    id = (int16_t)((last_id ? *last_id : 0) + delta);
+  } else {
+    if (!cp_thrift_read_i16(r, &id, err)) {
+      return 0;
+    }
+  }
+  if (type) {
+    *type = field_type;
+  }
+  if (field_id) {
+    *field_id = id;
+  }
+  if (last_id) {
+    *last_id = id;
+  }
+  return 1;
+}
+
+static int cp_thrift_skip(CpThriftReader *r,
+                          uint8_t type,
+                          CpError *err);
+
+static int cp_thrift_skip_struct(CpThriftReader *r, CpError *err) {
+  int16_t last_id = 0;
+  while (1) {
+    uint8_t ftype = 0;
+    int16_t fid = 0;
+    if (!cp_thrift_read_field_header(r, &ftype, &fid, &last_id, err)) {
+      return 0;
+    }
+    if (ftype == CP_THRIFT_STOP) {
+      return 1;
+    }
+    if (!cp_thrift_skip(r, ftype, err)) {
+      return 0;
+    }
+  }
+}
+
+static int cp_thrift_skip(CpThriftReader *r,
+                          uint8_t type,
+                          CpError *err) {
+  switch (type) {
+    case CP_THRIFT_STOP:
+      return 1;
+    case CP_THRIFT_BOOL_TRUE:
+    case CP_THRIFT_BOOL_FALSE:
+      return 1;
+    case CP_THRIFT_BYTE: {
+      unsigned char tmp = 0;
+      return cp_thrift_read_byte(r, &tmp, err);
+    }
+    case CP_THRIFT_I16:
+    case CP_THRIFT_I32:
+    case CP_THRIFT_I64: {
+      int64_t tmp = 0;
+      return cp_thrift_read_varint(r, &tmp, err);
+    }
+    case CP_THRIFT_DOUBLE: {
+      double tmp = 0.0;
+      return cp_thrift_read_double(r, &tmp, err);
+    }
+    case CP_THRIFT_BINARY: {
+      unsigned char *tmp = NULL;
+      size_t len = 0;
+      int ok = cp_thrift_read_binary(r, &tmp, &len, err);
+      free(tmp);
+      return ok;
+    }
+    case CP_THRIFT_LIST:
+    case CP_THRIFT_SET: {
+      uint8_t elem_type = 0;
+      size_t count = 0;
+      if (!cp_thrift_read_list_header(r, &elem_type, &count, err)) {
+        return 0;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        if (!cp_thrift_skip(r, elem_type, err)) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+    case CP_THRIFT_MAP: {
+      uint64_t map_size = 0;
+      if (!cp_thrift_read_uvarint(r, &map_size, err)) {
+        return 0;
+      }
+      if (map_size == 0) {
+        return 1;
+      }
+      unsigned char header = 0;
+      if (!cp_thrift_read_byte(r, &header, err)) {
+        return 0;
+      }
+      uint8_t key_type = header >> 4;
+      uint8_t val_type = header & 0x0f;
+      for (uint64_t i = 0; i < map_size; ++i) {
+        if (!cp_thrift_skip(r, key_type, err)) {
+          return 0;
+        }
+        if (!cp_thrift_skip(r, val_type, err)) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+    case CP_THRIFT_STRUCT:
+      return cp_thrift_skip_struct(r, err);
+    default:
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "unsupported thrift type");
+      return 0;
+  }
+}
+
+typedef struct {
+  FILE *fp;
+} CpThriftFileReader;
+
+static int cp_thrift_file_read_byte(CpThriftFileReader *r,
+                                    unsigned char *out,
+                                    CpError *err) {
+  int ch = fgetc(r->fp);
+  if (ch == EOF) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "truncated thrift data");
+    return 0;
+  }
+  if (out) {
+    *out = (unsigned char)ch;
+  }
+  return 1;
+}
+
+static int cp_thrift_file_read_uvarint(CpThriftFileReader *r,
+                                       uint64_t *out,
+                                       CpError *err) {
+  uint64_t result = 0;
+  int shift = 0;
+  while (1) {
+    unsigned char byte = 0;
+    if (!cp_thrift_file_read_byte(r, &byte, err)) {
+      return 0;
+    }
+    result |= ((uint64_t)(byte & 0x7f) << shift);
+    if ((byte & 0x80) == 0) {
+      break;
+    }
+    shift += 7;
+    if (shift > 63) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid thrift varint");
+      return 0;
+    }
+  }
+  if (out) {
+    *out = result;
+  }
+  return 1;
+}
+
+static int cp_thrift_file_read_varint(CpThriftFileReader *r,
+                                      int64_t *out,
+                                      CpError *err) {
+  uint64_t value = 0;
+  if (!cp_thrift_file_read_uvarint(r, &value, err)) {
+    return 0;
+  }
+  if (out) {
+    *out = cp_thrift_unzigzag64(value);
+  }
+  return 1;
+}
+
+static int cp_thrift_file_read_i32(CpThriftFileReader *r,
+                                   int32_t *out,
+                                   CpError *err) {
+  int64_t value = 0;
+  if (!cp_thrift_file_read_varint(r, &value, err)) {
+    return 0;
+  }
+  if (value < INT32_MIN || value > INT32_MAX) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "thrift i32 out of range");
+    return 0;
+  }
+  if (out) {
+    *out = (int32_t)value;
+  }
+  return 1;
+}
+
+static int cp_thrift_file_read_i64(CpThriftFileReader *r,
+                                   int64_t *out,
+                                   CpError *err) {
+  return cp_thrift_file_read_varint(r, out, err);
+}
+
+static int cp_thrift_file_read_field_header(CpThriftFileReader *r,
+                                            uint8_t *type,
+                                            int16_t *field_id,
+                                            int16_t *last_id,
+                                            CpError *err) {
+  unsigned char header = 0;
+  if (!cp_thrift_file_read_byte(r, &header, err)) {
+    return 0;
+  }
+  if (header == CP_THRIFT_STOP) {
+    if (type) {
+      *type = CP_THRIFT_STOP;
+    }
+    if (field_id) {
+      *field_id = 0;
+    }
+    return 1;
+  }
+  uint8_t field_type = header & 0x0f;
+  uint8_t delta = header >> 4;
+  int16_t id = 0;
+  if (delta != 0) {
+    id = (int16_t)((last_id ? *last_id : 0) + delta);
+  } else {
+    int16_t tmp = 0;
+    int64_t value = 0;
+    if (!cp_thrift_file_read_varint(r, &value, err)) {
+      return 0;
+    }
+    if (value < INT16_MIN || value > INT16_MAX) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "thrift i16 out of range");
+      return 0;
+    }
+    tmp = (int16_t)value;
+    id = tmp;
+  }
+  if (type) {
+    *type = field_type;
+  }
+  if (field_id) {
+    *field_id = id;
+  }
+  if (last_id) {
+    *last_id = id;
+  }
+  return 1;
+}
+
+static int cp_thrift_file_skip(CpThriftFileReader *r,
+                               uint8_t type,
+                               CpError *err);
+
+static int cp_thrift_file_skip_struct(CpThriftFileReader *r,
+                                      CpError *err) {
+  int16_t last_id = 0;
+  while (1) {
+    uint8_t ftype = 0;
+    int16_t fid = 0;
+    if (!cp_thrift_file_read_field_header(r, &ftype, &fid, &last_id, err)) {
+      return 0;
+    }
+    if (ftype == CP_THRIFT_STOP) {
+      return 1;
+    }
+    if (!cp_thrift_file_skip(r, ftype, err)) {
+      return 0;
+    }
+  }
+}
+
+static int cp_thrift_file_skip(CpThriftFileReader *r,
+                               uint8_t type,
+                               CpError *err) {
+  switch (type) {
+    case CP_THRIFT_STOP:
+    case CP_THRIFT_BOOL_TRUE:
+    case CP_THRIFT_BOOL_FALSE:
+      return 1;
+    case CP_THRIFT_BYTE: {
+      unsigned char tmp = 0;
+      return cp_thrift_file_read_byte(r, &tmp, err);
+    }
+    case CP_THRIFT_I16:
+    case CP_THRIFT_I32:
+    case CP_THRIFT_I64: {
+      int64_t tmp = 0;
+      return cp_thrift_file_read_varint(r, &tmp, err);
+    }
+    case CP_THRIFT_DOUBLE: {
+      unsigned char buf[8];
+      if (fread(buf, 1, sizeof(buf), r->fp) != sizeof(buf)) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "truncated thrift double");
+        return 0;
+      }
+      return 1;
+    }
+    case CP_THRIFT_BINARY: {
+      uint64_t len = 0;
+      if (!cp_thrift_file_read_uvarint(r, &len, err)) {
+        return 0;
+      }
+      if (len > 0) {
+        if (fseek(r->fp, (long)len, SEEK_CUR) != 0) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "truncated thrift binary");
+          return 0;
+        }
+      }
+      return 1;
+    }
+    case CP_THRIFT_LIST:
+    case CP_THRIFT_SET: {
+      unsigned char header = 0;
+      if (!cp_thrift_file_read_byte(r, &header, err)) {
+        return 0;
+      }
+      uint8_t elem_type = header & 0x0f;
+      uint8_t count = header >> 4;
+      size_t list_size = 0;
+      if (count == 15) {
+        uint64_t big_size = 0;
+        if (!cp_thrift_file_read_uvarint(r, &big_size, err)) {
+          return 0;
+        }
+        list_size = (size_t)big_size;
+      } else {
+        list_size = (size_t)count;
+      }
+      for (size_t i = 0; i < list_size; ++i) {
+        if (!cp_thrift_file_skip(r, elem_type, err)) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+    case CP_THRIFT_MAP: {
+      uint64_t map_size = 0;
+      if (!cp_thrift_file_read_uvarint(r, &map_size, err)) {
+        return 0;
+      }
+      if (map_size == 0) {
+        return 1;
+      }
+      unsigned char header = 0;
+      if (!cp_thrift_file_read_byte(r, &header, err)) {
+        return 0;
+      }
+      uint8_t key_type = header >> 4;
+      uint8_t val_type = header & 0x0f;
+      for (uint64_t i = 0; i < map_size; ++i) {
+        if (!cp_thrift_file_skip(r, key_type, err)) {
+          return 0;
+        }
+        if (!cp_thrift_file_skip(r, val_type, err)) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+    case CP_THRIFT_STRUCT:
+      return cp_thrift_file_skip_struct(r, err);
+    default:
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "unsupported thrift type");
+      return 0;
+  }
+}
+
+#define CP_PARQUET_TYPE_INT32 1
+#define CP_PARQUET_TYPE_INT64 2
+#define CP_PARQUET_TYPE_FLOAT 4
+#define CP_PARQUET_TYPE_DOUBLE 5
+#define CP_PARQUET_TYPE_BYTE_ARRAY 6
+
+#define CP_PARQUET_ENC_PLAIN 0
+#define CP_PARQUET_ENC_RLE 2
+
+#define CP_PARQUET_CODEC_UNCOMPRESSED 0
+
+#define CP_PARQUET_PAGE_DATA 0
+
+#define CP_PARQUET_REP_REQUIRED 0
+#define CP_PARQUET_REP_OPTIONAL 1
+
+#define CP_PARQUET_CONVERTED_UTF8 9
+
+static int cp_parquet_bit_width(uint8_t max_level) {
+  int width = 0;
+  while (max_level > 0) {
+    width += 1;
+    max_level >>= 1;
+  }
+  return width;
+}
+
+static int cp_parquet_encode_levels(const uint8_t *levels,
+                                    size_t count,
+                                    uint8_t max_level,
+                                    CpStrBuf *out,
+                                    CpError *err) {
+  if (!levels || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid levels");
+    return 0;
+  }
+  int bit_width = cp_parquet_bit_width(max_level);
+  if (bit_width <= 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid levels");
+    return 0;
+  }
+  if (!cp_buf_append_u8(out, (unsigned char)bit_width, err)) {
+    return 0;
+  }
+  size_t value_bytes = (size_t)((bit_width + 7) / 8);
+  size_t idx = 0;
+  while (idx < count) {
+    uint8_t value = levels[idx];
+    size_t run = 1;
+    while (idx + run < count && levels[idx + run] == value) {
+      run += 1;
+    }
+    uint64_t header = ((uint64_t)run << 1);
+    if (!cp_thrift_write_uvarint(out, header, err)) {
+      return 0;
+    }
+    for (size_t b = 0; b < value_bytes; ++b) {
+      unsigned char byte = (unsigned char)((value >> (b * 8)) & 0xffu);
+      if (!cp_buf_append_u8(out, byte, err)) {
+        return 0;
+      }
+    }
+    idx += run;
+  }
+  return 1;
+}
+
+static int cp_parquet_decode_levels(const unsigned char *data,
+                                    size_t data_len,
+                                    size_t count,
+                                    uint8_t max_level,
+                                    uint8_t *out,
+                                    CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid levels");
+    return 0;
+  }
+  if (data_len == 0) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+    return 0;
+  }
+  int expected_width = cp_parquet_bit_width(max_level);
+  int bit_width = (int)data[0];
+  if (bit_width <= 0 || bit_width > expected_width) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+    return 0;
+  }
+  size_t value_bytes = (size_t)((bit_width + 7) / 8);
+  size_t pos = 1;
+  size_t out_idx = 0;
+  while (pos < data_len && out_idx < count) {
+    uint64_t header = 0;
+    int shift = 0;
+    while (1) {
+      if (pos >= data_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+        return 0;
+      }
+      unsigned char byte = data[pos++];
+      header |= ((uint64_t)(byte & 0x7f) << shift);
+      if ((byte & 0x80) == 0) {
+        break;
+      }
+      shift += 7;
+      if (shift > 63) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+        return 0;
+      }
+    }
+    if (header & 1) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                   "bit-packed levels not supported");
+      return 0;
+    }
+    uint64_t run = header >> 1;
+    if (pos + value_bytes > data_len) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+      return 0;
+    }
+    uint8_t value = 0;
+    for (size_t b = 0; b < value_bytes; ++b) {
+      value |= (uint8_t)(data[pos++] << (b * 8));
+    }
+    if (value > max_level) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def level");
+      return 0;
+    }
+    for (uint64_t i = 0; i < run && out_idx < count; ++i) {
+      out[out_idx++] = value;
+    }
+  }
+  if (out_idx != count) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_parquet_write_u32(FILE *fp, uint32_t value, CpError *err) {
+  unsigned char buf[4];
+  buf[0] = (unsigned char)(value & 0xffu);
+  buf[1] = (unsigned char)((value >> 8) & 0xffu);
+  buf[2] = (unsigned char)((value >> 16) & 0xffu);
+  buf[3] = (unsigned char)((value >> 24) & 0xffu);
+  return cp_write_bytes(fp, buf, sizeof(buf), err, "failed to write parquet");
+}
+
+static int cp_parquet_buf_append_u32(CpStrBuf *buf,
+                                     uint32_t value,
+                                     CpError *err) {
+  unsigned char out[4];
+  out[0] = (unsigned char)(value & 0xffu);
+  out[1] = (unsigned char)((value >> 8) & 0xffu);
+  out[2] = (unsigned char)((value >> 16) & 0xffu);
+  out[3] = (unsigned char)((value >> 24) & 0xffu);
+  return cp_strbuf_append(buf, (const char *)out, sizeof(out), err);
+}
+
+static int cp_parquet_buf_append_u64(CpStrBuf *buf,
+                                     uint64_t value,
+                                     CpError *err) {
+  unsigned char out[8];
+  out[0] = (unsigned char)(value & 0xffu);
+  out[1] = (unsigned char)((value >> 8) & 0xffu);
+  out[2] = (unsigned char)((value >> 16) & 0xffu);
+  out[3] = (unsigned char)((value >> 24) & 0xffu);
+  out[4] = (unsigned char)((value >> 32) & 0xffu);
+  out[5] = (unsigned char)((value >> 40) & 0xffu);
+  out[6] = (unsigned char)((value >> 48) & 0xffu);
+  out[7] = (unsigned char)((value >> 56) & 0xffu);
+  return cp_strbuf_append(buf, (const char *)out, sizeof(out), err);
+}
+
+static int cp_parquet_buf_append_f64(CpStrBuf *buf, double value, CpError *err) {
+  uint64_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  return cp_parquet_buf_append_u64(buf, bits, err);
+}
+
+static int cp_parquet_read_u32(const unsigned char *data,
+                               size_t len,
+                               size_t *offset,
+                               uint32_t *out,
+                               CpError *err) {
+  if (!data || !offset || *offset + 4 > len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet data");
+    return 0;
+  }
+  size_t pos = *offset;
+  uint32_t value = 0;
+  value |= (uint32_t)data[pos];
+  value |= (uint32_t)data[pos + 1] << 8;
+  value |= (uint32_t)data[pos + 2] << 16;
+  value |= (uint32_t)data[pos + 3] << 24;
+  *offset = pos + 4;
+  if (out) {
+    *out = value;
+  }
+  return 1;
+}
+
+static int cp_parquet_read_u64(const unsigned char *data,
+                               size_t len,
+                               size_t *offset,
+                               uint64_t *out,
+                               CpError *err) {
+  if (!data || !offset || *offset + 8 > len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet data");
+    return 0;
+  }
+  size_t pos = *offset;
+  uint64_t value = 0;
+  value |= (uint64_t)data[pos];
+  value |= (uint64_t)data[pos + 1] << 8;
+  value |= (uint64_t)data[pos + 2] << 16;
+  value |= (uint64_t)data[pos + 3] << 24;
+  value |= (uint64_t)data[pos + 4] << 32;
+  value |= (uint64_t)data[pos + 5] << 40;
+  value |= (uint64_t)data[pos + 6] << 48;
+  value |= (uint64_t)data[pos + 7] << 56;
+  *offset = pos + 8;
+  if (out) {
+    *out = value;
+  }
+  return 1;
+}
+
+static int cp_parquet_read_f32(const unsigned char *data,
+                               size_t len,
+                               size_t *offset,
+                               float *out,
+                               CpError *err) {
+  uint32_t bits = 0;
+  if (!cp_parquet_read_u32(data, len, offset, &bits, err)) {
+    return 0;
+  }
+  if (out) {
+    memcpy(out, &bits, sizeof(bits));
+  }
+  return 1;
+}
+
+static int cp_parquet_read_f64(const unsigned char *data,
+                               size_t len,
+                               size_t *offset,
+                               double *out,
+                               CpError *err) {
+  uint64_t bits = 0;
+  if (!cp_parquet_read_u64(data, len, offset, &bits, err)) {
+    return 0;
+  }
+  if (out) {
+    memcpy(out, &bits, sizeof(bits));
+  }
+  return 1;
+}
+
+typedef struct {
+  const char *name;
+  CpDType dtype;
+  int repetition_type;
+  int max_def_level;
+  int64_t data_page_offset;
+  int64_t total_compressed_size;
+  int64_t total_uncompressed_size;
+} CpParquetColumnMeta;
+
+typedef struct {
+  size_t ncols;
+  size_t nrows;
+  char **names;
+  CpDType *dtypes;
+  int *parquet_types;
+  int *max_def_levels;
+  int64_t *data_page_offsets;
+} CpParquetFileMeta;
+
+typedef struct {
+  int32_t type;
+  int32_t uncompressed_size;
+  int32_t compressed_size;
+  int32_t num_values;
+  int32_t encoding;
+  int32_t def_encoding;
+  int32_t rep_encoding;
+} CpParquetPageHeader;
+
+static void cp_parquet_meta_free(CpParquetFileMeta *meta) {
+  if (!meta) {
+    return;
+  }
+  if (meta->names) {
+    for (size_t i = 0; i < meta->ncols; ++i) {
+      free(meta->names[i]);
+    }
+  }
+  free(meta->names);
+  free(meta->dtypes);
+  free(meta->parquet_types);
+  free(meta->max_def_levels);
+  free(meta->data_page_offsets);
+  meta->names = NULL;
+  meta->dtypes = NULL;
+  meta->parquet_types = NULL;
+  meta->max_def_levels = NULL;
+  meta->data_page_offsets = NULL;
+  meta->ncols = 0;
+  meta->nrows = 0;
+}
+
+static int cp_parquet_type_for_dtype(CpDType dtype) {
+  switch (dtype) {
+    case CP_DTYPE_INT64:
+      return CP_PARQUET_TYPE_INT64;
+    case CP_DTYPE_FLOAT64:
+      return CP_PARQUET_TYPE_DOUBLE;
+    case CP_DTYPE_STRING:
+      return CP_PARQUET_TYPE_BYTE_ARRAY;
+    default:
+      return -1;
+  }
+}
+
+static int cp_parquet_dtype_from_type(int type,
+                                      CpDType *out,
+                                      CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dtype output");
+    return 0;
+  }
+  switch (type) {
+    case CP_PARQUET_TYPE_INT32:
+    case CP_PARQUET_TYPE_INT64:
+      *out = CP_DTYPE_INT64;
+      return 1;
+    case CP_PARQUET_TYPE_FLOAT:
+    case CP_PARQUET_TYPE_DOUBLE:
+      *out = CP_DTYPE_FLOAT64;
+      return 1;
+    case CP_PARQUET_TYPE_BYTE_ARRAY:
+      *out = CP_DTYPE_STRING;
+      return 1;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported parquet type");
+      return 0;
+  }
+}
+
+static int cp_parquet_write_page_header(CpStrBuf *buf,
+                                        int32_t num_values,
+                                        int32_t data_size,
+                                        CpError *err) {
+  if (!buf) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid page header");
+    return 0;
+  }
+  int16_t last_id = 0;
+  if (!cp_thrift_write_field_i32(buf, 1, CP_PARQUET_PAGE_DATA,
+                                 &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 2, data_size, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 3, data_size, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 5, &last_id, err)) {
+    return 0;
+  }
+  int16_t data_last = 0;
+  if (!cp_thrift_write_field_i32(buf, 1, num_values, &data_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 2, CP_PARQUET_ENC_PLAIN,
+                                 &data_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 3, CP_PARQUET_ENC_RLE,
+                                 &data_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 4, CP_PARQUET_ENC_RLE,
+                                 &data_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_stop(buf, err)) {
+    return 0;
+  }
+  return cp_thrift_write_stop(buf, err);
+}
+
+static int cp_parquet_read_data_page_header(CpThriftFileReader *r,
+                                            CpParquetPageHeader *out,
+                                            CpError *err) {
+  int16_t last_id = 0;
+  int have_num = 0;
+  int have_enc = 0;
+  while (1) {
+    uint8_t type = 0;
+    int16_t field_id = 0;
+    if (!cp_thrift_file_read_field_header(r, &type, &field_id, &last_id, err)) {
+      return 0;
+    }
+    if (type == CP_THRIFT_STOP) {
+      break;
+    }
+    switch (field_id) {
+      case 1:
+        if (!cp_thrift_file_read_i32(r, &out->num_values, err)) {
+          return 0;
+        }
+        have_num = 1;
+        break;
+      case 2:
+        if (!cp_thrift_file_read_i32(r, &out->encoding, err)) {
+          return 0;
+        }
+        have_enc = 1;
+        break;
+      case 3:
+        if (!cp_thrift_file_read_i32(r, &out->def_encoding, err)) {
+          return 0;
+        }
+        break;
+      case 4:
+        if (!cp_thrift_file_read_i32(r, &out->rep_encoding, err)) {
+          return 0;
+        }
+        break;
+      default:
+        if (!cp_thrift_file_skip(r, type, err)) {
+          return 0;
+        }
+        break;
+    }
+  }
+  if (!have_num || !have_enc) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet page header");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_parquet_read_page_header(FILE *fp,
+                                       CpParquetPageHeader *out,
+                                       CpError *err) {
+  if (!fp || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid page header");
+    return 0;
+  }
+  CpThriftFileReader reader = {fp};
+  int16_t last_id = 0;
+  int have_type = 0;
+  int have_size = 0;
+  int have_data = 0;
+  memset(out, 0, sizeof(*out));
+  while (1) {
+    uint8_t type = 0;
+    int16_t field_id = 0;
+    if (!cp_thrift_file_read_field_header(&reader, &type, &field_id,
+                                          &last_id, err)) {
+      return 0;
+    }
+    if (type == CP_THRIFT_STOP) {
+      break;
+    }
+    switch (field_id) {
+      case 1:
+        if (!cp_thrift_file_read_i32(&reader, &out->type, err)) {
+          return 0;
+        }
+        have_type = 1;
+        break;
+      case 2:
+        if (!cp_thrift_file_read_i32(&reader, &out->uncompressed_size, err)) {
+          return 0;
+        }
+        have_size = 1;
+        break;
+      case 3:
+        if (!cp_thrift_file_read_i32(&reader, &out->compressed_size, err)) {
+          return 0;
+        }
+        break;
+      case 5:
+        if (!cp_parquet_read_data_page_header(&reader, out, err)) {
+          return 0;
+        }
+        have_data = 1;
+        break;
+      default:
+        if (!cp_thrift_file_skip(&reader, type, err)) {
+          return 0;
+        }
+        break;
+    }
+  }
+  if (!have_type || !have_size || !have_data) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet page header");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_parquet_write_schema_element_root(CpStrBuf *buf,
+                                                size_t ncols,
+                                                CpError *err) {
+  int16_t last_id = 0;
+  if (!cp_thrift_write_field_i32(buf, 3, CP_PARQUET_REP_REQUIRED,
+                                 &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_binary(buf, 4, "schema", &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 5, (int32_t)ncols, &last_id, err)) {
+    return 0;
+  }
+  return cp_thrift_write_stop(buf, err);
+}
+
+static int cp_parquet_write_schema_element_col(CpStrBuf *buf,
+                                               const char *name,
+                                               int parquet_type,
+                                               int repetition_type,
+                                               int converted_type,
+                                               CpError *err) {
+  int16_t last_id = 0;
+  if (!cp_thrift_write_field_i32(buf, 1, parquet_type, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 3, repetition_type, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_binary(buf, 4, name, &last_id, err)) {
+    return 0;
+  }
+  if (converted_type >= 0) {
+    if (!cp_thrift_write_field_i32(buf, 6, converted_type, &last_id, err)) {
+      return 0;
+    }
+  }
+  return cp_thrift_write_stop(buf, err);
+}
+
+static int cp_parquet_write_file_metadata(CpStrBuf *buf,
+                                          const CpParquetColumnMeta *cols,
+                                          size_t ncols,
+                                          int64_t nrows,
+                                          int64_t row_group_size,
+                                          CpError *err) {
+  int16_t last_id = 0;
+  if (!cp_thrift_write_field_i32(buf, 1, 1, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 2, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, ncols + 1, err)) {
+    return 0;
+  }
+  if (!cp_parquet_write_schema_element_root(buf, ncols, err)) {
+    return 0;
+  }
+  for (size_t i = 0; i < ncols; ++i) {
+    int parquet_type = cp_parquet_type_for_dtype(cols[i].dtype);
+    int converted_type = (cols[i].dtype == CP_DTYPE_STRING)
+                             ? CP_PARQUET_CONVERTED_UTF8
+                             : -1;
+    if (!cp_parquet_write_schema_element_col(buf,
+                                             cols[i].name,
+                                             parquet_type,
+                                             cols[i].repetition_type,
+                                             converted_type,
+                                             err)) {
+      return 0;
+    }
+  }
+  if (!cp_thrift_write_field_i64(buf, 3, nrows, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 4, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, 1, err)) {
+    return 0;
+  }
+  int16_t rg_last = 0;
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 1, &rg_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, ncols, err)) {
+    return 0;
+  }
+  for (size_t i = 0; i < ncols; ++i) {
+    int16_t cc_last = 0;
+    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 2, &cc_last, err)) {
+      return 0;
+    }
+    int16_t md_last = 0;
+    int parquet_type = cp_parquet_type_for_dtype(cols[i].dtype);
+    if (!cp_thrift_write_field_i32(buf, 1, parquet_type, &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 2, &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_list_header(buf, CP_THRIFT_I32, 2, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_i32(buf, CP_PARQUET_ENC_PLAIN, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_i32(buf, CP_PARQUET_ENC_RLE, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 3, &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_list_header(buf, CP_THRIFT_BINARY, 1, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_binary(buf,
+                                (const unsigned char *)cols[i].name,
+                                strlen(cols[i].name),
+                                err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_i32(buf, 4, CP_PARQUET_CODEC_UNCOMPRESSED,
+                                   &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_i64(buf, 5, nrows, &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_i64(buf, 6,
+                                   cols[i].total_uncompressed_size,
+                                   &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_i64(buf, 7,
+                                   cols[i].total_compressed_size,
+                                   &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_field_i64(buf, 9, cols[i].data_page_offset,
+                                   &md_last, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_stop(buf, err)) {
+      return 0;
+    }
+    if (!cp_thrift_write_stop(buf, err)) {
+      return 0;
+    }
+  }
+  if (!cp_thrift_write_field_i64(buf, 2, row_group_size, &rg_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i64(buf, 3, nrows, &rg_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_stop(buf, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_binary(buf, 6, "cpandas", &last_id, err)) {
+    return 0;
+  }
+  return cp_thrift_write_stop(buf, err);
+}
+
+typedef struct {
+  int type;
+  int repetition_type;
+  int num_children;
+  int converted_type;
+  int has_type;
+  int has_repetition;
+  int has_num_children;
+  int has_converted;
+  char *name;
+} CpParquetSchemaElement;
+
+static void cp_parquet_schema_element_free(CpParquetSchemaElement *elem) {
+  if (!elem) {
+    return;
+  }
+  free(elem->name);
+  elem->name = NULL;
+}
+
+static int cp_parquet_read_schema_element(CpThriftReader *r,
+                                          CpParquetSchemaElement *out,
+                                          CpError *err) {
+  if (!r || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid schema element");
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  int16_t last_id = 0;
+  while (1) {
+    uint8_t type = 0;
+    int16_t field_id = 0;
+    if (!cp_thrift_read_field_header(r, &type, &field_id, &last_id, err)) {
+      return 0;
+    }
+    if (type == CP_THRIFT_STOP) {
+      break;
+    }
+    switch (field_id) {
+      case 1: {
+        int32_t value = 0;
+        if (!cp_thrift_read_i32(r, &value, err)) {
+          return 0;
+        }
+        out->type = value;
+        out->has_type = 1;
+        break;
+      }
+      case 3: {
+        int32_t value = 0;
+        if (!cp_thrift_read_i32(r, &value, err)) {
+          return 0;
+        }
+        out->repetition_type = value;
+        out->has_repetition = 1;
+        break;
+      }
+      case 4: {
+        char *name = NULL;
+        if (!cp_thrift_read_string(r, &name, err)) {
+          return 0;
+        }
+        out->name = name;
+        break;
+      }
+      case 5: {
+        int32_t value = 0;
+        if (!cp_thrift_read_i32(r, &value, err)) {
+          return 0;
+        }
+        out->num_children = value;
+        out->has_num_children = 1;
+        break;
+      }
+      case 6: {
+        int32_t value = 0;
+        if (!cp_thrift_read_i32(r, &value, err)) {
+          return 0;
+        }
+        out->converted_type = value;
+        out->has_converted = 1;
+        break;
+      }
+      default:
+        if (!cp_thrift_skip(r, type, err)) {
+          return 0;
+        }
+        break;
+    }
+  }
+  return 1;
+}
+
+typedef struct {
+  char *name;
+  int type;
+  int codec;
+  int64_t num_values;
+  int64_t data_page_offset;
+  int has_name;
+  int has_type;
+  int has_codec;
+  int has_num_values;
+  int has_data_page_offset;
+} CpParquetColumnChunkMeta;
+
+static void cp_parquet_column_meta_clear(CpParquetColumnChunkMeta *meta) {
+  if (!meta) {
+    return;
+  }
+  free(meta->name);
+  meta->name = NULL;
+}
+
+static int cp_parquet_read_column_meta(CpThriftReader *r,
+                                       CpParquetColumnChunkMeta *out,
+                                       CpError *err) {
+  if (!r || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid column meta");
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  int16_t last_id = 0;
+  while (1) {
+    uint8_t type = 0;
+    int16_t field_id = 0;
+    if (!cp_thrift_read_field_header(r, &type, &field_id, &last_id, err)) {
+      return 0;
+    }
+    if (type == CP_THRIFT_STOP) {
+      break;
+    }
+    switch (field_id) {
+      case 1: {
+        int32_t value = 0;
+        if (!cp_thrift_read_i32(r, &value, err)) {
+          return 0;
+        }
+        out->type = value;
+        out->has_type = 1;
+        break;
+      }
+      case 3: {
+        uint8_t elem_type = 0;
+        size_t count = 0;
+        if (!cp_thrift_read_list_header(r, &elem_type, &count, err)) {
+          return 0;
+        }
+        if (elem_type != CP_THRIFT_BINARY || count == 0) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid path_in_schema");
+          return 0;
+        }
+        for (size_t i = 0; i < count; ++i) {
+          char *name = NULL;
+          if (!cp_thrift_read_string(r, &name, err)) {
+            return 0;
+          }
+          if (i == 0) {
+            out->name = name;
+            out->has_name = 1;
+          } else {
+            free(name);
+          }
+        }
+        break;
+      }
+      case 4: {
+        int32_t value = 0;
+        if (!cp_thrift_read_i32(r, &value, err)) {
+          return 0;
+        }
+        out->codec = value;
+        out->has_codec = 1;
+        break;
+      }
+      case 5: {
+        int64_t value = 0;
+        if (!cp_thrift_read_i64(r, &value, err)) {
+          return 0;
+        }
+        out->num_values = value;
+        out->has_num_values = 1;
+        break;
+      }
+      case 9: {
+        int64_t value = 0;
+        if (!cp_thrift_read_i64(r, &value, err)) {
+          return 0;
+        }
+        out->data_page_offset = value;
+        out->has_data_page_offset = 1;
+        break;
+      }
+      default:
+        if (!cp_thrift_skip(r, type, err)) {
+          return 0;
+        }
+        break;
+    }
+  }
+  return 1;
+}
+
+static int cp_parquet_parse_file_metadata(const unsigned char *data,
+                                          size_t len,
+                                          CpParquetFileMeta *out,
+                                          CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid parquet metadata");
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  CpThriftReader r = {data, len, 0};
+  int16_t last_id = 0;
+  int have_schema = 0;
+  int have_rows = 0;
+  int have_row_groups = 0;
+  int64_t row_group_rows = 0;
+  while (1) {
+    uint8_t type = 0;
+    int16_t field_id = 0;
+    if (!cp_thrift_read_field_header(&r, &type, &field_id, &last_id, err)) {
+      cp_parquet_meta_free(out);
+      return 0;
+    }
+    if (type == CP_THRIFT_STOP) {
+      break;
+    }
+    switch (field_id) {
+      case 2: {
+        uint8_t elem_type = 0;
+        size_t count = 0;
+        if (!cp_thrift_read_list_header(&r, &elem_type, &count, err)) {
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        if (elem_type != CP_THRIFT_STRUCT || count < 2) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        CpParquetSchemaElement elem;
+        if (!cp_parquet_read_schema_element(&r, &elem, err)) {
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        int expected_children = elem.has_num_children
+                                    ? elem.num_children
+                                    : (int)(count - 1);
+        cp_parquet_schema_element_free(&elem);
+        if (expected_children != (int)(count - 1)) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        out->ncols = count - 1;
+        out->names = (char **)calloc(out->ncols, sizeof(char *));
+        out->dtypes = (CpDType *)malloc(out->ncols * sizeof(CpDType));
+        out->parquet_types = (int *)malloc(out->ncols * sizeof(int));
+        out->max_def_levels = (int *)calloc(out->ncols, sizeof(int));
+        out->data_page_offsets =
+            (int64_t *)calloc(out->ncols, sizeof(int64_t));
+        if (!out->names || !out->dtypes || !out->parquet_types ||
+            !out->max_def_levels || !out->data_page_offsets) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        for (size_t i = 0; i < out->ncols; ++i) {
+          CpParquetSchemaElement col;
+          if (!cp_parquet_read_schema_element(&r, &col, err)) {
+            cp_parquet_schema_element_free(&col);
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+          if (!col.name || !col.has_type) {
+            cp_parquet_schema_element_free(&col);
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+          CpDType dtype;
+          if (!cp_parquet_dtype_from_type(col.type, &dtype, err)) {
+            cp_parquet_schema_element_free(&col);
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+          out->names[i] = col.name;
+          out->dtypes[i] = dtype;
+          out->parquet_types[i] = col.type;
+          if (col.has_repetition &&
+              col.repetition_type == CP_PARQUET_REP_OPTIONAL) {
+            out->max_def_levels[i] = 1;
+          } else if (col.has_repetition &&
+                     col.repetition_type != CP_PARQUET_REP_REQUIRED) {
+            cp_parquet_schema_element_free(&col);
+            cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                         "unsupported parquet repetition");
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+          col.name = NULL;
+          cp_parquet_schema_element_free(&col);
+        }
+        have_schema = 1;
+        break;
+      }
+      case 3: {
+        int64_t value = 0;
+        if (!cp_thrift_read_i64(&r, &value, err)) {
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        if (value < 0) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row count");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        out->nrows = (size_t)value;
+        have_rows = 1;
+        break;
+      }
+      case 4: {
+        uint8_t elem_type = 0;
+        size_t count = 0;
+        if (!cp_thrift_read_list_header(&r, &elem_type, &count, err)) {
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        if (elem_type != CP_THRIFT_STRUCT || count == 0) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row groups");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        if (count != 1) {
+          cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                       "multiple row groups not supported");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        int16_t rg_last = 0;
+        while (1) {
+          uint8_t rg_type = 0;
+          int16_t rg_field = 0;
+          if (!cp_thrift_read_field_header(&r, &rg_type, &rg_field,
+                                           &rg_last, err)) {
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+          if (rg_type == CP_THRIFT_STOP) {
+            break;
+          }
+          if (rg_field == 1) {
+            uint8_t col_type = 0;
+            size_t col_count = 0;
+            if (!cp_thrift_read_list_header(&r, &col_type, &col_count, err)) {
+              cp_parquet_meta_free(out);
+              return 0;
+            }
+            if (col_type != CP_THRIFT_STRUCT ||
+                (!have_schema && col_count == 0)) {
+              cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid columns");
+              cp_parquet_meta_free(out);
+              return 0;
+            }
+            if (have_schema && col_count != out->ncols) {
+              cp_error_set(err, CP_ERR_PARSE, 0, 0, "column count mismatch");
+              cp_parquet_meta_free(out);
+              return 0;
+            }
+            for (size_t i = 0; i < col_count; ++i) {
+              CpParquetColumnChunkMeta meta;
+              int have_meta = 0;
+              int16_t cc_last = 0;
+              memset(&meta, 0, sizeof(meta));
+              while (1) {
+                uint8_t cc_type = 0;
+                int16_t cc_field = 0;
+                if (!cp_thrift_read_field_header(&r, &cc_type, &cc_field,
+                                                 &cc_last, err)) {
+                  cp_parquet_column_meta_clear(&meta);
+                  cp_parquet_meta_free(out);
+                  return 0;
+                }
+                if (cc_type == CP_THRIFT_STOP) {
+                  break;
+                }
+                if (cc_field == 2 && cc_type == CP_THRIFT_STRUCT) {
+                  if (!cp_parquet_read_column_meta(&r, &meta, err)) {
+                    cp_parquet_column_meta_clear(&meta);
+                    cp_parquet_meta_free(out);
+                    return 0;
+                  }
+                  have_meta = 1;
+                } else {
+                  if (!cp_thrift_skip(&r, cc_type, err)) {
+                    cp_parquet_column_meta_clear(&meta);
+                    cp_parquet_meta_free(out);
+                    return 0;
+                  }
+                }
+              }
+              if (!have_meta || !meta.has_name || !meta.has_data_page_offset ||
+                  !meta.has_type || !meta.has_codec ||
+                  !meta.has_num_values) {
+                cp_parquet_column_meta_clear(&meta);
+                cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                             "invalid column metadata");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              if (meta.codec != CP_PARQUET_CODEC_UNCOMPRESSED) {
+                cp_parquet_column_meta_clear(&meta);
+                cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                             "compressed parquet not supported");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              size_t index = SIZE_MAX;
+              if (have_schema) {
+                for (size_t c = 0; c < out->ncols; ++c) {
+                  if (out->names[c] &&
+                      strcmp(out->names[c], meta.name) == 0) {
+                    index = c;
+                    break;
+                  }
+                }
+              }
+              if (index == SIZE_MAX && i < out->ncols) {
+                index = i;
+              }
+              if (index == SIZE_MAX || index >= out->ncols) {
+                cp_parquet_column_meta_clear(&meta);
+                cp_error_set(err, CP_ERR_PARSE, 0, 0, "unknown column");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              if (have_schema && out->parquet_types &&
+                  meta.type != out->parquet_types[index]) {
+                cp_parquet_column_meta_clear(&meta);
+                cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                             "column type mismatch");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              out->data_page_offsets[index] = meta.data_page_offset;
+              if (meta.num_values < 0) {
+                cp_parquet_column_meta_clear(&meta);
+                cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid num_values");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              if (row_group_rows == 0) {
+                row_group_rows = meta.num_values;
+              }
+              cp_parquet_column_meta_clear(&meta);
+            }
+          } else if (rg_field == 3) {
+            int64_t value = 0;
+            if (!cp_thrift_read_i64(&r, &value, err)) {
+              cp_parquet_meta_free(out);
+              return 0;
+            }
+            row_group_rows = value;
+          } else {
+            if (!cp_thrift_skip(&r, rg_type, err)) {
+              cp_parquet_meta_free(out);
+              return 0;
+            }
+          }
+        }
+        have_row_groups = 1;
+        break;
+      }
+      default:
+        if (!cp_thrift_skip(&r, type, err)) {
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        break;
+    }
+  }
+  if (!have_schema || !have_row_groups) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet metadata");
+    cp_parquet_meta_free(out);
+    return 0;
+  }
+  if (!have_rows) {
+    if (row_group_rows < 0) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row count");
+      cp_parquet_meta_free(out);
+      return 0;
+    }
+    out->nrows = (size_t)row_group_rows;
   }
   return 1;
 }
@@ -10407,9 +12332,401 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
     return NULL;
   }
-  cp_error_set(err, CP_ERR_INVALID, 0, 0,
-               "parquet support not built");
-  return NULL;
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open parquet");
+    return NULL;
+  }
+
+  unsigned char magic[4];
+  if (!cp_read_bytes(fp, magic, sizeof(magic), err, "failed to read parquet")) {
+    fclose(fp);
+    return NULL;
+  }
+  if (memcmp(magic, cp_parquet_magic, sizeof(magic)) != 0) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet magic");
+    fclose(fp);
+    return NULL;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read parquet");
+    fclose(fp);
+    return NULL;
+  }
+  long file_size = ftell(fp);
+  if (file_size < 12) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet footer");
+    fclose(fp);
+    return NULL;
+  }
+  if (fseek(fp, file_size - 4, SEEK_SET) != 0 ||
+      !cp_read_bytes(fp, magic, sizeof(magic), err,
+                     "failed to read parquet")) {
+    fclose(fp);
+    return NULL;
+  }
+  if (memcmp(magic, cp_parquet_magic, sizeof(magic)) != 0) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet footer");
+    fclose(fp);
+    return NULL;
+  }
+  if (fseek(fp, file_size - 8, SEEK_SET) != 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read parquet footer");
+    fclose(fp);
+    return NULL;
+  }
+  uint32_t meta_len = 0;
+  if (!cp_read_u32(fp, &meta_len, err)) {
+    fclose(fp);
+    return NULL;
+  }
+  if (meta_len == 0 || (long)meta_len > file_size - 8) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet metadata");
+    fclose(fp);
+    return NULL;
+  }
+  long meta_start = file_size - 8 - (long)meta_len;
+  if (meta_start < 4) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet metadata");
+    fclose(fp);
+    return NULL;
+  }
+  if (fseek(fp, meta_start, SEEK_SET) != 0) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read parquet metadata");
+    fclose(fp);
+    return NULL;
+  }
+  unsigned char *meta_buf = (unsigned char *)malloc(meta_len);
+  if (!meta_buf) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    fclose(fp);
+    return NULL;
+  }
+  if (!cp_read_bytes(fp, meta_buf, meta_len, err,
+                     "failed to read parquet metadata")) {
+    free(meta_buf);
+    fclose(fp);
+    return NULL;
+  }
+
+  CpParquetFileMeta meta;
+  if (!cp_parquet_parse_file_metadata(meta_buf, meta_len, &meta, err)) {
+    free(meta_buf);
+    fclose(fp);
+    return NULL;
+  }
+  free(meta_buf);
+  if (meta.ncols == 0) {
+    cp_parquet_meta_free(&meta);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+    fclose(fp);
+    return NULL;
+  }
+  if (meta.nrows > (size_t)INT32_MAX) {
+    cp_parquet_meta_free(&meta);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet row count too large");
+    fclose(fp);
+    return NULL;
+  }
+
+  const char **names = (const char **)meta.names;
+  CpDataFrame *df =
+      cp_df_create(meta.ncols, names, meta.dtypes, meta.nrows, err);
+  if (!df) {
+    cp_parquet_meta_free(&meta);
+    fclose(fp);
+    return NULL;
+  }
+
+  for (size_t col = 0; col < meta.ncols; ++col) {
+    CpSeries *series = df->cols[col];
+    if (!series) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (!cp_series_reserve(series, meta.nrows, err)) {
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (meta.data_page_offsets[col] < 0 ||
+        meta.data_page_offsets[col] > file_size) {
+      cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet offset");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (fseek(fp, (long)meta.data_page_offsets[col], SEEK_SET) != 0) {
+      cp_error_set(err, CP_ERR_IO, 0, col, "failed to seek parquet");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    CpParquetPageHeader header;
+    if (!cp_parquet_read_page_header(fp, &header, err)) {
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (header.type != CP_PARQUET_PAGE_DATA) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col,
+                   "unsupported parquet page");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (header.encoding != CP_PARQUET_ENC_PLAIN) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col,
+                   "unsupported parquet encoding");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (meta.max_def_levels[col] > 0 &&
+        header.def_encoding != CP_PARQUET_ENC_RLE) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col,
+                   "unsupported parquet definition levels");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (header.rep_encoding != 0 &&
+        header.rep_encoding != CP_PARQUET_ENC_RLE) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col,
+                   "unsupported parquet repetition levels");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (header.compressed_size < 0 || header.uncompressed_size < 0 ||
+        header.compressed_size != header.uncompressed_size) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col,
+                   "compressed parquet not supported");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    if (header.num_values < 0 ||
+        (size_t)header.num_values != meta.nrows) {
+      cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet row count");
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    size_t page_size = (size_t)header.compressed_size;
+    unsigned char *page = NULL;
+    if (page_size > 0) {
+      page = (unsigned char *)malloc(page_size);
+      if (!page) {
+        cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (fread(page, 1, page_size, fp) != page_size) {
+        cp_error_set(err, CP_ERR_IO, 0, col, "failed to read parquet");
+        free(page);
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+    }
+    size_t offset = 0;
+    uint8_t *def_levels = NULL;
+    if (meta.max_def_levels[col] > 0 && meta.nrows > 0) {
+      uint32_t def_len = 0;
+      if (!cp_parquet_read_u32(page, page_size, &offset, &def_len, err)) {
+        free(page);
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (def_len > page_size - offset) {
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid def levels");
+        free(page);
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      def_levels = (uint8_t *)malloc(meta.nrows);
+      if (!def_levels) {
+        cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+        free(page);
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (!cp_parquet_decode_levels(page + offset, def_len, meta.nrows, 1,
+                                    def_levels, err)) {
+        free(def_levels);
+        free(page);
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      offset += def_len;
+    }
+
+    int parquet_type = meta.parquet_types
+                           ? meta.parquet_types[col]
+                           : cp_parquet_type_for_dtype(series->dtype);
+    for (size_t row = 0; row < meta.nrows; ++row) {
+      int is_null = 0;
+      if (meta.max_def_levels[col] > 0) {
+        uint8_t level = def_levels ? def_levels[row] : 0;
+        if (level == 0) {
+          is_null = 1;
+        } else if (level != 1) {
+          cp_error_set(err, CP_ERR_PARSE, row, col, "invalid def level");
+          free(def_levels);
+          free(page);
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+      }
+      series->is_null[row] = is_null ? 1 : 0;
+      if (is_null) {
+        if (series->dtype == CP_DTYPE_STRING) {
+          series->data.str[row] = NULL;
+        }
+        series->length = row + 1;
+        continue;
+      }
+      switch (parquet_type) {
+        case CP_PARQUET_TYPE_INT32: {
+          uint32_t value = 0;
+          if (!cp_parquet_read_u32(page, page_size, &offset, &value, err)) {
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          series->data.i64[row] = (int64_t)(int32_t)value;
+          break;
+        }
+        case CP_PARQUET_TYPE_INT64: {
+          uint64_t value = 0;
+          if (!cp_parquet_read_u64(page, page_size, &offset, &value, err)) {
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          series->data.i64[row] = (int64_t)value;
+          break;
+        }
+        case CP_PARQUET_TYPE_FLOAT: {
+          float value = 0.0f;
+          if (!cp_parquet_read_f32(page, page_size, &offset, &value, err)) {
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          series->data.f64[row] = (double)value;
+          break;
+        }
+        case CP_PARQUET_TYPE_DOUBLE: {
+          double value = 0.0;
+          if (!cp_parquet_read_f64(page, page_size, &offset, &value, err)) {
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          series->data.f64[row] = value;
+          break;
+        }
+        case CP_PARQUET_TYPE_BYTE_ARRAY: {
+          uint32_t len = 0;
+          if (!cp_parquet_read_u32(page, page_size, &offset, &len, err)) {
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          if (len > page_size - offset) {
+            cp_error_set(err, CP_ERR_PARSE, row, col, "invalid string length");
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          char *value = cp_strndup((const char *)page + offset, len);
+          if (!value) {
+            cp_error_set(err, CP_ERR_OOM, row, col, "out of memory");
+            free(def_levels);
+            free(page);
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          offset += len;
+          series->data.str[row] = value;
+          break;
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, col, "unsupported type");
+          free(def_levels);
+          free(page);
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+      }
+      series->length = row + 1;
+    }
+    if (offset != page_size) {
+      cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet page data");
+      free(def_levels);
+      free(page);
+      cp_df_free(df);
+      cp_parquet_meta_free(&meta);
+      fclose(fp);
+      return NULL;
+    }
+    free(def_levels);
+    free(page);
+  }
+
+  df->nrows = meta.nrows;
+  cp_parquet_meta_free(&meta);
+  fclose(fp);
+  return df;
 }
 
 static int cp_write_csv_field(FILE *fp, const char *s, char delimiter) {
@@ -10942,9 +13259,313 @@ int cp_df_write_parquet(const CpDataFrame *df,
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
     return 0;
   }
-  cp_error_set(err, CP_ERR_INVALID, 0, 0,
-               "parquet support not built");
-  return 0;
+  if (df->ncols == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "empty dataframe");
+    return 0;
+  }
+  if (df->nrows > (size_t)INT32_MAX) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet row count too large");
+    return 0;
+  }
+  FILE *fp = fopen(path, "wb");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open parquet");
+    return 0;
+  }
+  if (!cp_write_bytes(fp, cp_parquet_magic, sizeof(cp_parquet_magic), err,
+                      "failed to write parquet")) {
+    fclose(fp);
+    return 0;
+  }
+
+  size_t ncols = df->ncols;
+  size_t nrows = df->nrows;
+  CpParquetColumnMeta *cols =
+      (CpParquetColumnMeta *)calloc(ncols, sizeof(CpParquetColumnMeta));
+  if (!cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    fclose(fp);
+    return 0;
+  }
+  int64_t row_group_size = 0;
+
+  for (size_t col = 0; col < ncols; ++col) {
+    CpSeries *series = df->cols[col];
+    if (!series) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series");
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    if (series->length != nrows) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series length");
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    int parquet_type = cp_parquet_type_for_dtype(series->dtype);
+    if (parquet_type < 0) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "unsupported dtype");
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    cols[col].name = series->name ? series->name : "";
+    cols[col].dtype = series->dtype;
+
+    int has_null = 0;
+    if (nrows > 0) {
+      for (size_t row = 0; row < nrows; ++row) {
+        if (series->is_null[row]) {
+          has_null = 1;
+          break;
+        }
+      }
+    }
+    cols[col].repetition_type =
+        has_null ? CP_PARQUET_REP_OPTIONAL : CP_PARQUET_REP_REQUIRED;
+    cols[col].max_def_level = has_null ? 1 : 0;
+
+    CpStrBuf values_buf;
+    if (!cp_strbuf_init(&values_buf, 0, err)) {
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+
+    for (size_t row = 0; row < nrows; ++row) {
+      if (has_null && series->is_null[row]) {
+        continue;
+      }
+      switch (parquet_type) {
+        case CP_PARQUET_TYPE_INT64:
+          if (!cp_parquet_buf_append_u64(&values_buf,
+                                         (uint64_t)series->data.i64[row],
+                                         err)) {
+            cp_strbuf_free(&values_buf);
+            free(cols);
+            fclose(fp);
+            return 0;
+          }
+          break;
+        case CP_PARQUET_TYPE_DOUBLE:
+          if (!cp_parquet_buf_append_f64(&values_buf,
+                                         series->data.f64[row], err)) {
+            cp_strbuf_free(&values_buf);
+            free(cols);
+            fclose(fp);
+            return 0;
+          }
+          break;
+        case CP_PARQUET_TYPE_BYTE_ARRAY: {
+          const char *value = series->data.str[row];
+          if (!value) {
+            value = "";
+          }
+          size_t len = strlen(value);
+          if (len > UINT32_MAX) {
+            cp_error_set(err, CP_ERR_INVALID, row, col,
+                         "string too large");
+            cp_strbuf_free(&values_buf);
+            free(cols);
+            fclose(fp);
+            return 0;
+          }
+          if (!cp_parquet_buf_append_u32(&values_buf, (uint32_t)len, err) ||
+              !cp_strbuf_append(&values_buf, value, len, err)) {
+            cp_strbuf_free(&values_buf);
+            free(cols);
+            fclose(fp);
+            return 0;
+          }
+          break;
+        }
+        default:
+          cp_error_set(err, CP_ERR_INVALID, row, col, "unsupported type");
+          cp_strbuf_free(&values_buf);
+          free(cols);
+          fclose(fp);
+          return 0;
+      }
+    }
+
+    CpStrBuf data_buf;
+    if (!cp_strbuf_init(&data_buf, 0, err)) {
+      cp_strbuf_free(&values_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+
+    if (has_null && nrows > 0) {
+      uint8_t *def_levels = (uint8_t *)malloc(nrows);
+      if (!def_levels) {
+        cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+        cp_strbuf_free(&values_buf);
+        cp_strbuf_free(&data_buf);
+        free(cols);
+        fclose(fp);
+        return 0;
+      }
+      for (size_t row = 0; row < nrows; ++row) {
+        def_levels[row] = series->is_null[row] ? 0 : 1;
+      }
+      CpStrBuf def_buf;
+      if (!cp_strbuf_init(&def_buf, 0, err)) {
+        free(def_levels);
+        cp_strbuf_free(&values_buf);
+        cp_strbuf_free(&data_buf);
+        free(cols);
+        fclose(fp);
+        return 0;
+      }
+      if (!cp_parquet_encode_levels(def_levels, nrows, 1, &def_buf, err)) {
+        cp_strbuf_free(&def_buf);
+        free(def_levels);
+        cp_strbuf_free(&values_buf);
+        cp_strbuf_free(&data_buf);
+        free(cols);
+        fclose(fp);
+        return 0;
+      }
+      free(def_levels);
+      if (def_buf.len > UINT32_MAX) {
+        cp_error_set(err, CP_ERR_INVALID, 0, col, "def levels too large");
+        cp_strbuf_free(&def_buf);
+        cp_strbuf_free(&values_buf);
+        cp_strbuf_free(&data_buf);
+        free(cols);
+        fclose(fp);
+        return 0;
+      }
+      if (!cp_parquet_buf_append_u32(&data_buf,
+                                     (uint32_t)def_buf.len,
+                                     err) ||
+          !cp_strbuf_append(&data_buf, def_buf.data, def_buf.len, err)) {
+        cp_strbuf_free(&def_buf);
+        cp_strbuf_free(&values_buf);
+        cp_strbuf_free(&data_buf);
+        free(cols);
+        fclose(fp);
+        return 0;
+      }
+      cp_strbuf_free(&def_buf);
+    }
+
+    if (!cp_strbuf_append(&data_buf, values_buf.data, values_buf.len, err)) {
+      cp_strbuf_free(&values_buf);
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    cp_strbuf_free(&values_buf);
+
+    if (data_buf.len > INT32_MAX) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "parquet page too large");
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+
+    CpStrBuf header_buf;
+    if (!cp_strbuf_init(&header_buf, 0, err)) {
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    if (!cp_parquet_write_page_header(&header_buf, (int32_t)nrows,
+                                      (int32_t)data_buf.len, err)) {
+      cp_strbuf_free(&header_buf);
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+
+    long offset = ftell(fp);
+    if (offset < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, col, "failed to write parquet");
+      cp_strbuf_free(&header_buf);
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    cols[col].data_page_offset = (int64_t)offset;
+
+    if (!cp_write_bytes(fp, header_buf.data, header_buf.len, err,
+                        "failed to write parquet") ||
+        !cp_write_bytes(fp, data_buf.data, data_buf.len, err,
+                        "failed to write parquet")) {
+      cp_strbuf_free(&header_buf);
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    size_t chunk_size = header_buf.len + data_buf.len;
+    if (chunk_size > (size_t)INT64_MAX) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "parquet chunk too large");
+      cp_strbuf_free(&header_buf);
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    cols[col].total_uncompressed_size = (int64_t)chunk_size;
+    cols[col].total_compressed_size = (int64_t)chunk_size;
+
+    if (row_group_size > INT64_MAX - (int64_t)chunk_size) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet size overflow");
+      cp_strbuf_free(&header_buf);
+      cp_strbuf_free(&data_buf);
+      free(cols);
+      fclose(fp);
+      return 0;
+    }
+    row_group_size += (int64_t)chunk_size;
+
+    cp_strbuf_free(&header_buf);
+    cp_strbuf_free(&data_buf);
+  }
+
+  CpStrBuf meta_buf;
+  if (!cp_strbuf_init(&meta_buf, 0, err)) {
+    free(cols);
+    fclose(fp);
+    return 0;
+  }
+  if (!cp_parquet_write_file_metadata(&meta_buf, cols, ncols,
+                                      (int64_t)nrows, row_group_size, err)) {
+    cp_strbuf_free(&meta_buf);
+    free(cols);
+    fclose(fp);
+    return 0;
+  }
+  if (meta_buf.len > UINT32_MAX) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet metadata too large");
+    cp_strbuf_free(&meta_buf);
+    free(cols);
+    fclose(fp);
+    return 0;
+  }
+  if (!cp_write_bytes(fp, meta_buf.data, meta_buf.len, err,
+                      "failed to write parquet") ||
+      !cp_parquet_write_u32(fp, (uint32_t)meta_buf.len, err) ||
+      !cp_write_bytes(fp, cp_parquet_magic, sizeof(cp_parquet_magic), err,
+                      "failed to write parquet")) {
+    cp_strbuf_free(&meta_buf);
+    free(cols);
+    fclose(fp);
+    return 0;
+  }
+  cp_strbuf_free(&meta_buf);
+  free(cols);
+  fclose(fp);
+  return 1;
 }
 
 int cp_df_to_excel(const CpDataFrame *df,
