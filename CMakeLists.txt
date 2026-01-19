@@ -16,6 +16,11 @@ target_include_directories(cpandas
 if(NOT WIN32)
   target_link_libraries(cpandas PUBLIC m)
 endif()
+find_package(ZLIB)
+if(ZLIB_FOUND)
+  target_link_libraries(cpandas PUBLIC ZLIB::ZLIB)
+  target_compile_definitions(cpandas PRIVATE CPANDAS_HAVE_ZLIB=1)
+endif()
 
 enable_testing()
 

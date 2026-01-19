@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef CPANDAS_HAVE_ZLIB
+#include <zlib.h>
+#endif
 
 struct CpSeries {
   char *name;
@@ -9595,6 +9598,201 @@ static int cp_thrift_file_skip(CpThriftFileReader *r,
   }
 }
 
+static int cp_snappy_read_uvarint(const unsigned char *data,
+                                  size_t len,
+                                  size_t *offset,
+                                  uint64_t *out,
+                                  CpError *err) {
+  if (!data || !offset) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid snappy data");
+    return 0;
+  }
+  uint64_t result = 0;
+  int shift = 0;
+  size_t pos = *offset;
+  while (1) {
+    if (pos >= len) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy data");
+      return 0;
+    }
+    unsigned char byte = data[pos++];
+    result |= ((uint64_t)(byte & 0x7f) << shift);
+    if ((byte & 0x80) == 0) {
+      break;
+    }
+    shift += 7;
+    if (shift > 63) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy data");
+      return 0;
+    }
+  }
+  *offset = pos;
+  if (out) {
+    *out = result;
+  }
+  return 1;
+}
+
+static int cp_snappy_write_literal(CpStrBuf *out,
+                                   const unsigned char *data,
+                                   size_t len,
+                                   CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid snappy output");
+    return 0;
+  }
+  if (len == 0) {
+    return 1;
+  }
+  size_t n = len - 1;
+  if (n < 60) {
+    unsigned char tag = (unsigned char)((n << 2) | 0);
+    if (!cp_buf_append_u8(out, tag, err)) {
+      return 0;
+    }
+  } else {
+    size_t bytes = 0;
+    size_t tmp = n;
+    while (tmp > 0 && bytes < 4) {
+      bytes += 1;
+      tmp >>= 8;
+    }
+    if (bytes == 0 || bytes > 4) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "snappy literal too large");
+      return 0;
+    }
+    unsigned char tag = (unsigned char)(((59 + bytes) << 2) | 0);
+    if (!cp_buf_append_u8(out, tag, err)) {
+      return 0;
+    }
+    for (size_t i = 0; i < bytes; ++i) {
+      unsigned char byte = (unsigned char)((n >> (i * 8)) & 0xffu);
+      if (!cp_buf_append_u8(out, byte, err)) {
+        return 0;
+      }
+    }
+  }
+  return cp_strbuf_append(out, (const char *)data, len, err);
+}
+
+static int cp_snappy_compress(const unsigned char *data,
+                              size_t len,
+                              CpStrBuf *out,
+                              CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid snappy input");
+    return 0;
+  }
+  if (!cp_thrift_write_uvarint(out, (uint64_t)len, err)) {
+    return 0;
+  }
+  size_t pos = 0;
+  while (pos < len) {
+    size_t chunk = len - pos;
+    if (chunk > 65536) {
+      chunk = 65536;
+    }
+    if (!cp_snappy_write_literal(out, data + pos, chunk, err)) {
+      return 0;
+    }
+    pos += chunk;
+  }
+  return 1;
+}
+
+static int cp_snappy_decompress(const unsigned char *data,
+                                size_t len,
+                                unsigned char *out,
+                                size_t out_len,
+                                CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid snappy input");
+    return 0;
+  }
+  size_t pos = 0;
+  uint64_t expected = 0;
+  if (!cp_snappy_read_uvarint(data, len, &pos, &expected, err)) {
+    return 0;
+  }
+  if (expected != out_len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "snappy size mismatch");
+    return 0;
+  }
+  size_t out_pos = 0;
+  while (pos < len) {
+    unsigned char tag = data[pos++];
+    unsigned char type = tag & 0x03u;
+    if (type == 0) {
+      size_t literal_len = tag >> 2;
+      if (literal_len < 60) {
+        literal_len += 1;
+      } else {
+        size_t extra = literal_len - 59;
+        if (extra == 0 || extra > 4 || pos + extra > len) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy literal");
+          return 0;
+        }
+        size_t value = 0;
+        for (size_t i = 0; i < extra; ++i) {
+          value |= ((size_t)data[pos++]) << (i * 8);
+        }
+        literal_len = value + 1;
+      }
+      if (pos + literal_len > len || out_pos + literal_len > out_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy literal");
+        return 0;
+      }
+      memcpy(out + out_pos, data + pos, literal_len);
+      pos += literal_len;
+      out_pos += literal_len;
+    } else {
+      size_t length = 0;
+      size_t offset = 0;
+      if (type == 1) {
+        length = ((tag >> 2) & 0x7) + 4;
+        if (pos >= len) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy copy");
+          return 0;
+        }
+        offset = ((size_t)(tag & 0xe0) << 3) | data[pos++];
+      } else if (type == 2) {
+        length = (tag >> 2) + 1;
+        if (pos + 2 > len) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy copy");
+          return 0;
+        }
+        offset = (size_t)data[pos] | ((size_t)data[pos + 1] << 8);
+        pos += 2;
+      } else {
+        length = (tag >> 2) + 1;
+        if (pos + 4 > len) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy copy");
+          return 0;
+        }
+        offset = (size_t)data[pos] |
+                 ((size_t)data[pos + 1] << 8) |
+                 ((size_t)data[pos + 2] << 16) |
+                 ((size_t)data[pos + 3] << 24);
+        pos += 4;
+      }
+      if (offset == 0 || offset > out_pos ||
+          out_pos + length > out_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy copy");
+        return 0;
+      }
+      for (size_t i = 0; i < length; ++i) {
+        out[out_pos + i] = out[out_pos + i - offset];
+      }
+      out_pos += length;
+    }
+  }
+  if (out_pos != out_len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid snappy data");
+    return 0;
+  }
+  return 1;
+}
+
 #define CP_PARQUET_TYPE_INT32 1
 #define CP_PARQUET_TYPE_INT64 2
 #define CP_PARQUET_TYPE_FLOAT 4
@@ -9602,16 +9800,134 @@ static int cp_thrift_file_skip(CpThriftFileReader *r,
 #define CP_PARQUET_TYPE_BYTE_ARRAY 6
 
 #define CP_PARQUET_ENC_PLAIN 0
+#define CP_PARQUET_ENC_PLAIN_DICTIONARY 1
 #define CP_PARQUET_ENC_RLE 2
+#define CP_PARQUET_ENC_RLE_DICTIONARY 7
 
 #define CP_PARQUET_CODEC_UNCOMPRESSED 0
+#define CP_PARQUET_CODEC_SNAPPY 1
+#define CP_PARQUET_CODEC_GZIP 2
 
 #define CP_PARQUET_PAGE_DATA 0
+#define CP_PARQUET_PAGE_DICTIONARY 2
 
 #define CP_PARQUET_REP_REQUIRED 0
 #define CP_PARQUET_REP_OPTIONAL 1
 
 #define CP_PARQUET_CONVERTED_UTF8 9
+#define CP_PARQUET_DEFAULT_ROW_GROUP 65536
+
+static int cp_parquet_compress(int codec,
+                               const unsigned char *data,
+                               size_t len,
+                               CpStrBuf *out,
+                               CpError *err) {
+  if (!out || (!data && len > 0)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compression input");
+    return 0;
+  }
+  switch (codec) {
+    case CP_PARQUET_CODEC_UNCOMPRESSED:
+      return cp_strbuf_append(out, (const char *)data, len, err);
+    case CP_PARQUET_CODEC_SNAPPY:
+      return cp_snappy_compress(data, len, out, err);
+    case CP_PARQUET_CODEC_GZIP: {
+#ifdef CPANDAS_HAVE_ZLIB
+      uLongf bound = compressBound((uLong)len);
+      unsigned char *buf = (unsigned char *)malloc((size_t)bound);
+      if (!buf) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return 0;
+      }
+      z_stream stream;
+      memset(&stream, 0, sizeof(stream));
+      stream.next_in = (Bytef *)data;
+      stream.avail_in = (uInt)len;
+      stream.next_out = buf;
+      stream.avail_out = (uInt)bound;
+      int rc = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED,
+                            15 + 16, 8, Z_DEFAULT_STRATEGY);
+      if (rc != Z_OK) {
+        free(buf);
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip init failed");
+        return 0;
+      }
+      rc = deflate(&stream, Z_FINISH);
+      if (rc != Z_STREAM_END) {
+        deflateEnd(&stream);
+        free(buf);
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip compress failed");
+        return 0;
+      }
+      size_t out_len = (size_t)(bound - stream.avail_out);
+      deflateEnd(&stream);
+      int ok = cp_strbuf_append(out, (const char *)buf, out_len, err);
+      free(buf);
+      return ok;
+#else
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip not available");
+      return 0;
+#endif
+    }
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported compression");
+      return 0;
+  }
+}
+
+static int cp_parquet_decompress(int codec,
+                                 const unsigned char *data,
+                                 size_t len,
+                                 unsigned char *out,
+                                 size_t out_len,
+                                 CpError *err) {
+  if (!out || (!data && len > 0)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid compression input");
+    return 0;
+  }
+  switch (codec) {
+    case CP_PARQUET_CODEC_UNCOMPRESSED:
+      if (len != out_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "parquet size mismatch");
+        return 0;
+      }
+      if (len > 0) {
+        memcpy(out, data, len);
+      }
+      return 1;
+    case CP_PARQUET_CODEC_SNAPPY:
+      return cp_snappy_decompress(data, len, out, out_len, err);
+    case CP_PARQUET_CODEC_GZIP: {
+#ifdef CPANDAS_HAVE_ZLIB
+      z_stream stream;
+      memset(&stream, 0, sizeof(stream));
+      stream.next_in = (Bytef *)data;
+      stream.avail_in = (uInt)len;
+      stream.next_out = out;
+      stream.avail_out = (uInt)out_len;
+      int rc = inflateInit2(&stream, 15 + 32);
+      if (rc != Z_OK) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "gzip init failed");
+        return 0;
+      }
+      rc = inflate(&stream, Z_FINISH);
+      if (rc != Z_STREAM_END || stream.avail_out != 0) {
+        inflateEnd(&stream);
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "gzip decompress failed");
+        return 0;
+      }
+      inflateEnd(&stream);
+      return 1;
+#else
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip not available");
+      return 0;
+#endif
+    }
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unsupported compression");
+      return 0;
+  }
+}
 
 static int cp_parquet_bit_width(uint8_t max_level) {
   int width = 0;
@@ -9729,6 +10045,131 @@ static int cp_parquet_decode_levels(const unsigned char *data,
   if (out_idx != count) {
     cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
     return 0;
+  }
+  return 1;
+}
+
+static int cp_parquet_encode_indices(const uint32_t *values,
+                                     size_t count,
+                                     uint32_t max_value,
+                                     CpStrBuf *out,
+                                     CpError *err) {
+  if (!values || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid indices");
+    return 0;
+  }
+  int bit_width = cp_parquet_bit_width((uint8_t)(max_value & 0xffu));
+  if (max_value > 0xffu) {
+    bit_width = 0;
+    uint32_t tmp = max_value;
+    while (tmp > 0) {
+      bit_width += 1;
+      tmp >>= 1;
+    }
+  }
+  if (bit_width <= 0) {
+    bit_width = 1;
+  }
+  if (!cp_buf_append_u8(out, (unsigned char)bit_width, err)) {
+    return 0;
+  }
+  size_t value_bytes = (size_t)((bit_width + 7) / 8);
+  size_t idx = 0;
+  while (idx < count) {
+    uint32_t value = values[idx];
+    if (value > max_value) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid index value");
+      return 0;
+    }
+    size_t run = 1;
+    while (idx + run < count && values[idx + run] == value) {
+      run += 1;
+    }
+    uint64_t header = ((uint64_t)run << 1);
+    if (!cp_thrift_write_uvarint(out, header, err)) {
+      return 0;
+    }
+    for (size_t b = 0; b < value_bytes; ++b) {
+      unsigned char byte = (unsigned char)((value >> (b * 8)) & 0xffu);
+      if (!cp_buf_append_u8(out, byte, err)) {
+        return 0;
+      }
+    }
+    idx += run;
+  }
+  return 1;
+}
+
+static int cp_parquet_decode_indices(const unsigned char *data,
+                                     size_t data_len,
+                                     size_t count,
+                                     uint32_t max_value,
+                                     uint32_t *out,
+                                     size_t *consumed,
+                                     CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid indices");
+    return 0;
+  }
+  if (data_len == 0) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+    return 0;
+  }
+  int bit_width = (int)data[0];
+  if (bit_width < 0 || bit_width > 32) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+    return 0;
+  }
+  size_t value_bytes = (size_t)((bit_width + 7) / 8);
+  size_t pos = 1;
+  size_t out_idx = 0;
+  while (pos < data_len && out_idx < count) {
+    uint64_t header = 0;
+    int shift = 0;
+    while (1) {
+      if (pos >= data_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+        return 0;
+      }
+      unsigned char byte = data[pos++];
+      header |= ((uint64_t)(byte & 0x7f) << shift);
+      if ((byte & 0x80) == 0) {
+        break;
+      }
+      shift += 7;
+      if (shift > 63) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+        return 0;
+      }
+    }
+    if (header & 1) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                   "bit-packed indices not supported");
+      return 0;
+    }
+    uint64_t run = header >> 1;
+    if (pos + value_bytes > data_len) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+      return 0;
+    }
+    uint32_t value = 0;
+    for (size_t b = 0; b < value_bytes; ++b) {
+      value |= (uint32_t)(data[pos++] << (b * 8));
+    }
+    if (value > max_value) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index value");
+      return 0;
+    }
+    for (uint64_t i = 0; i < run && out_idx < count; ++i) {
+      out[out_idx++] = value;
+    }
+  }
+  if (out_idx != count) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+    return 0;
+  }
+  if (consumed) {
+    *consumed = pos;
   }
   return 1;
 }
@@ -9853,14 +10294,268 @@ static int cp_parquet_read_f64(const unsigned char *data,
 }
 
 typedef struct {
+  size_t bucket_count;
+  size_t mask;
+  size_t *indices;
+  uint64_t *hashes;
+} CpParquetDictIndex;
+
+static int cp_parquet_dict_index_init(CpParquetDictIndex *index,
+                                      size_t expected,
+                                      CpError *err) {
+  if (!index) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dictionary index");
+    return 0;
+  }
+  index->bucket_count = 0;
+  index->mask = 0;
+  index->indices = NULL;
+  index->hashes = NULL;
+  size_t target = expected * 2;
+  if (target < 8) {
+    target = 8;
+  }
+  size_t buckets = 1;
+  while (buckets < target) {
+    if (buckets > SIZE_MAX / 2) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "dictionary overflow");
+      return 0;
+    }
+    buckets <<= 1;
+  }
+  size_t *indices = (size_t *)malloc(buckets * sizeof(size_t));
+  uint64_t *hashes = (uint64_t *)malloc(buckets * sizeof(uint64_t));
+  if (!indices || !hashes) {
+    free(indices);
+    free(hashes);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  for (size_t i = 0; i < buckets; ++i) {
+    indices[i] = SIZE_MAX;
+    hashes[i] = 0;
+  }
+  index->bucket_count = buckets;
+  index->mask = buckets - 1;
+  index->indices = indices;
+  index->hashes = hashes;
+  return 1;
+}
+
+static void cp_parquet_dict_index_free(CpParquetDictIndex *index) {
+  if (!index) {
+    return;
+  }
+  free(index->indices);
+  free(index->hashes);
+  index->indices = NULL;
+  index->hashes = NULL;
+  index->bucket_count = 0;
+  index->mask = 0;
+}
+
+static int cp_parquet_dict_ensure(void **buffer,
+                                  size_t *cap,
+                                  size_t needed,
+                                  size_t elem_size,
+                                  CpError *err) {
+  if (!buffer || !cap || elem_size == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dictionary buffer");
+    return 0;
+  }
+  if (needed <= *cap) {
+    return 1;
+  }
+  size_t new_cap = *cap == 0 ? 16 : *cap;
+  while (new_cap < needed) {
+    if (new_cap > SIZE_MAX / 2) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "dictionary overflow");
+      return 0;
+    }
+    new_cap *= 2;
+  }
+  void *next = realloc(*buffer, new_cap * elem_size);
+  if (!next) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  *buffer = next;
+  *cap = new_cap;
+  return 1;
+}
+
+static int cp_parquet_dict_add_int64(CpParquetDictIndex *index,
+                                     int64_t value,
+                                     int64_t **dict_values,
+                                     size_t *dict_count,
+                                     size_t *dict_cap,
+                                     size_t *out_index,
+                                     CpError *err) {
+  if (!index || !dict_values || !dict_count || !dict_cap) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dictionary");
+    return 0;
+  }
+  uint64_t hash = 14695981039346656037ULL;
+  hash = cp_hash_int64(hash, value);
+  size_t mask = index->mask;
+  size_t slot = (size_t)hash & mask;
+  for (size_t probe = 0; probe < index->bucket_count; ++probe) {
+    size_t entry = index->indices[slot];
+    if (entry == SIZE_MAX) {
+      size_t next_idx = *dict_count;
+      if (!cp_parquet_dict_ensure((void **)dict_values, dict_cap,
+                                  next_idx + 1, sizeof(int64_t), err)) {
+        return 0;
+      }
+      (*dict_values)[next_idx] = value;
+      *dict_count = next_idx + 1;
+      index->indices[slot] = next_idx;
+      index->hashes[slot] = hash;
+      if (out_index) {
+        *out_index = next_idx;
+      }
+      return 1;
+    }
+    if (index->hashes[slot] == hash &&
+        (*dict_values)[entry] == value) {
+      if (out_index) {
+        *out_index = entry;
+      }
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "dictionary full");
+  return 0;
+}
+
+static int cp_parquet_dict_add_float64(CpParquetDictIndex *index,
+                                       double value,
+                                       uint64_t **dict_values,
+                                       size_t *dict_count,
+                                       size_t *dict_cap,
+                                       size_t *out_index,
+                                       CpError *err) {
+  if (!index || !dict_values || !dict_count || !dict_cap) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dictionary");
+    return 0;
+  }
+  uint64_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  uint64_t hash = 14695981039346656037ULL;
+  hash = cp_hash_bytes(hash, (const unsigned char *)&bits, sizeof(bits));
+  size_t mask = index->mask;
+  size_t slot = (size_t)hash & mask;
+  for (size_t probe = 0; probe < index->bucket_count; ++probe) {
+    size_t entry = index->indices[slot];
+    if (entry == SIZE_MAX) {
+      size_t next_idx = *dict_count;
+      if (!cp_parquet_dict_ensure((void **)dict_values, dict_cap,
+                                  next_idx + 1, sizeof(uint64_t), err)) {
+        return 0;
+      }
+      (*dict_values)[next_idx] = bits;
+      *dict_count = next_idx + 1;
+      index->indices[slot] = next_idx;
+      index->hashes[slot] = hash;
+      if (out_index) {
+        *out_index = next_idx;
+      }
+      return 1;
+    }
+    if (index->hashes[slot] == hash &&
+        (*dict_values)[entry] == bits) {
+      if (out_index) {
+        *out_index = entry;
+      }
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "dictionary full");
+  return 0;
+}
+
+static int cp_parquet_dict_add_string(CpParquetDictIndex *index,
+                                      const char *value,
+                                      size_t len,
+                                      const char ***dict_values,
+                                      size_t **dict_lens,
+                                      size_t *dict_count,
+                                      size_t *dict_cap,
+                                      size_t *lens_cap,
+                                      size_t *out_index,
+                                      CpError *err) {
+  if (!index || !dict_values || !dict_lens || !dict_count ||
+      !dict_cap || !lens_cap) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dictionary");
+    return 0;
+  }
+  uint64_t hash = 14695981039346656037ULL;
+  hash = cp_hash_size(hash, len);
+  if (len > 0) {
+    hash = cp_hash_bytes(hash, (const unsigned char *)value, len);
+  }
+  size_t mask = index->mask;
+  size_t slot = (size_t)hash & mask;
+  for (size_t probe = 0; probe < index->bucket_count; ++probe) {
+    size_t entry = index->indices[slot];
+    if (entry == SIZE_MAX) {
+      size_t next_idx = *dict_count;
+      if (!cp_parquet_dict_ensure((void **)dict_values, dict_cap,
+                                  next_idx + 1, sizeof(char *), err) ||
+          !cp_parquet_dict_ensure((void **)dict_lens, lens_cap,
+                                  next_idx + 1, sizeof(size_t), err)) {
+        return 0;
+      }
+      (*dict_values)[next_idx] = value;
+      (*dict_lens)[next_idx] = len;
+      *dict_count = next_idx + 1;
+      index->indices[slot] = next_idx;
+      index->hashes[slot] = hash;
+      if (out_index) {
+        *out_index = next_idx;
+      }
+      return 1;
+    }
+    if (index->hashes[slot] == hash &&
+        (*dict_lens)[entry] == len &&
+        (len == 0 ||
+         memcmp((*dict_values)[entry], value, len) == 0)) {
+      if (out_index) {
+        *out_index = entry;
+      }
+      return 1;
+    }
+    slot = (slot + 1) & mask;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "dictionary full");
+  return 0;
+}
+
+typedef struct {
   const char *name;
   CpDType dtype;
   int repetition_type;
   int max_def_level;
+} CpParquetSchemaColumn;
+
+typedef struct {
   int64_t data_page_offset;
+  int64_t dictionary_page_offset;
   int64_t total_compressed_size;
   int64_t total_uncompressed_size;
-} CpParquetColumnMeta;
+  int64_t num_values;
+  int encoding;
+  int codec;
+  int has_dictionary;
+} CpParquetColumnChunkMeta;
+
+typedef struct {
+  CpParquetColumnChunkMeta *cols;
+  int64_t num_rows;
+  int64_t total_byte_size;
+} CpParquetRowGroupMeta;
 
 typedef struct {
   size_t ncols;
@@ -9869,7 +10564,11 @@ typedef struct {
   CpDType *dtypes;
   int *parquet_types;
   int *max_def_levels;
+  size_t row_group_count;
+  size_t *row_group_rows;
   int64_t *data_page_offsets;
+  int64_t *dictionary_page_offsets;
+  int *codecs;
 } CpParquetFileMeta;
 
 typedef struct {
@@ -9880,6 +10579,8 @@ typedef struct {
   int32_t encoding;
   int32_t def_encoding;
   int32_t rep_encoding;
+  int32_t dict_num_values;
+  int32_t dict_encoding;
 } CpParquetPageHeader;
 
 static void cp_parquet_meta_free(CpParquetFileMeta *meta) {
@@ -9896,13 +10597,20 @@ static void cp_parquet_meta_free(CpParquetFileMeta *meta) {
   free(meta->parquet_types);
   free(meta->max_def_levels);
   free(meta->data_page_offsets);
+  free(meta->dictionary_page_offsets);
+  free(meta->row_group_rows);
+  free(meta->codecs);
   meta->names = NULL;
   meta->dtypes = NULL;
   meta->parquet_types = NULL;
   meta->max_def_levels = NULL;
   meta->data_page_offsets = NULL;
+  meta->dictionary_page_offsets = NULL;
+  meta->row_group_rows = NULL;
+  meta->codecs = NULL;
   meta->ncols = 0;
   meta->nrows = 0;
+  meta->row_group_count = 0;
 }
 
 static int cp_parquet_type_for_dtype(CpDType dtype) {
@@ -9943,10 +10651,37 @@ static int cp_parquet_dtype_from_type(int type,
   }
 }
 
-static int cp_parquet_write_page_header(CpStrBuf *buf,
-                                        int32_t num_values,
-                                        int32_t data_size,
-                                        CpError *err) {
+static int cp_parquet_pick_codec(CpError *err) {
+  const char *env = getenv("CPANDAS_PARQUET_CODEC");
+  if (!env || env[0] == '\0') {
+    return CP_PARQUET_CODEC_SNAPPY;
+  }
+  if (strcmp(env, "none") == 0 || strcmp(env, "uncompressed") == 0) {
+    return CP_PARQUET_CODEC_UNCOMPRESSED;
+  }
+  if (strcmp(env, "snappy") == 0) {
+    return CP_PARQUET_CODEC_SNAPPY;
+  }
+  if (strcmp(env, "gzip") == 0) {
+#ifdef CPANDAS_HAVE_ZLIB
+    return CP_PARQUET_CODEC_GZIP;
+#else
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip not available");
+    return -1;
+#endif
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown parquet codec");
+  return -1;
+}
+
+static int cp_parquet_write_data_page_header(CpStrBuf *buf,
+                                             int32_t num_values,
+                                             int32_t uncompressed_size,
+                                             int32_t compressed_size,
+                                             int32_t encoding,
+                                             int32_t def_encoding,
+                                             int32_t rep_encoding,
+                                             CpError *err) {
   if (!buf) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid page header");
     return 0;
@@ -9956,10 +10691,10 @@ static int cp_parquet_write_page_header(CpStrBuf *buf,
                                  &last_id, err)) {
     return 0;
   }
-  if (!cp_thrift_write_field_i32(buf, 2, data_size, &last_id, err)) {
+  if (!cp_thrift_write_field_i32(buf, 2, uncompressed_size, &last_id, err)) {
     return 0;
   }
-  if (!cp_thrift_write_field_i32(buf, 3, data_size, &last_id, err)) {
+  if (!cp_thrift_write_field_i32(buf, 3, compressed_size, &last_id, err)) {
     return 0;
   }
   if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 5, &last_id, err)) {
@@ -9969,16 +10704,50 @@ static int cp_parquet_write_page_header(CpStrBuf *buf,
   if (!cp_thrift_write_field_i32(buf, 1, num_values, &data_last, err)) {
     return 0;
   }
-  if (!cp_thrift_write_field_i32(buf, 2, CP_PARQUET_ENC_PLAIN,
-                                 &data_last, err)) {
+  if (!cp_thrift_write_field_i32(buf, 2, encoding, &data_last, err)) {
     return 0;
   }
-  if (!cp_thrift_write_field_i32(buf, 3, CP_PARQUET_ENC_RLE,
-                                 &data_last, err)) {
+  if (!cp_thrift_write_field_i32(buf, 3, def_encoding, &data_last, err)) {
     return 0;
   }
-  if (!cp_thrift_write_field_i32(buf, 4, CP_PARQUET_ENC_RLE,
-                                 &data_last, err)) {
+  if (!cp_thrift_write_field_i32(buf, 4, rep_encoding, &data_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_stop(buf, err)) {
+    return 0;
+  }
+  return cp_thrift_write_stop(buf, err);
+}
+
+static int cp_parquet_write_dict_page_header(CpStrBuf *buf,
+                                             int32_t num_values,
+                                             int32_t uncompressed_size,
+                                             int32_t compressed_size,
+                                             int32_t encoding,
+                                             CpError *err) {
+  if (!buf) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid page header");
+    return 0;
+  }
+  int16_t last_id = 0;
+  if (!cp_thrift_write_field_i32(buf, 1, CP_PARQUET_PAGE_DICTIONARY,
+                                 &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 2, uncompressed_size, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 3, compressed_size, &last_id, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 7, &last_id, err)) {
+    return 0;
+  }
+  int16_t dict_last = 0;
+  if (!cp_thrift_write_field_i32(buf, 1, num_values, &dict_last, err)) {
+    return 0;
+  }
+  if (!cp_thrift_write_field_i32(buf, 2, encoding, &dict_last, err)) {
     return 0;
   }
   if (!cp_thrift_write_stop(buf, err)) {
@@ -10039,6 +10808,48 @@ static int cp_parquet_read_data_page_header(CpThriftFileReader *r,
   return 1;
 }
 
+static int cp_parquet_read_dict_page_header(CpThriftFileReader *r,
+                                            CpParquetPageHeader *out,
+                                            CpError *err) {
+  int16_t last_id = 0;
+  int have_num = 0;
+  int have_enc = 0;
+  while (1) {
+    uint8_t type = 0;
+    int16_t field_id = 0;
+    if (!cp_thrift_file_read_field_header(r, &type, &field_id, &last_id, err)) {
+      return 0;
+    }
+    if (type == CP_THRIFT_STOP) {
+      break;
+    }
+    switch (field_id) {
+      case 1:
+        if (!cp_thrift_file_read_i32(r, &out->dict_num_values, err)) {
+          return 0;
+        }
+        have_num = 1;
+        break;
+      case 2:
+        if (!cp_thrift_file_read_i32(r, &out->dict_encoding, err)) {
+          return 0;
+        }
+        have_enc = 1;
+        break;
+      default:
+        if (!cp_thrift_file_skip(r, type, err)) {
+          return 0;
+        }
+        break;
+    }
+  }
+  if (!have_num || !have_enc) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet page header");
+    return 0;
+  }
+  return 1;
+}
+
 static int cp_parquet_read_page_header(FILE *fp,
                                        CpParquetPageHeader *out,
                                        CpError *err) {
@@ -10051,6 +10862,7 @@ static int cp_parquet_read_page_header(FILE *fp,
   int have_type = 0;
   int have_size = 0;
   int have_data = 0;
+  int have_dict = 0;
   memset(out, 0, sizeof(*out));
   while (1) {
     uint8_t type = 0;
@@ -10086,6 +10898,12 @@ static int cp_parquet_read_page_header(FILE *fp,
         }
         have_data = 1;
         break;
+      case 7:
+        if (!cp_parquet_read_dict_page_header(&reader, out, err)) {
+          return 0;
+        }
+        have_dict = 1;
+        break;
       default:
         if (!cp_thrift_file_skip(&reader, type, err)) {
           return 0;
@@ -10093,10 +10911,74 @@ static int cp_parquet_read_page_header(FILE *fp,
         break;
     }
   }
-  if (!have_type || !have_size || !have_data) {
+  if (!have_type || !have_size || (!have_data && !have_dict)) {
     cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet page header");
     return 0;
   }
+  return 1;
+}
+
+static int cp_parquet_read_page_payload(FILE *fp,
+                                        int codec,
+                                        const CpParquetPageHeader *header,
+                                        unsigned char **out,
+                                        size_t *out_len,
+                                        CpError *err) {
+  if (!fp || !header || !out || !out_len) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid parquet page");
+    return 0;
+  }
+  if (header->compressed_size < 0 || header->uncompressed_size < 0) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet page size");
+    return 0;
+  }
+  size_t comp_size = (size_t)header->compressed_size;
+  size_t uncomp_size = (size_t)header->uncompressed_size;
+  unsigned char *compressed = NULL;
+  if (comp_size > 0) {
+    compressed = (unsigned char *)malloc(comp_size);
+    if (!compressed) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+    if (fread(compressed, 1, comp_size, fp) != comp_size) {
+      free(compressed);
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read parquet");
+      return 0;
+    }
+  }
+  if (codec == CP_PARQUET_CODEC_UNCOMPRESSED) {
+    if (comp_size != uncomp_size) {
+      free(compressed);
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "parquet size mismatch");
+      return 0;
+    }
+    *out = compressed;
+    *out_len = uncomp_size;
+    return 1;
+  }
+  unsigned char *uncompressed = NULL;
+  if (uncomp_size > 0) {
+    uncompressed = (unsigned char *)malloc(uncomp_size);
+    if (!uncompressed) {
+      free(compressed);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+  }
+  if (!cp_parquet_decompress(codec,
+                             compressed ? compressed : (unsigned char *)"",
+                             comp_size,
+                             uncompressed ? uncompressed : (unsigned char *)"",
+                             uncomp_size,
+                             err)) {
+    free(compressed);
+    free(uncompressed);
+    return 0;
+  }
+  free(compressed);
+  *out = uncompressed;
+  *out_len = uncomp_size;
   return 1;
 }
 
@@ -10142,10 +11024,11 @@ static int cp_parquet_write_schema_element_col(CpStrBuf *buf,
 }
 
 static int cp_parquet_write_file_metadata(CpStrBuf *buf,
-                                          const CpParquetColumnMeta *cols,
+                                          const CpParquetSchemaColumn *schema,
                                           size_t ncols,
+                                          const CpParquetRowGroupMeta *row_groups,
+                                          size_t row_group_count,
                                           int64_t nrows,
-                                          int64_t row_group_size,
                                           CpError *err) {
   int16_t last_id = 0;
   if (!cp_thrift_write_field_i32(buf, 1, 1, &last_id, err)) {
@@ -10161,14 +11044,14 @@ static int cp_parquet_write_file_metadata(CpStrBuf *buf,
     return 0;
   }
   for (size_t i = 0; i < ncols; ++i) {
-    int parquet_type = cp_parquet_type_for_dtype(cols[i].dtype);
-    int converted_type = (cols[i].dtype == CP_DTYPE_STRING)
+    int parquet_type = cp_parquet_type_for_dtype(schema[i].dtype);
+    int converted_type = (schema[i].dtype == CP_DTYPE_STRING)
                              ? CP_PARQUET_CONVERTED_UTF8
                              : -1;
     if (!cp_parquet_write_schema_element_col(buf,
-                                             cols[i].name,
+                                             schema[i].name,
                                              parquet_type,
-                                             cols[i].repetition_type,
+                                             schema[i].repetition_type,
                                              converted_type,
                                              err)) {
       return 0;
@@ -10180,91 +11063,125 @@ static int cp_parquet_write_file_metadata(CpStrBuf *buf,
   if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 4, &last_id, err)) {
     return 0;
   }
-  if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, 1, err)) {
+  if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, row_group_count,
+                                   err)) {
     return 0;
   }
-  int16_t rg_last = 0;
-  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 1, &rg_last, err)) {
-    return 0;
-  }
-  if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, ncols, err)) {
-    return 0;
-  }
-  for (size_t i = 0; i < ncols; ++i) {
-    int16_t cc_last = 0;
-    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 2, &cc_last, err)) {
+  for (size_t rg = 0; rg < row_group_count; ++rg) {
+    const CpParquetRowGroupMeta *group = &row_groups[rg];
+    int16_t rg_last = 0;
+    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 1, &rg_last, err)) {
       return 0;
     }
-    int16_t md_last = 0;
-    int parquet_type = cp_parquet_type_for_dtype(cols[i].dtype);
-    if (!cp_thrift_write_field_i32(buf, 1, parquet_type, &md_last, err)) {
+    if (!cp_thrift_write_list_header(buf, CP_THRIFT_STRUCT, ncols, err)) {
       return 0;
     }
-    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 2, &md_last, err)) {
+    for (size_t i = 0; i < ncols; ++i) {
+      const CpParquetColumnChunkMeta *col = &group->cols[i];
+      int16_t cc_last = 0;
+      if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 2, &cc_last,
+                                       err)) {
+        return 0;
+      }
+      int16_t md_last = 0;
+      int parquet_type = cp_parquet_type_for_dtype(schema[i].dtype);
+      if (!cp_thrift_write_field_i32(buf, 1, parquet_type, &md_last, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 2, &md_last,
+                                       err)) {
+        return 0;
+      }
+      int encodings[4];
+      size_t enc_count = 0;
+      encodings[enc_count++] = CP_PARQUET_ENC_PLAIN;
+      if (schema[i].max_def_level > 0 ||
+          col->encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
+          col->encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY) {
+        encodings[enc_count++] = CP_PARQUET_ENC_RLE;
+      }
+      if (col->encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
+          col->encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY) {
+        encodings[enc_count++] = col->encoding;
+      }
+      if (!cp_thrift_write_list_header(buf, CP_THRIFT_I32, enc_count, err)) {
+        return 0;
+      }
+      for (size_t e = 0; e < enc_count; ++e) {
+        if (!cp_thrift_write_i32(buf, encodings[e], err)) {
+          return 0;
+        }
+      }
+      if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 3, &md_last, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_list_header(buf, CP_THRIFT_BINARY, 1, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_binary(buf,
+                                  (const unsigned char *)schema[i].name,
+                                  strlen(schema[i].name),
+                                  err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_field_i32(buf, 4, col->codec, &md_last, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_field_i64(buf, 5, col->num_values, &md_last, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_field_i64(buf, 6, col->total_uncompressed_size,
+                                     &md_last, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_field_i64(buf, 7, col->total_compressed_size,
+                                     &md_last, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_field_i64(buf, 9, col->data_page_offset,
+                                     &md_last, err)) {
+        return 0;
+      }
+      if (col->has_dictionary) {
+        if (!cp_thrift_write_field_i64(buf, 11, col->dictionary_page_offset,
+                                       &md_last, err)) {
+          return 0;
+        }
+      }
+      if (!cp_thrift_write_stop(buf, err)) {
+        return 0;
+      }
+      if (!cp_thrift_write_stop(buf, err)) {
+        return 0;
+      }
+    }
+    if (!cp_thrift_write_field_i64(buf, 2, group->total_byte_size, &rg_last,
+                                   err)) {
       return 0;
     }
-    if (!cp_thrift_write_list_header(buf, CP_THRIFT_I32, 2, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_i32(buf, CP_PARQUET_ENC_PLAIN, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_i32(buf, CP_PARQUET_ENC_RLE, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_field_begin(buf, CP_THRIFT_LIST, 3, &md_last, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_list_header(buf, CP_THRIFT_BINARY, 1, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_binary(buf,
-                                (const unsigned char *)cols[i].name,
-                                strlen(cols[i].name),
-                                err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_field_i32(buf, 4, CP_PARQUET_CODEC_UNCOMPRESSED,
-                                   &md_last, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_field_i64(buf, 5, nrows, &md_last, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_field_i64(buf, 6,
-                                   cols[i].total_uncompressed_size,
-                                   &md_last, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_field_i64(buf, 7,
-                                   cols[i].total_compressed_size,
-                                   &md_last, err)) {
-      return 0;
-    }
-    if (!cp_thrift_write_field_i64(buf, 9, cols[i].data_page_offset,
-                                   &md_last, err)) {
+    if (!cp_thrift_write_field_i64(buf, 3, group->num_rows, &rg_last, err)) {
       return 0;
     }
     if (!cp_thrift_write_stop(buf, err)) {
       return 0;
     }
-    if (!cp_thrift_write_stop(buf, err)) {
-      return 0;
-    }
-  }
-  if (!cp_thrift_write_field_i64(buf, 2, row_group_size, &rg_last, err)) {
-    return 0;
-  }
-  if (!cp_thrift_write_field_i64(buf, 3, nrows, &rg_last, err)) {
-    return 0;
-  }
-  if (!cp_thrift_write_stop(buf, err)) {
-    return 0;
   }
   if (!cp_thrift_write_field_binary(buf, 6, "cpandas", &last_id, err)) {
     return 0;
   }
   return cp_thrift_write_stop(buf, err);
+}
+
+static void cp_parquet_row_groups_free(CpParquetRowGroupMeta *groups,
+                                       size_t count) {
+  if (!groups) {
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    free(groups[i].cols);
+    groups[i].cols = NULL;
+  }
+  free(groups);
 }
 
 typedef struct {
@@ -10366,14 +11283,16 @@ typedef struct {
   int codec;
   int64_t num_values;
   int64_t data_page_offset;
+  int64_t dictionary_page_offset;
   int has_name;
   int has_type;
   int has_codec;
   int has_num_values;
   int has_data_page_offset;
-} CpParquetColumnChunkMeta;
+  int has_dictionary_page_offset;
+} CpParquetColumnMetaRead;
 
-static void cp_parquet_column_meta_clear(CpParquetColumnChunkMeta *meta) {
+static void cp_parquet_column_meta_clear(CpParquetColumnMetaRead *meta) {
   if (!meta) {
     return;
   }
@@ -10382,7 +11301,7 @@ static void cp_parquet_column_meta_clear(CpParquetColumnChunkMeta *meta) {
 }
 
 static int cp_parquet_read_column_meta(CpThriftReader *r,
-                                       CpParquetColumnChunkMeta *out,
+                                       CpParquetColumnMetaRead *out,
                                        CpError *err) {
   if (!r || !out) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid column meta");
@@ -10460,6 +11379,15 @@ static int cp_parquet_read_column_meta(CpThriftReader *r,
         out->has_data_page_offset = 1;
         break;
       }
+      case 11: {
+        int64_t value = 0;
+        if (!cp_thrift_read_i64(r, &value, err)) {
+          return 0;
+        }
+        out->dictionary_page_offset = value;
+        out->has_dictionary_page_offset = 1;
+        break;
+      }
       default:
         if (!cp_thrift_skip(r, type, err)) {
           return 0;
@@ -10484,7 +11412,6 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
   int have_schema = 0;
   int have_rows = 0;
   int have_row_groups = 0;
-  int64_t row_group_rows = 0;
   while (1) {
     uint8_t type = 0;
     int16_t field_id = 0;
@@ -10527,10 +11454,8 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
         out->dtypes = (CpDType *)malloc(out->ncols * sizeof(CpDType));
         out->parquet_types = (int *)malloc(out->ncols * sizeof(int));
         out->max_def_levels = (int *)calloc(out->ncols, sizeof(int));
-        out->data_page_offsets =
-            (int64_t *)calloc(out->ncols, sizeof(int64_t));
         if (!out->names || !out->dtypes || !out->parquet_types ||
-            !out->max_def_levels || !out->data_page_offsets) {
+            !out->max_def_levels) {
           cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
           cp_parquet_meta_free(out);
           return 0;
@@ -10596,97 +11521,129 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
           cp_parquet_meta_free(out);
           return 0;
         }
-        if (elem_type != CP_THRIFT_STRUCT || count == 0) {
+        if (elem_type != CP_THRIFT_STRUCT) {
           cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row groups");
           cp_parquet_meta_free(out);
           return 0;
         }
-        if (count != 1) {
-          cp_error_set(err, CP_ERR_INVALID, 0, 0,
-                       "multiple row groups not supported");
+        if (!have_schema) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "missing parquet schema");
           cp_parquet_meta_free(out);
           return 0;
         }
-        int16_t rg_last = 0;
-        while (1) {
-          uint8_t rg_type = 0;
-          int16_t rg_field = 0;
-          if (!cp_thrift_read_field_header(&r, &rg_type, &rg_field,
-                                           &rg_last, err)) {
-            cp_parquet_meta_free(out);
-            return 0;
-          }
-          if (rg_type == CP_THRIFT_STOP) {
-            break;
-          }
-          if (rg_field == 1) {
-            uint8_t col_type = 0;
-            size_t col_count = 0;
-            if (!cp_thrift_read_list_header(&r, &col_type, &col_count, err)) {
+        if (out->row_group_count > 0 || out->row_group_rows) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "duplicate row groups");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        if (count == 0) {
+          out->row_group_count = 0;
+          have_row_groups = 1;
+          break;
+        }
+        if (count > SIZE_MAX / out->ncols) {
+          cp_error_set(err, CP_ERR_INVALID, 0, 0, "row group overflow");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        out->row_group_count = count;
+        out->row_group_rows =
+            (size_t *)calloc(count, sizeof(size_t));
+        size_t total_slots = count * out->ncols;
+        out->data_page_offsets =
+            (int64_t *)malloc(total_slots * sizeof(int64_t));
+        out->dictionary_page_offsets =
+            (int64_t *)malloc(total_slots * sizeof(int64_t));
+        out->codecs = (int *)malloc(total_slots * sizeof(int));
+        if (!out->row_group_rows || !out->data_page_offsets ||
+            !out->dictionary_page_offsets || !out->codecs) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        for (size_t i = 0; i < total_slots; ++i) {
+          out->data_page_offsets[i] = -1;
+          out->dictionary_page_offsets[i] = -1;
+          out->codecs[i] = -1;
+        }
+        for (size_t rg = 0; rg < count; ++rg) {
+          int64_t rg_rows = -1;
+          int have_rg_rows = 0;
+          int16_t rg_last = 0;
+          while (1) {
+            uint8_t rg_type = 0;
+            int16_t rg_field = 0;
+            if (!cp_thrift_read_field_header(&r, &rg_type, &rg_field,
+                                             &rg_last, err)) {
               cp_parquet_meta_free(out);
               return 0;
             }
-            if (col_type != CP_THRIFT_STRUCT ||
-                (!have_schema && col_count == 0)) {
-              cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid columns");
-              cp_parquet_meta_free(out);
-              return 0;
+            if (rg_type == CP_THRIFT_STOP) {
+              break;
             }
-            if (have_schema && col_count != out->ncols) {
-              cp_error_set(err, CP_ERR_PARSE, 0, 0, "column count mismatch");
-              cp_parquet_meta_free(out);
-              return 0;
-            }
-            for (size_t i = 0; i < col_count; ++i) {
-              CpParquetColumnChunkMeta meta;
-              int have_meta = 0;
-              int16_t cc_last = 0;
-              memset(&meta, 0, sizeof(meta));
-              while (1) {
-                uint8_t cc_type = 0;
-                int16_t cc_field = 0;
-                if (!cp_thrift_read_field_header(&r, &cc_type, &cc_field,
-                                                 &cc_last, err)) {
+            if (rg_field == 1) {
+              uint8_t col_type = 0;
+              size_t col_count = 0;
+              if (!cp_thrift_read_list_header(&r, &col_type, &col_count, err)) {
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              if (col_type != CP_THRIFT_STRUCT || col_count != out->ncols) {
+                cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid columns");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              for (size_t i = 0; i < col_count; ++i) {
+                CpParquetColumnMetaRead meta;
+                int have_meta = 0;
+                int16_t cc_last = 0;
+                memset(&meta, 0, sizeof(meta));
+                while (1) {
+                  uint8_t cc_type = 0;
+                  int16_t cc_field = 0;
+                  if (!cp_thrift_read_field_header(&r, &cc_type, &cc_field,
+                                                   &cc_last, err)) {
+                    cp_parquet_column_meta_clear(&meta);
+                    cp_parquet_meta_free(out);
+                    return 0;
+                  }
+                  if (cc_type == CP_THRIFT_STOP) {
+                    break;
+                  }
+                  if (cc_field == 2 && cc_type == CP_THRIFT_STRUCT) {
+                    if (!cp_parquet_read_column_meta(&r, &meta, err)) {
+                      cp_parquet_column_meta_clear(&meta);
+                      cp_parquet_meta_free(out);
+                      return 0;
+                    }
+                    have_meta = 1;
+                  } else {
+                    if (!cp_thrift_skip(&r, cc_type, err)) {
+                      cp_parquet_column_meta_clear(&meta);
+                      cp_parquet_meta_free(out);
+                      return 0;
+                    }
+                  }
+                }
+                if (!have_meta || !meta.has_name || !meta.has_data_page_offset ||
+                    !meta.has_type || !meta.has_codec ||
+                    !meta.has_num_values) {
                   cp_parquet_column_meta_clear(&meta);
+                  cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                               "invalid column metadata");
                   cp_parquet_meta_free(out);
                   return 0;
                 }
-                if (cc_type == CP_THRIFT_STOP) {
-                  break;
+                if (meta.codec != CP_PARQUET_CODEC_UNCOMPRESSED &&
+                    meta.codec != CP_PARQUET_CODEC_SNAPPY &&
+                    meta.codec != CP_PARQUET_CODEC_GZIP) {
+                  cp_parquet_column_meta_clear(&meta);
+                  cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                               "unsupported parquet compression");
+                  cp_parquet_meta_free(out);
+                  return 0;
                 }
-                if (cc_field == 2 && cc_type == CP_THRIFT_STRUCT) {
-                  if (!cp_parquet_read_column_meta(&r, &meta, err)) {
-                    cp_parquet_column_meta_clear(&meta);
-                    cp_parquet_meta_free(out);
-                    return 0;
-                  }
-                  have_meta = 1;
-                } else {
-                  if (!cp_thrift_skip(&r, cc_type, err)) {
-                    cp_parquet_column_meta_clear(&meta);
-                    cp_parquet_meta_free(out);
-                    return 0;
-                  }
-                }
-              }
-              if (!have_meta || !meta.has_name || !meta.has_data_page_offset ||
-                  !meta.has_type || !meta.has_codec ||
-                  !meta.has_num_values) {
-                cp_parquet_column_meta_clear(&meta);
-                cp_error_set(err, CP_ERR_PARSE, 0, 0,
-                             "invalid column metadata");
-                cp_parquet_meta_free(out);
-                return 0;
-              }
-              if (meta.codec != CP_PARQUET_CODEC_UNCOMPRESSED) {
-                cp_parquet_column_meta_clear(&meta);
-                cp_error_set(err, CP_ERR_INVALID, 0, 0,
-                             "compressed parquet not supported");
-                cp_parquet_meta_free(out);
-                return 0;
-              }
-              size_t index = SIZE_MAX;
-              if (have_schema) {
+                size_t index = SIZE_MAX;
                 for (size_t c = 0; c < out->ncols; ++c) {
                   if (out->names[c] &&
                       strcmp(out->names[c], meta.name) == 0) {
@@ -10694,49 +11651,80 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
                     break;
                   }
                 }
-              }
-              if (index == SIZE_MAX && i < out->ncols) {
-                index = i;
-              }
-              if (index == SIZE_MAX || index >= out->ncols) {
+                if (index == SIZE_MAX && i < out->ncols) {
+                  index = i;
+                }
+                if (index == SIZE_MAX || index >= out->ncols) {
+                  cp_parquet_column_meta_clear(&meta);
+                  cp_error_set(err, CP_ERR_PARSE, 0, 0, "unknown column");
+                  cp_parquet_meta_free(out);
+                  return 0;
+                }
+                if (out->parquet_types &&
+                    meta.type != out->parquet_types[index]) {
+                  cp_parquet_column_meta_clear(&meta);
+                  cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                               "column type mismatch");
+                  cp_parquet_meta_free(out);
+                  return 0;
+                }
+                size_t slot = rg * out->ncols + index;
+                out->data_page_offsets[slot] = meta.data_page_offset;
+                if (meta.has_dictionary_page_offset) {
+                  out->dictionary_page_offsets[slot] =
+                      meta.dictionary_page_offset;
+                }
+                out->codecs[slot] = meta.codec;
+                if (meta.num_values < 0) {
+                  cp_parquet_column_meta_clear(&meta);
+                  cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid num_values");
+                  cp_parquet_meta_free(out);
+                  return 0;
+                }
+                if (rg_rows < 0) {
+                  rg_rows = meta.num_values;
+                } else if (rg_rows != meta.num_values) {
+                  cp_parquet_column_meta_clear(&meta);
+                  cp_error_set(err, CP_ERR_PARSE, 0, 0,
+                               "row group size mismatch");
+                  cp_parquet_meta_free(out);
+                  return 0;
+                }
                 cp_parquet_column_meta_clear(&meta);
-                cp_error_set(err, CP_ERR_PARSE, 0, 0, "unknown column");
+              }
+            } else if (rg_field == 3) {
+              int64_t value = 0;
+              if (!cp_thrift_read_i64(&r, &value, err)) {
                 cp_parquet_meta_free(out);
                 return 0;
               }
-              if (have_schema && out->parquet_types &&
-                  meta.type != out->parquet_types[index]) {
-                cp_parquet_column_meta_clear(&meta);
+              if (value < 0) {
+                cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row count");
+                cp_parquet_meta_free(out);
+                return 0;
+              }
+              if (rg_rows >= 0 && rg_rows != value) {
                 cp_error_set(err, CP_ERR_PARSE, 0, 0,
-                             "column type mismatch");
+                             "row group size mismatch");
                 cp_parquet_meta_free(out);
                 return 0;
               }
-              out->data_page_offsets[index] = meta.data_page_offset;
-              if (meta.num_values < 0) {
-                cp_parquet_column_meta_clear(&meta);
-                cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid num_values");
+              rg_rows = value;
+              have_rg_rows = 1;
+            } else {
+              if (!cp_thrift_skip(&r, rg_type, err)) {
                 cp_parquet_meta_free(out);
                 return 0;
               }
-              if (row_group_rows == 0) {
-                row_group_rows = meta.num_values;
-              }
-              cp_parquet_column_meta_clear(&meta);
-            }
-          } else if (rg_field == 3) {
-            int64_t value = 0;
-            if (!cp_thrift_read_i64(&r, &value, err)) {
-              cp_parquet_meta_free(out);
-              return 0;
-            }
-            row_group_rows = value;
-          } else {
-            if (!cp_thrift_skip(&r, rg_type, err)) {
-              cp_parquet_meta_free(out);
-              return 0;
             }
           }
+          if (rg_rows < 0) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row group");
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+          out->row_group_rows[rg] = (size_t)rg_rows;
+          (void)have_rg_rows;
         }
         have_row_groups = 1;
         break;
@@ -10755,12 +11743,21 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
     return 0;
   }
   if (!have_rows) {
-    if (row_group_rows < 0) {
+    size_t total = 0;
+    if (!out->row_group_rows || out->row_group_count == 0) {
       cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid row count");
       cp_parquet_meta_free(out);
       return 0;
     }
-    out->nrows = (size_t)row_group_rows;
+    for (size_t rg = 0; rg < out->row_group_count; ++rg) {
+      if (SIZE_MAX - total < out->row_group_rows[rg]) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
+        cp_parquet_meta_free(out);
+        return 0;
+      }
+      total += out->row_group_rows[rg];
+    }
+    out->nrows = total;
   }
   return 1;
 }
@@ -12422,6 +13419,12 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
     fclose(fp);
     return NULL;
   }
+  if (meta.nrows > 0 && meta.row_group_count == 0) {
+    cp_parquet_meta_free(&meta);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet row groups");
+    fclose(fp);
+    return NULL;
+  }
   if (meta.nrows > (size_t)INT32_MAX) {
     cp_parquet_meta_free(&meta);
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet row count too large");
@@ -12453,276 +13456,938 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
       fclose(fp);
       return NULL;
     }
-    if (meta.data_page_offsets[col] < 0 ||
-        meta.data_page_offsets[col] > file_size) {
-      cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet offset");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (fseek(fp, (long)meta.data_page_offsets[col], SEEK_SET) != 0) {
-      cp_error_set(err, CP_ERR_IO, 0, col, "failed to seek parquet");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    CpParquetPageHeader header;
-    if (!cp_parquet_read_page_header(fp, &header, err)) {
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (header.type != CP_PARQUET_PAGE_DATA) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col,
-                   "unsupported parquet page");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (header.encoding != CP_PARQUET_ENC_PLAIN) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col,
-                   "unsupported parquet encoding");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (meta.max_def_levels[col] > 0 &&
-        header.def_encoding != CP_PARQUET_ENC_RLE) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col,
-                   "unsupported parquet definition levels");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (header.rep_encoding != 0 &&
-        header.rep_encoding != CP_PARQUET_ENC_RLE) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col,
-                   "unsupported parquet repetition levels");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (header.compressed_size < 0 || header.uncompressed_size < 0 ||
-        header.compressed_size != header.uncompressed_size) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col,
-                   "compressed parquet not supported");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    if (header.num_values < 0 ||
-        (size_t)header.num_values != meta.nrows) {
-      cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet row count");
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    size_t page_size = (size_t)header.compressed_size;
-    unsigned char *page = NULL;
-    if (page_size > 0) {
-      page = (unsigned char *)malloc(page_size);
-      if (!page) {
-        cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
-        cp_df_free(df);
-        cp_parquet_meta_free(&meta);
-        fclose(fp);
-        return NULL;
-      }
-      if (fread(page, 1, page_size, fp) != page_size) {
-        cp_error_set(err, CP_ERR_IO, 0, col, "failed to read parquet");
-        free(page);
-        cp_df_free(df);
-        cp_parquet_meta_free(&meta);
-        fclose(fp);
-        return NULL;
-      }
-    }
-    size_t offset = 0;
-    uint8_t *def_levels = NULL;
-    if (meta.max_def_levels[col] > 0 && meta.nrows > 0) {
-      uint32_t def_len = 0;
-      if (!cp_parquet_read_u32(page, page_size, &offset, &def_len, err)) {
-        free(page);
-        cp_df_free(df);
-        cp_parquet_meta_free(&meta);
-        fclose(fp);
-        return NULL;
-      }
-      if (def_len > page_size - offset) {
-        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid def levels");
-        free(page);
-        cp_df_free(df);
-        cp_parquet_meta_free(&meta);
-        fclose(fp);
-        return NULL;
-      }
-      def_levels = (uint8_t *)malloc(meta.nrows);
-      if (!def_levels) {
-        cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
-        free(page);
-        cp_df_free(df);
-        cp_parquet_meta_free(&meta);
-        fclose(fp);
-        return NULL;
-      }
-      if (!cp_parquet_decode_levels(page + offset, def_len, meta.nrows, 1,
-                                    def_levels, err)) {
-        free(def_levels);
-        free(page);
-        cp_df_free(df);
-        cp_parquet_meta_free(&meta);
-        fclose(fp);
-        return NULL;
-      }
-      offset += def_len;
-    }
-
-    int parquet_type = meta.parquet_types
-                           ? meta.parquet_types[col]
-                           : cp_parquet_type_for_dtype(series->dtype);
-    for (size_t row = 0; row < meta.nrows; ++row) {
-      int is_null = 0;
-      if (meta.max_def_levels[col] > 0) {
-        uint8_t level = def_levels ? def_levels[row] : 0;
-        if (level == 0) {
-          is_null = 1;
-        } else if (level != 1) {
-          cp_error_set(err, CP_ERR_PARSE, row, col, "invalid def level");
-          free(def_levels);
-          free(page);
-          cp_df_free(df);
-          cp_parquet_meta_free(&meta);
-          fclose(fp);
-          return NULL;
-        }
-      }
-      series->is_null[row] = is_null ? 1 : 0;
-      if (is_null) {
-        if (series->dtype == CP_DTYPE_STRING) {
-          series->data.str[row] = NULL;
-        }
-        series->length = row + 1;
-        continue;
-      }
-      switch (parquet_type) {
-        case CP_PARQUET_TYPE_INT32: {
-          uint32_t value = 0;
-          if (!cp_parquet_read_u32(page, page_size, &offset, &value, err)) {
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          series->data.i64[row] = (int64_t)(int32_t)value;
-          break;
-        }
-        case CP_PARQUET_TYPE_INT64: {
-          uint64_t value = 0;
-          if (!cp_parquet_read_u64(page, page_size, &offset, &value, err)) {
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          series->data.i64[row] = (int64_t)value;
-          break;
-        }
-        case CP_PARQUET_TYPE_FLOAT: {
-          float value = 0.0f;
-          if (!cp_parquet_read_f32(page, page_size, &offset, &value, err)) {
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          series->data.f64[row] = (double)value;
-          break;
-        }
-        case CP_PARQUET_TYPE_DOUBLE: {
-          double value = 0.0;
-          if (!cp_parquet_read_f64(page, page_size, &offset, &value, err)) {
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          series->data.f64[row] = value;
-          break;
-        }
-        case CP_PARQUET_TYPE_BYTE_ARRAY: {
-          uint32_t len = 0;
-          if (!cp_parquet_read_u32(page, page_size, &offset, &len, err)) {
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          if (len > page_size - offset) {
-            cp_error_set(err, CP_ERR_PARSE, row, col, "invalid string length");
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          char *value = cp_strndup((const char *)page + offset, len);
-          if (!value) {
-            cp_error_set(err, CP_ERR_OOM, row, col, "out of memory");
-            free(def_levels);
-            free(page);
-            cp_df_free(df);
-            cp_parquet_meta_free(&meta);
-            fclose(fp);
-            return NULL;
-          }
-          offset += len;
-          series->data.str[row] = value;
-          break;
-        }
-        default:
-          cp_error_set(err, CP_ERR_INVALID, row, col, "unsupported type");
-          free(def_levels);
-          free(page);
-          cp_df_free(df);
-          cp_parquet_meta_free(&meta);
-          fclose(fp);
-          return NULL;
-      }
-      series->length = row + 1;
-    }
-    if (offset != page_size) {
-      cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet page data");
-      free(def_levels);
-      free(page);
-      cp_df_free(df);
-      cp_parquet_meta_free(&meta);
-      fclose(fp);
-      return NULL;
-    }
-    free(def_levels);
-    free(page);
   }
 
+  size_t row_offset = 0;
+  for (size_t rg = 0; rg < meta.row_group_count; ++rg) {
+    size_t rg_rows = meta.row_group_rows[rg];
+    for (size_t col = 0; col < meta.ncols; ++col) {
+      CpSeries *series = df->cols[col];
+      size_t slot = rg * meta.ncols + col;
+      int64_t data_offset = meta.data_page_offsets[slot];
+      int64_t dict_offset = meta.dictionary_page_offsets
+                                ? meta.dictionary_page_offsets[slot]
+                                : -1;
+      int codec = meta.codecs ? meta.codecs[slot] : CP_PARQUET_CODEC_UNCOMPRESSED;
+      if (data_offset < 0 || data_offset > file_size) {
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet offset");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+
+      int parquet_type = meta.parquet_types
+                             ? meta.parquet_types[col]
+                             : cp_parquet_type_for_dtype(series->dtype);
+
+      size_t dict_count = 0;
+      int64_t *dict_i64 = NULL;
+      double *dict_f64 = NULL;
+      char **dict_str = NULL;
+
+      if (dict_offset >= 0) {
+        if (fseek(fp, (long)dict_offset, SEEK_SET) != 0) {
+          cp_error_set(err, CP_ERR_IO, 0, col, "failed to seek parquet");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        CpParquetPageHeader dict_header;
+        if (!cp_parquet_read_page_header(fp, &dict_header, err)) {
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        if (dict_header.type != CP_PARQUET_PAGE_DICTIONARY) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid dictionary page");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        if (dict_header.dict_encoding != CP_PARQUET_ENC_PLAIN &&
+            dict_header.dict_encoding != CP_PARQUET_ENC_PLAIN_DICTIONARY) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "unsupported dictionary encoding");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        unsigned char *dict_page = NULL;
+        size_t dict_len = 0;
+        if (!cp_parquet_read_page_payload(fp, codec, &dict_header,
+                                          &dict_page, &dict_len, err)) {
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        if (dict_header.dict_num_values < 0) {
+          free(dict_page);
+          cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid dictionary size");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        dict_count = (size_t)dict_header.dict_num_values;
+        size_t dict_offset_bytes = 0;
+        if (dict_count > 0) {
+          if (parquet_type == CP_PARQUET_TYPE_INT32 ||
+              parquet_type == CP_PARQUET_TYPE_INT64) {
+            dict_i64 = (int64_t *)calloc(dict_count, sizeof(int64_t));
+            if (!dict_i64) {
+              free(dict_page);
+              cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+              cp_df_free(df);
+              cp_parquet_meta_free(&meta);
+              fclose(fp);
+              return NULL;
+            }
+            for (size_t i = 0; i < dict_count; ++i) {
+              if (parquet_type == CP_PARQUET_TYPE_INT32) {
+                uint32_t value = 0;
+                if (!cp_parquet_read_u32(dict_page, dict_len,
+                                         &dict_offset_bytes, &value, err)) {
+                  free(dict_page);
+                  free(dict_i64);
+                  cp_df_free(df);
+                  cp_parquet_meta_free(&meta);
+                  fclose(fp);
+                  return NULL;
+                }
+                dict_i64[i] = (int64_t)(int32_t)value;
+              } else {
+                uint64_t value = 0;
+                if (!cp_parquet_read_u64(dict_page, dict_len,
+                                         &dict_offset_bytes, &value, err)) {
+                  free(dict_page);
+                  free(dict_i64);
+                  cp_df_free(df);
+                  cp_parquet_meta_free(&meta);
+                  fclose(fp);
+                  return NULL;
+                }
+                dict_i64[i] = (int64_t)value;
+              }
+            }
+          } else if (parquet_type == CP_PARQUET_TYPE_FLOAT ||
+                     parquet_type == CP_PARQUET_TYPE_DOUBLE) {
+            dict_f64 = (double *)calloc(dict_count, sizeof(double));
+            if (!dict_f64) {
+              free(dict_page);
+              cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+              cp_df_free(df);
+              cp_parquet_meta_free(&meta);
+              fclose(fp);
+              return NULL;
+            }
+            for (size_t i = 0; i < dict_count; ++i) {
+              if (parquet_type == CP_PARQUET_TYPE_FLOAT) {
+                float value = 0.0f;
+                if (!cp_parquet_read_f32(dict_page, dict_len,
+                                         &dict_offset_bytes, &value, err)) {
+                  free(dict_page);
+                  free(dict_f64);
+                  cp_df_free(df);
+                  cp_parquet_meta_free(&meta);
+                  fclose(fp);
+                  return NULL;
+                }
+                dict_f64[i] = (double)value;
+              } else {
+                double value = 0.0;
+                if (!cp_parquet_read_f64(dict_page, dict_len,
+                                         &dict_offset_bytes, &value, err)) {
+                  free(dict_page);
+                  free(dict_f64);
+                  cp_df_free(df);
+                  cp_parquet_meta_free(&meta);
+                  fclose(fp);
+                  return NULL;
+                }
+                dict_f64[i] = value;
+              }
+            }
+          } else if (parquet_type == CP_PARQUET_TYPE_BYTE_ARRAY) {
+            dict_str = (char **)calloc(dict_count, sizeof(char *));
+            if (!dict_str) {
+              free(dict_page);
+              cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+              cp_df_free(df);
+              cp_parquet_meta_free(&meta);
+              fclose(fp);
+              return NULL;
+            }
+            for (size_t i = 0; i < dict_count; ++i) {
+              uint32_t len = 0;
+              if (!cp_parquet_read_u32(dict_page, dict_len,
+                                       &dict_offset_bytes, &len, err)) {
+                free(dict_page);
+                for (size_t j = 0; j < i; ++j) {
+                  free(dict_str[j]);
+                }
+                free(dict_str);
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              if (len > dict_len - dict_offset_bytes) {
+                free(dict_page);
+                for (size_t j = 0; j < i; ++j) {
+                  free(dict_str[j]);
+                }
+                free(dict_str);
+                cp_error_set(err, CP_ERR_PARSE, 0, col,
+                             "invalid dictionary value");
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              char *value = cp_strndup((const char *)dict_page +
+                                           dict_offset_bytes,
+                                       len);
+              if (!value) {
+                free(dict_page);
+                for (size_t j = 0; j < i; ++j) {
+                  free(dict_str[j]);
+                }
+                free(dict_str);
+                cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              dict_offset_bytes += len;
+              dict_str[i] = value;
+            }
+          }
+        }
+        if (dict_offset_bytes != dict_len) {
+          free(dict_page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid dictionary page");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        free(dict_page);
+      }
+
+      if (fseek(fp, (long)data_offset, SEEK_SET) != 0) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_IO, 0, col, "failed to seek parquet");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      CpParquetPageHeader header;
+      if (!cp_parquet_read_page_header(fp, &header, err)) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (header.type != CP_PARQUET_PAGE_DATA) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_INVALID, 0, col,
+                     "unsupported parquet page");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (meta.max_def_levels[col] > 0 &&
+          header.def_encoding != CP_PARQUET_ENC_RLE) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_INVALID, 0, col,
+                     "unsupported parquet definition levels");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (header.rep_encoding != 0 &&
+          header.rep_encoding != CP_PARQUET_ENC_RLE) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_INVALID, 0, col,
+                     "unsupported parquet repetition levels");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (header.num_values < 0 ||
+          (size_t)header.num_values != rg_rows) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet row count");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+
+      unsigned char *page = NULL;
+      size_t page_size = 0;
+      if (!cp_parquet_read_page_payload(fp, codec, &header,
+                                        &page, &page_size, err)) {
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+
+      size_t offset = 0;
+      uint8_t *def_levels = NULL;
+      if (meta.max_def_levels[col] > 0 && rg_rows > 0) {
+        uint32_t def_len = 0;
+        if (!cp_parquet_read_u32(page, page_size, &offset, &def_len, err)) {
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        if (def_len > page_size - offset) {
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid def levels");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        def_levels = (uint8_t *)malloc(rg_rows);
+        if (!def_levels) {
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        if (!cp_parquet_decode_levels(page + offset, def_len, rg_rows, 1,
+                                      def_levels, err)) {
+          free(def_levels);
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        offset += def_len;
+      }
+
+      size_t non_null = 0;
+      if (meta.max_def_levels[col] > 0) {
+        for (size_t r = 0; r < rg_rows; ++r) {
+          if (def_levels[r] == 1) {
+            non_null += 1;
+          } else if (def_levels[r] != 0) {
+            free(def_levels);
+            free(page);
+            if (dict_i64) {
+              free(dict_i64);
+            }
+            if (dict_f64) {
+              free(dict_f64);
+            }
+            if (dict_str) {
+              for (size_t i = 0; i < dict_count; ++i) {
+                free(dict_str[i]);
+              }
+              free(dict_str);
+            }
+            cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid def level");
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+        }
+      } else {
+        non_null = rg_rows;
+      }
+
+      int is_dict = (header.encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
+                     header.encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY);
+      if (is_dict && dict_count == 0) {
+        free(def_levels);
+        free(page);
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "missing dictionary page");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (!is_dict && header.encoding != CP_PARQUET_ENC_PLAIN) {
+        free(def_levels);
+        free(page);
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_INVALID, 0, col,
+                     "unsupported parquet encoding");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+
+      uint32_t *indices = NULL;
+      if (is_dict && non_null > 0) {
+        indices = (uint32_t *)malloc(non_null * sizeof(uint32_t));
+        if (!indices) {
+          free(def_levels);
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        size_t consumed = 0;
+        if (!cp_parquet_decode_indices(page + offset, page_size - offset,
+                                       non_null,
+                                       dict_count == 0
+                                           ? 0
+                                           : (uint32_t)(dict_count - 1),
+                                       indices, &consumed, err)) {
+          free(indices);
+          free(def_levels);
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        offset += consumed;
+      }
+
+      size_t idx_pos = 0;
+      for (size_t row = 0; row < rg_rows; ++row) {
+        size_t out_row = row_offset + row;
+        int is_null = 0;
+        if (meta.max_def_levels[col] > 0) {
+          is_null = def_levels ? (def_levels[row] == 0) : 0;
+        }
+        series->is_null[out_row] = is_null ? 1 : 0;
+        if (is_null) {
+          if (series->dtype == CP_DTYPE_STRING) {
+            series->data.str[out_row] = NULL;
+          }
+          continue;
+        }
+        if (is_dict) {
+          uint32_t index = indices ? indices[idx_pos++] : 0;
+          if (index >= dict_count) {
+            free(indices);
+            free(def_levels);
+            free(page);
+            if (dict_i64) {
+              free(dict_i64);
+            }
+            if (dict_f64) {
+              free(dict_f64);
+            }
+            if (dict_str) {
+              for (size_t i = 0; i < dict_count; ++i) {
+                free(dict_str[i]);
+              }
+              free(dict_str);
+            }
+            cp_error_set(err, CP_ERR_PARSE, row, col, "invalid dictionary index");
+            cp_df_free(df);
+            cp_parquet_meta_free(&meta);
+            fclose(fp);
+            return NULL;
+          }
+          if (parquet_type == CP_PARQUET_TYPE_INT32 ||
+              parquet_type == CP_PARQUET_TYPE_INT64) {
+            series->data.i64[out_row] = dict_i64[index];
+          } else if (parquet_type == CP_PARQUET_TYPE_FLOAT ||
+                     parquet_type == CP_PARQUET_TYPE_DOUBLE) {
+            series->data.f64[out_row] = dict_f64[index];
+          } else if (parquet_type == CP_PARQUET_TYPE_BYTE_ARRAY) {
+            const char *src = dict_str[index];
+            size_t len = src ? strlen(src) : 0;
+            char *value = cp_strndup(src ? src : "", len);
+            if (!value) {
+              free(indices);
+              free(def_levels);
+              free(page);
+              if (dict_i64) {
+                free(dict_i64);
+              }
+              if (dict_f64) {
+                free(dict_f64);
+              }
+              if (dict_str) {
+                for (size_t i = 0; i < dict_count; ++i) {
+                  free(dict_str[i]);
+                }
+                free(dict_str);
+              }
+              cp_error_set(err, CP_ERR_OOM, row, col, "out of memory");
+              cp_df_free(df);
+              cp_parquet_meta_free(&meta);
+              fclose(fp);
+              return NULL;
+            }
+            series->data.str[out_row] = value;
+          }
+        } else {
+          switch (parquet_type) {
+            case CP_PARQUET_TYPE_INT32: {
+              uint32_t value = 0;
+              if (!cp_parquet_read_u32(page, page_size, &offset, &value, err)) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              series->data.i64[out_row] = (int64_t)(int32_t)value;
+              break;
+            }
+            case CP_PARQUET_TYPE_INT64: {
+              uint64_t value = 0;
+              if (!cp_parquet_read_u64(page, page_size, &offset, &value, err)) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              series->data.i64[out_row] = (int64_t)value;
+              break;
+            }
+            case CP_PARQUET_TYPE_FLOAT: {
+              float value = 0.0f;
+              if (!cp_parquet_read_f32(page, page_size, &offset, &value, err)) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              series->data.f64[out_row] = (double)value;
+              break;
+            }
+            case CP_PARQUET_TYPE_DOUBLE: {
+              double value = 0.0;
+              if (!cp_parquet_read_f64(page, page_size, &offset, &value, err)) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              series->data.f64[out_row] = value;
+              break;
+            }
+            case CP_PARQUET_TYPE_BYTE_ARRAY: {
+              uint32_t len = 0;
+              if (!cp_parquet_read_u32(page, page_size, &offset, &len, err)) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              if (len > page_size - offset) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_error_set(err, CP_ERR_PARSE, row, col,
+                             "invalid string length");
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              char *value = cp_strndup((const char *)page + offset, len);
+              if (!value) {
+                free(indices);
+                free(def_levels);
+                free(page);
+                if (dict_i64) {
+                  free(dict_i64);
+                }
+                if (dict_f64) {
+                  free(dict_f64);
+                }
+                if (dict_str) {
+                  for (size_t i = 0; i < dict_count; ++i) {
+                    free(dict_str[i]);
+                  }
+                  free(dict_str);
+                }
+                cp_error_set(err, CP_ERR_OOM, row, col, "out of memory");
+                cp_df_free(df);
+                cp_parquet_meta_free(&meta);
+                fclose(fp);
+                return NULL;
+              }
+              offset += len;
+              series->data.str[out_row] = value;
+              break;
+            }
+            default:
+              free(indices);
+              free(def_levels);
+              free(page);
+              if (dict_i64) {
+                free(dict_i64);
+              }
+              if (dict_f64) {
+                free(dict_f64);
+              }
+              if (dict_str) {
+                for (size_t i = 0; i < dict_count; ++i) {
+                  free(dict_str[i]);
+                }
+                free(dict_str);
+              }
+              cp_error_set(err, CP_ERR_INVALID, row, col, "unsupported type");
+              cp_df_free(df);
+              cp_parquet_meta_free(&meta);
+              fclose(fp);
+              return NULL;
+          }
+        }
+      }
+
+      if (!is_dict && offset != page_size) {
+        free(indices);
+        free(def_levels);
+        free(page);
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet page data");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+      if (is_dict && offset != page_size) {
+        free(indices);
+        free(def_levels);
+        free(page);
+        if (dict_i64) {
+          free(dict_i64);
+        }
+        if (dict_f64) {
+          free(dict_f64);
+        }
+        if (dict_str) {
+          for (size_t i = 0; i < dict_count; ++i) {
+            free(dict_str[i]);
+          }
+          free(dict_str);
+        }
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet page data");
+        cp_df_free(df);
+        cp_parquet_meta_free(&meta);
+        fclose(fp);
+        return NULL;
+      }
+
+      free(indices);
+      free(def_levels);
+      free(page);
+      if (dict_i64) {
+        free(dict_i64);
+      }
+      if (dict_f64) {
+        free(dict_f64);
+      }
+      if (dict_str) {
+        for (size_t i = 0; i < dict_count; ++i) {
+          free(dict_str[i]);
+        }
+        free(dict_str);
+      }
+    }
+    row_offset += rg_rows;
+  }
+
+  for (size_t col = 0; col < meta.ncols; ++col) {
+    if (df->cols[col]) {
+      df->cols[col]->length = meta.nrows;
+    }
+  }
   df->nrows = meta.nrows;
   cp_parquet_meta_free(&meta);
   fclose(fp);
@@ -13267,6 +14932,12 @@ int cp_df_write_parquet(const CpDataFrame *df,
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet row count too large");
     return 0;
   }
+
+  int codec = cp_parquet_pick_codec(err);
+  if (codec < 0) {
+    return 0;
+  }
+
   FILE *fp = fopen(path, "wb");
   if (!fp) {
     cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open parquet");
@@ -13280,292 +14951,900 @@ int cp_df_write_parquet(const CpDataFrame *df,
 
   size_t ncols = df->ncols;
   size_t nrows = df->nrows;
-  CpParquetColumnMeta *cols =
-      (CpParquetColumnMeta *)calloc(ncols, sizeof(CpParquetColumnMeta));
-  if (!cols) {
+  CpParquetSchemaColumn *schema =
+      (CpParquetSchemaColumn *)calloc(ncols, sizeof(CpParquetSchemaColumn));
+  if (!schema) {
     cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
     fclose(fp);
     return 0;
   }
-  int64_t row_group_size = 0;
 
   for (size_t col = 0; col < ncols; ++col) {
     CpSeries *series = df->cols[col];
     if (!series) {
       cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series");
-      free(cols);
+      free(schema);
       fclose(fp);
       return 0;
     }
     if (series->length != nrows) {
       cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series length");
-      free(cols);
+      free(schema);
       fclose(fp);
       return 0;
     }
-    int parquet_type = cp_parquet_type_for_dtype(series->dtype);
-    if (parquet_type < 0) {
+    if (cp_parquet_type_for_dtype(series->dtype) < 0) {
       cp_error_set(err, CP_ERR_INVALID, 0, col, "unsupported dtype");
-      free(cols);
+      free(schema);
       fclose(fp);
       return 0;
     }
-    cols[col].name = series->name ? series->name : "";
-    cols[col].dtype = series->dtype;
-
+    schema[col].name = series->name ? series->name : "";
+    schema[col].dtype = series->dtype;
     int has_null = 0;
-    if (nrows > 0) {
-      for (size_t row = 0; row < nrows; ++row) {
-        if (series->is_null[row]) {
-          has_null = 1;
-          break;
-        }
-      }
-    }
-    cols[col].repetition_type =
-        has_null ? CP_PARQUET_REP_OPTIONAL : CP_PARQUET_REP_REQUIRED;
-    cols[col].max_def_level = has_null ? 1 : 0;
-
-    CpStrBuf values_buf;
-    if (!cp_strbuf_init(&values_buf, 0, err)) {
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-
     for (size_t row = 0; row < nrows; ++row) {
-      if (has_null && series->is_null[row]) {
-        continue;
+      if (series->is_null[row]) {
+        has_null = 1;
+        break;
       }
-      switch (parquet_type) {
-        case CP_PARQUET_TYPE_INT64:
-          if (!cp_parquet_buf_append_u64(&values_buf,
-                                         (uint64_t)series->data.i64[row],
-                                         err)) {
-            cp_strbuf_free(&values_buf);
-            free(cols);
-            fclose(fp);
-            return 0;
-          }
-          break;
-        case CP_PARQUET_TYPE_DOUBLE:
-          if (!cp_parquet_buf_append_f64(&values_buf,
-                                         series->data.f64[row], err)) {
-            cp_strbuf_free(&values_buf);
-            free(cols);
-            fclose(fp);
-            return 0;
-          }
-          break;
-        case CP_PARQUET_TYPE_BYTE_ARRAY: {
-          const char *value = series->data.str[row];
-          if (!value) {
-            value = "";
-          }
-          size_t len = strlen(value);
-          if (len > UINT32_MAX) {
-            cp_error_set(err, CP_ERR_INVALID, row, col,
-                         "string too large");
-            cp_strbuf_free(&values_buf);
-            free(cols);
-            fclose(fp);
-            return 0;
-          }
-          if (!cp_parquet_buf_append_u32(&values_buf, (uint32_t)len, err) ||
-              !cp_strbuf_append(&values_buf, value, len, err)) {
-            cp_strbuf_free(&values_buf);
-            free(cols);
-            fclose(fp);
-            return 0;
-          }
-          break;
+    }
+    schema[col].repetition_type =
+        has_null ? CP_PARQUET_REP_OPTIONAL : CP_PARQUET_REP_REQUIRED;
+    schema[col].max_def_level = has_null ? 1 : 0;
+  }
+
+  size_t row_group_size = CP_PARQUET_DEFAULT_ROW_GROUP;
+  size_t row_group_count = 0;
+  if (nrows > 0) {
+    row_group_count = (nrows + row_group_size - 1) / row_group_size;
+  }
+
+  CpParquetRowGroupMeta *row_groups = NULL;
+  if (row_group_count > 0) {
+    row_groups =
+        (CpParquetRowGroupMeta *)calloc(row_group_count,
+                                        sizeof(CpParquetRowGroupMeta));
+    if (!row_groups) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      free(schema);
+      fclose(fp);
+      return 0;
+    }
+  }
+
+  int ok = 0;
+  for (size_t rg = 0; rg < row_group_count; ++rg) {
+    size_t rg_start = rg * row_group_size;
+    size_t rg_rows = nrows - rg_start;
+    if (rg_rows > row_group_size) {
+      rg_rows = row_group_size;
+    }
+    row_groups[rg].num_rows = (int64_t)rg_rows;
+    row_groups[rg].cols =
+        (CpParquetColumnChunkMeta *)calloc(ncols,
+                                           sizeof(CpParquetColumnChunkMeta));
+    if (!row_groups[rg].cols) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      goto cleanup;
+    }
+
+    long rg_start_offset = ftell(fp);
+    if (rg_start_offset < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write parquet");
+      goto cleanup;
+    }
+
+    for (size_t col = 0; col < ncols; ++col) {
+      CpSeries *series = df->cols[col];
+      CpParquetColumnChunkMeta *col_meta = &row_groups[rg].cols[col];
+      col_meta->codec = codec;
+      col_meta->num_values = (int64_t)rg_rows;
+      col_meta->dictionary_page_offset = -1;
+      col_meta->has_dictionary = 0;
+      col_meta->encoding = CP_PARQUET_ENC_PLAIN;
+
+      uint8_t *def_levels = NULL;
+      size_t non_null = rg_rows;
+      if (schema[col].max_def_level > 0 && rg_rows > 0) {
+        def_levels = (uint8_t *)malloc(rg_rows);
+        if (!def_levels) {
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          goto cleanup;
         }
-        default:
-          cp_error_set(err, CP_ERR_INVALID, row, col, "unsupported type");
+        non_null = 0;
+        for (size_t row = 0; row < rg_rows; ++row) {
+          size_t src_row = rg_start + row;
+          if (series->is_null[src_row]) {
+            def_levels[row] = 0;
+          } else {
+            def_levels[row] = 1;
+            non_null += 1;
+          }
+        }
+      }
+
+      CpStrBuf values_buf;
+      int values_init = 0;
+      if (!cp_strbuf_init(&values_buf, 0, err)) {
+        free(def_levels);
+        goto cleanup;
+      }
+      values_init = 1;
+
+      CpParquetDictIndex dict_index;
+      int dict_index_init = 0;
+      memset(&dict_index, 0, sizeof(dict_index));
+      uint32_t *indices = NULL;
+      size_t index_pos = 0;
+      int64_t *dict_i64 = NULL;
+      size_t dict_i64_count = 0;
+      size_t dict_i64_cap = 0;
+      uint64_t *dict_f64 = NULL;
+      size_t dict_f64_count = 0;
+      size_t dict_f64_cap = 0;
+      const char **dict_str = NULL;
+      size_t *dict_str_lens = NULL;
+      size_t dict_str_count = 0;
+      size_t dict_str_cap = 0;
+      size_t dict_len_cap = 0;
+
+      if (non_null > 0) {
+        indices = (uint32_t *)malloc(non_null * sizeof(uint32_t));
+        if (!indices) {
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
           cp_strbuf_free(&values_buf);
-          free(cols);
-          fclose(fp);
-          return 0;
+          free(def_levels);
+          goto cleanup;
+        }
+        if (!cp_parquet_dict_index_init(&dict_index, non_null, err)) {
+          free(indices);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        dict_index_init = 1;
       }
-    }
 
-    CpStrBuf data_buf;
-    if (!cp_strbuf_init(&data_buf, 0, err)) {
-      cp_strbuf_free(&values_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-
-    if (has_null && nrows > 0) {
-      uint8_t *def_levels = (uint8_t *)malloc(nrows);
-      if (!def_levels) {
-        cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+      int parquet_type = cp_parquet_type_for_dtype(series->dtype);
+      for (size_t row = 0; row < rg_rows; ++row) {
+        size_t src_row = rg_start + row;
+        if (schema[col].max_def_level > 0 && series->is_null[src_row]) {
+          continue;
+        }
+        switch (parquet_type) {
+          case CP_PARQUET_TYPE_INT64: {
+            int64_t value = series->data.i64[src_row];
+            if (!cp_parquet_buf_append_u64(&values_buf,
+                                           (uint64_t)value, err)) {
+              cp_parquet_dict_index_free(&dict_index);
+              free(indices);
+              cp_strbuf_free(&values_buf);
+              free(def_levels);
+              goto cleanup;
+            }
+            if (dict_index_init) {
+              size_t idx = 0;
+              if (!cp_parquet_dict_add_int64(&dict_index, value,
+                                             &dict_i64, &dict_i64_count,
+                                             &dict_i64_cap, &idx, err)) {
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_i64);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+              indices[index_pos++] = (uint32_t)idx;
+            }
+            break;
+          }
+          case CP_PARQUET_TYPE_DOUBLE: {
+            double value = series->data.f64[src_row];
+            if (!cp_parquet_buf_append_f64(&values_buf, value, err)) {
+              cp_parquet_dict_index_free(&dict_index);
+              free(indices);
+              cp_strbuf_free(&values_buf);
+              free(def_levels);
+              goto cleanup;
+            }
+            if (dict_index_init) {
+              size_t idx = 0;
+              if (!cp_parquet_dict_add_float64(&dict_index, value,
+                                               &dict_f64, &dict_f64_count,
+                                               &dict_f64_cap, &idx, err)) {
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_f64);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+              indices[index_pos++] = (uint32_t)idx;
+            }
+            break;
+          }
+          case CP_PARQUET_TYPE_BYTE_ARRAY: {
+            const char *value = series->data.str[src_row];
+            if (!value) {
+              value = "";
+            }
+            size_t len = strlen(value);
+            if (len > UINT32_MAX) {
+              cp_error_set(err, CP_ERR_INVALID, src_row, col,
+                           "string too large");
+              cp_parquet_dict_index_free(&dict_index);
+              free(indices);
+              cp_strbuf_free(&values_buf);
+              free(def_levels);
+              goto cleanup;
+            }
+            if (!cp_parquet_buf_append_u32(&values_buf, (uint32_t)len, err) ||
+                !cp_strbuf_append(&values_buf, value, len, err)) {
+              cp_parquet_dict_index_free(&dict_index);
+              free(indices);
+              cp_strbuf_free(&values_buf);
+              free(def_levels);
+              goto cleanup;
+            }
+            if (dict_index_init) {
+              size_t idx = 0;
+              if (!cp_parquet_dict_add_string(&dict_index, value, len,
+                                              &dict_str, &dict_str_lens,
+                                              &dict_str_count, &dict_str_cap,
+                                              &dict_len_cap, &idx, err)) {
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_str);
+                free(dict_str_lens);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+              indices[index_pos++] = (uint32_t)idx;
+            }
+            break;
+          }
+          default:
+            cp_error_set(err, CP_ERR_INVALID, src_row, col, "unsupported type");
+            cp_parquet_dict_index_free(&dict_index);
+            free(indices);
+            cp_strbuf_free(&values_buf);
+            free(def_levels);
+            goto cleanup;
+        }
+      }
+      if (dict_index_init && index_pos != non_null) {
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid parquet index data");
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
         cp_strbuf_free(&values_buf);
-        cp_strbuf_free(&data_buf);
-        free(cols);
-        fclose(fp);
-        return 0;
+        free(def_levels);
+        goto cleanup;
       }
-      for (size_t row = 0; row < nrows; ++row) {
-        def_levels[row] = series->is_null[row] ? 0 : 1;
+
+      CpStrBuf dict_buf;
+      CpStrBuf indices_buf;
+      int dict_init = 0;
+      int indices_init = 0;
+      int use_dict = 0;
+      size_t dict_count = 0;
+      if (dict_index_init && non_null > 0) {
+        if (parquet_type == CP_PARQUET_TYPE_INT64) {
+          dict_count = dict_i64_count;
+        } else if (parquet_type == CP_PARQUET_TYPE_DOUBLE) {
+          dict_count = dict_f64_count;
+        } else if (parquet_type == CP_PARQUET_TYPE_BYTE_ARRAY) {
+          dict_count = dict_str_count;
+        }
+        if (dict_count > 0 && dict_count <= UINT32_MAX) {
+          if (!cp_strbuf_init(&dict_buf, 0, err)) {
+            cp_parquet_dict_index_free(&dict_index);
+            free(indices);
+            free(dict_i64);
+            free(dict_f64);
+            free(dict_str);
+            free(dict_str_lens);
+            cp_strbuf_free(&values_buf);
+            free(def_levels);
+            goto cleanup;
+          }
+          dict_init = 1;
+          for (size_t i = 0; i < dict_count; ++i) {
+            if (parquet_type == CP_PARQUET_TYPE_INT64) {
+              if (!cp_parquet_buf_append_u64(&dict_buf,
+                                             (uint64_t)dict_i64[i], err)) {
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_i64);
+                free(dict_f64);
+                free(dict_str);
+                free(dict_str_lens);
+                cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+            } else if (parquet_type == CP_PARQUET_TYPE_DOUBLE) {
+              double value = 0.0;
+              memcpy(&value, &dict_f64[i], sizeof(value));
+              if (!cp_parquet_buf_append_f64(&dict_buf, value, err)) {
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_i64);
+                free(dict_f64);
+                free(dict_str);
+                free(dict_str_lens);
+                cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+            } else if (parquet_type == CP_PARQUET_TYPE_BYTE_ARRAY) {
+              size_t len = dict_str_lens[i];
+              if (len > UINT32_MAX) {
+                cp_error_set(err, CP_ERR_INVALID, 0, col,
+                             "string too large");
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_i64);
+                free(dict_f64);
+                free(dict_str);
+                free(dict_str_lens);
+                cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+              if (!cp_parquet_buf_append_u32(&dict_buf, (uint32_t)len, err) ||
+                  !cp_strbuf_append(&dict_buf, dict_str[i], len, err)) {
+                cp_parquet_dict_index_free(&dict_index);
+                free(indices);
+                free(dict_i64);
+                free(dict_f64);
+                free(dict_str);
+                free(dict_str_lens);
+                cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&values_buf);
+                free(def_levels);
+                goto cleanup;
+              }
+            }
+          }
+          if (!cp_strbuf_init(&indices_buf, 0, err)) {
+            cp_parquet_dict_index_free(&dict_index);
+            free(indices);
+            free(dict_i64);
+            free(dict_f64);
+            free(dict_str);
+            free(dict_str_lens);
+            cp_strbuf_free(&dict_buf);
+            cp_strbuf_free(&values_buf);
+            free(def_levels);
+            goto cleanup;
+          }
+          indices_init = 1;
+          if (!cp_parquet_encode_indices(indices, non_null,
+                                         (uint32_t)(dict_count - 1),
+                                         &indices_buf, err)) {
+            cp_parquet_dict_index_free(&dict_index);
+            free(indices);
+            free(dict_i64);
+            free(dict_f64);
+            free(dict_str);
+            free(dict_str_lens);
+            cp_strbuf_free(&dict_buf);
+            cp_strbuf_free(&indices_buf);
+            cp_strbuf_free(&values_buf);
+            free(def_levels);
+            goto cleanup;
+          }
+          if (dict_buf.len + indices_buf.len < values_buf.len) {
+            use_dict = 1;
+          }
+        }
       }
+
       CpStrBuf def_buf;
-      if (!cp_strbuf_init(&def_buf, 0, err)) {
-        free(def_levels);
-        cp_strbuf_free(&values_buf);
-        cp_strbuf_free(&data_buf);
-        free(cols);
-        fclose(fp);
-        return 0;
+      int def_init = 0;
+      if (schema[col].max_def_level > 0 && rg_rows > 0) {
+        if (!cp_strbuf_init(&def_buf, 0, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        def_init = 1;
+        if (!cp_parquet_encode_levels(def_levels, rg_rows, 1, &def_buf, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&def_buf);
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        if (def_buf.len > UINT32_MAX) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col, "def levels too large");
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&def_buf);
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
       }
-      if (!cp_parquet_encode_levels(def_levels, nrows, 1, &def_buf, err)) {
-        cp_strbuf_free(&def_buf);
-        free(def_levels);
-        cp_strbuf_free(&values_buf);
-        cp_strbuf_free(&data_buf);
-        free(cols);
-        fclose(fp);
-        return 0;
-      }
-      free(def_levels);
-      if (def_buf.len > UINT32_MAX) {
-        cp_error_set(err, CP_ERR_INVALID, 0, col, "def levels too large");
-        cp_strbuf_free(&def_buf);
-        cp_strbuf_free(&values_buf);
-        cp_strbuf_free(&data_buf);
-        free(cols);
-        fclose(fp);
-        return 0;
-      }
-      if (!cp_parquet_buf_append_u32(&data_buf,
-                                     (uint32_t)def_buf.len,
-                                     err) ||
-          !cp_strbuf_append(&data_buf, def_buf.data, def_buf.len, err)) {
-        cp_strbuf_free(&def_buf);
-        cp_strbuf_free(&values_buf);
-        cp_strbuf_free(&data_buf);
-        free(cols);
-        fclose(fp);
-        return 0;
-      }
-      cp_strbuf_free(&def_buf);
-    }
 
-    if (!cp_strbuf_append(&data_buf, values_buf.data, values_buf.len, err)) {
+      CpStrBuf data_buf;
+      if (!cp_strbuf_init(&data_buf, 0, err)) {
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+
+      if (def_init) {
+        if (!cp_parquet_buf_append_u32(&data_buf, (uint32_t)def_buf.len, err) ||
+            !cp_strbuf_append(&data_buf, def_buf.data, def_buf.len, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&data_buf);
+          cp_strbuf_free(&def_buf);
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+      }
+
+      if (use_dict) {
+        if (!cp_strbuf_append(&data_buf, indices_buf.data,
+                              indices_buf.len, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          cp_strbuf_free(&dict_buf);
+          cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+      } else {
+        if (!cp_strbuf_append(&data_buf, values_buf.data,
+                              values_buf.len, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+      }
+
+      CpStrBuf compressed_data;
+      if (!cp_strbuf_init(&compressed_data, 0, err)) {
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        cp_strbuf_free(&data_buf);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+      if (!cp_parquet_compress(codec,
+                               (const unsigned char *)data_buf.data,
+                               data_buf.len, &compressed_data, err)) {
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        cp_strbuf_free(&compressed_data);
+        cp_strbuf_free(&data_buf);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+
+      int64_t total_uncompressed = (int64_t)data_buf.len;
+      int64_t total_compressed = (int64_t)compressed_data.len;
+
+      if (use_dict) {
+        CpStrBuf compressed_dict;
+        CpStrBuf dict_header;
+        if (!cp_strbuf_init(&compressed_dict, 0, err) ||
+            !cp_strbuf_init(&dict_header, 0, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&compressed_data);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          cp_strbuf_free(&dict_buf);
+          cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        if (!cp_parquet_compress(codec,
+                                 (const unsigned char *)dict_buf.data,
+                                 dict_buf.len, &compressed_dict, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&compressed_data);
+          cp_strbuf_free(&compressed_dict);
+          cp_strbuf_free(&dict_header);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          cp_strbuf_free(&dict_buf);
+          cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        if (!cp_parquet_write_dict_page_header(&dict_header,
+                                               (int32_t)dict_count,
+                                               (int32_t)dict_buf.len,
+                                               (int32_t)compressed_dict.len,
+                                               CP_PARQUET_ENC_PLAIN,
+                                               err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&compressed_data);
+          cp_strbuf_free(&compressed_dict);
+          cp_strbuf_free(&dict_header);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          cp_strbuf_free(&dict_buf);
+          cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        long dict_offset = ftell(fp);
+        if (dict_offset < 0) {
+          cp_error_set(err, CP_ERR_IO, 0, col, "failed to write parquet");
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&compressed_data);
+          cp_strbuf_free(&compressed_dict);
+          cp_strbuf_free(&dict_header);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          cp_strbuf_free(&dict_buf);
+          cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        if (!cp_write_bytes(fp, dict_header.data, dict_header.len, err,
+                            "failed to write parquet") ||
+            !cp_write_bytes(fp, compressed_dict.data, compressed_dict.len, err,
+                            "failed to write parquet")) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&compressed_data);
+          cp_strbuf_free(&compressed_dict);
+          cp_strbuf_free(&dict_header);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          cp_strbuf_free(&dict_buf);
+          cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        col_meta->has_dictionary = 1;
+        col_meta->dictionary_page_offset = (int64_t)dict_offset;
+        col_meta->encoding = CP_PARQUET_ENC_RLE_DICTIONARY;
+        total_uncompressed += (int64_t)dict_buf.len;
+        total_compressed += (int64_t)compressed_dict.len;
+        cp_strbuf_free(&compressed_dict);
+        cp_strbuf_free(&dict_header);
+      }
+
+      CpStrBuf data_header;
+      if (!cp_strbuf_init(&data_header, 0, err)) {
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        cp_strbuf_free(&compressed_data);
+        cp_strbuf_free(&data_buf);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+      if (!cp_parquet_write_data_page_header(
+              &data_header, (int32_t)rg_rows,
+              (int32_t)data_buf.len,
+              (int32_t)compressed_data.len,
+              use_dict ? CP_PARQUET_ENC_RLE_DICTIONARY : CP_PARQUET_ENC_PLAIN,
+              schema[col].max_def_level > 0 ? CP_PARQUET_ENC_RLE : 0,
+              0, err)) {
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        cp_strbuf_free(&compressed_data);
+        cp_strbuf_free(&data_buf);
+        cp_strbuf_free(&data_header);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+
+      long data_offset = ftell(fp);
+      if (data_offset < 0) {
+        cp_error_set(err, CP_ERR_IO, 0, col, "failed to write parquet");
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        cp_strbuf_free(&compressed_data);
+        cp_strbuf_free(&data_buf);
+        cp_strbuf_free(&data_header);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+      if (!cp_write_bytes(fp, data_header.data, data_header.len, err,
+                          "failed to write parquet") ||
+          !cp_write_bytes(fp, compressed_data.data, compressed_data.len, err,
+                          "failed to write parquet")) {
+        cp_parquet_dict_index_free(&dict_index);
+        free(indices);
+        free(dict_i64);
+        free(dict_f64);
+        free(dict_str);
+        free(dict_str_lens);
+        cp_strbuf_free(&compressed_data);
+        cp_strbuf_free(&data_buf);
+        cp_strbuf_free(&data_header);
+        if (def_init) {
+          cp_strbuf_free(&def_buf);
+        }
+        if (dict_init) {
+          cp_strbuf_free(&dict_buf);
+        }
+        if (indices_init) {
+          cp_strbuf_free(&indices_buf);
+        }
+        cp_strbuf_free(&values_buf);
+        free(def_levels);
+        goto cleanup;
+      }
+
+      col_meta->data_page_offset = (int64_t)data_offset;
+      col_meta->total_uncompressed_size = total_uncompressed;
+      col_meta->total_compressed_size = total_compressed;
+      col_meta->encoding = use_dict ? CP_PARQUET_ENC_RLE_DICTIONARY
+                                    : CP_PARQUET_ENC_PLAIN;
+
+      cp_parquet_dict_index_free(&dict_index);
+      free(indices);
+      free(dict_i64);
+      free(dict_f64);
+      free(dict_str);
+      free(dict_str_lens);
+      cp_strbuf_free(&compressed_data);
+      cp_strbuf_free(&data_buf);
+      cp_strbuf_free(&data_header);
+      if (def_init) {
+        cp_strbuf_free(&def_buf);
+      }
+      if (dict_init) {
+        cp_strbuf_free(&dict_buf);
+      }
+      if (indices_init) {
+        cp_strbuf_free(&indices_buf);
+      }
       cp_strbuf_free(&values_buf);
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-    cp_strbuf_free(&values_buf);
-
-    if (data_buf.len > INT32_MAX) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col, "parquet page too large");
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
+      free(def_levels);
     }
 
-    CpStrBuf header_buf;
-    if (!cp_strbuf_init(&header_buf, 0, err)) {
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
+    long rg_end_offset = ftell(fp);
+    if (rg_end_offset < 0) {
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to write parquet");
+      goto cleanup;
     }
-    if (!cp_parquet_write_page_header(&header_buf, (int32_t)nrows,
-                                      (int32_t)data_buf.len, err)) {
-      cp_strbuf_free(&header_buf);
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-
-    long offset = ftell(fp);
-    if (offset < 0) {
-      cp_error_set(err, CP_ERR_IO, 0, col, "failed to write parquet");
-      cp_strbuf_free(&header_buf);
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-    cols[col].data_page_offset = (int64_t)offset;
-
-    if (!cp_write_bytes(fp, header_buf.data, header_buf.len, err,
-                        "failed to write parquet") ||
-        !cp_write_bytes(fp, data_buf.data, data_buf.len, err,
-                        "failed to write parquet")) {
-      cp_strbuf_free(&header_buf);
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-    size_t chunk_size = header_buf.len + data_buf.len;
-    if (chunk_size > (size_t)INT64_MAX) {
-      cp_error_set(err, CP_ERR_INVALID, 0, col, "parquet chunk too large");
-      cp_strbuf_free(&header_buf);
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-    cols[col].total_uncompressed_size = (int64_t)chunk_size;
-    cols[col].total_compressed_size = (int64_t)chunk_size;
-
-    if (row_group_size > INT64_MAX - (int64_t)chunk_size) {
-      cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet size overflow");
-      cp_strbuf_free(&header_buf);
-      cp_strbuf_free(&data_buf);
-      free(cols);
-      fclose(fp);
-      return 0;
-    }
-    row_group_size += (int64_t)chunk_size;
-
-    cp_strbuf_free(&header_buf);
-    cp_strbuf_free(&data_buf);
+    row_groups[rg].total_byte_size =
+        (int64_t)(rg_end_offset - rg_start_offset);
   }
 
   CpStrBuf meta_buf;
+  int meta_init = 0;
   if (!cp_strbuf_init(&meta_buf, 0, err)) {
-    free(cols);
-    fclose(fp);
-    return 0;
+    goto cleanup;
   }
-  if (!cp_parquet_write_file_metadata(&meta_buf, cols, ncols,
-                                      (int64_t)nrows, row_group_size, err)) {
-    cp_strbuf_free(&meta_buf);
-    free(cols);
-    fclose(fp);
-    return 0;
+  meta_init = 1;
+  if (!cp_parquet_write_file_metadata(&meta_buf, schema, ncols,
+                                      row_groups, row_group_count,
+                                      (int64_t)nrows, err)) {
+    goto cleanup;
   }
   if (meta_buf.len > UINT32_MAX) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "parquet metadata too large");
-    cp_strbuf_free(&meta_buf);
-    free(cols);
-    fclose(fp);
-    return 0;
+    goto cleanup;
   }
   if (!cp_write_bytes(fp, meta_buf.data, meta_buf.len, err,
                       "failed to write parquet") ||
       !cp_parquet_write_u32(fp, (uint32_t)meta_buf.len, err) ||
       !cp_write_bytes(fp, cp_parquet_magic, sizeof(cp_parquet_magic), err,
                       "failed to write parquet")) {
-    cp_strbuf_free(&meta_buf);
-    free(cols);
-    fclose(fp);
-    return 0;
+    goto cleanup;
   }
-  cp_strbuf_free(&meta_buf);
-  free(cols);
+
+  ok = 1;
+
+cleanup:
+  if (meta_init) {
+    cp_strbuf_free(&meta_buf);
+  }
+  cp_parquet_row_groups_free(row_groups, row_group_count);
+  free(schema);
   fclose(fp);
-  return 1;
+  return ok;
 }
 
 int cp_df_to_excel(const CpDataFrame *df,
