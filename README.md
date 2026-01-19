@@ -9,7 +9,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - Columnar data C storage with typed columns (int64, float64, string).
 - DataFrame and Series API with selection, sorting, joins, groupby, and pivot tables.
 - Aggregations (count, sum, mean, min, max, median, std, corr, cov, rank, diff).
-- CSV/TSV/JSON/NDJSON read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
+- CSV/TSV/JSON/NDJSON/CPD read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
 - Pure C11 core (no C++ dependencies required).
 - Query filtering with AND/OR and parentheses.
 - Vectorized arithmetic helpers and column-to-column comparisons.
@@ -46,6 +46,11 @@ ctest --test-dir build
 ## Status
 
 See `CONVERSION_STATUS.md` for a checklist of implemented and remaining pandas features.
+
+## CPD format
+
+CPD is a compact little-endian binary format used by cpandas for fast load/save of
+typed, columnar data with null masks. It is intended for C-to-C workflows.
 
 ## Repo metadata (SEO)
 

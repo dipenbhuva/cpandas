@@ -8710,6 +8710,136 @@ static char **cp_make_default_names(size_t ncols, CpError *err) {
   return names;
 }
 
+static const unsigned char cp_cpd_magic[4] = {'C', 'P', 'D', '1'};
+
+static int cp_write_bytes(FILE *fp,
+                          const void *data,
+                          size_t len,
+                          CpError *err,
+                          const char *msg) {
+  if (!fp || (!data && len > 0)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid cpd write");
+    return 0;
+  }
+  if (len == 0) {
+    return 1;
+  }
+  if (fwrite(data, 1, len, fp) != len) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, msg ? msg : "failed to write cpd");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_read_bytes(FILE *fp,
+                         void *data,
+                         size_t len,
+                         CpError *err,
+                         const char *msg) {
+  if (!fp || (!data && len > 0)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid cpd read");
+    return 0;
+  }
+  if (len == 0) {
+    return 1;
+  }
+  if (fread(data, 1, len, fp) != len) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, msg ? msg : "failed to read cpd");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_write_u32(FILE *fp, uint32_t value, CpError *err) {
+  unsigned char buf[4];
+  buf[0] = (unsigned char)(value & 0xffu);
+  buf[1] = (unsigned char)((value >> 8) & 0xffu);
+  buf[2] = (unsigned char)((value >> 16) & 0xffu);
+  buf[3] = (unsigned char)((value >> 24) & 0xffu);
+  return cp_write_bytes(fp, buf, sizeof(buf), err, "failed to write cpd");
+}
+
+static int cp_write_u64(FILE *fp, uint64_t value, CpError *err) {
+  unsigned char buf[8];
+  buf[0] = (unsigned char)(value & 0xffu);
+  buf[1] = (unsigned char)((value >> 8) & 0xffu);
+  buf[2] = (unsigned char)((value >> 16) & 0xffu);
+  buf[3] = (unsigned char)((value >> 24) & 0xffu);
+  buf[4] = (unsigned char)((value >> 32) & 0xffu);
+  buf[5] = (unsigned char)((value >> 40) & 0xffu);
+  buf[6] = (unsigned char)((value >> 48) & 0xffu);
+  buf[7] = (unsigned char)((value >> 56) & 0xffu);
+  return cp_write_bytes(fp, buf, sizeof(buf), err, "failed to write cpd");
+}
+
+static int cp_write_i64(FILE *fp, int64_t value, CpError *err) {
+  return cp_write_u64(fp, (uint64_t)value, err);
+}
+
+static int cp_write_f64(FILE *fp, double value, CpError *err) {
+  uint64_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  return cp_write_u64(fp, bits, err);
+}
+
+static int cp_read_u32(FILE *fp, uint32_t *out, CpError *err) {
+  unsigned char buf[4];
+  if (!cp_read_bytes(fp, buf, sizeof(buf), err, "failed to read cpd")) {
+    return 0;
+  }
+  uint32_t value = 0;
+  value |= (uint32_t)buf[0];
+  value |= (uint32_t)buf[1] << 8;
+  value |= (uint32_t)buf[2] << 16;
+  value |= (uint32_t)buf[3] << 24;
+  if (out) {
+    *out = value;
+  }
+  return 1;
+}
+
+static int cp_read_u64(FILE *fp, uint64_t *out, CpError *err) {
+  unsigned char buf[8];
+  if (!cp_read_bytes(fp, buf, sizeof(buf), err, "failed to read cpd")) {
+    return 0;
+  }
+  uint64_t value = 0;
+  value |= (uint64_t)buf[0];
+  value |= (uint64_t)buf[1] << 8;
+  value |= (uint64_t)buf[2] << 16;
+  value |= (uint64_t)buf[3] << 24;
+  value |= (uint64_t)buf[4] << 32;
+  value |= (uint64_t)buf[5] << 40;
+  value |= (uint64_t)buf[6] << 48;
+  value |= (uint64_t)buf[7] << 56;
+  if (out) {
+    *out = value;
+  }
+  return 1;
+}
+
+static int cp_read_i64(FILE *fp, int64_t *out, CpError *err) {
+  uint64_t value = 0;
+  if (!cp_read_u64(fp, &value, err)) {
+    return 0;
+  }
+  if (out) {
+    *out = (int64_t)value;
+  }
+  return 1;
+}
+
+static int cp_read_f64(FILE *fp, double *out, CpError *err) {
+  uint64_t bits = 0;
+  if (!cp_read_u64(fp, &bits, err)) {
+    return 0;
+  }
+  if (out) {
+    memcpy(out, &bits, sizeof(bits));
+  }
+  return 1;
+}
+
 typedef enum {
   CP_JSON_NULL = 0,
   CP_JSON_BOOL = 1,
@@ -9983,6 +10113,295 @@ CpDataFrame *cp_df_read_ndjson(const char *path,
   return df;
 }
 
+CpDataFrame *cp_df_read_cpd(const char *path, CpError *err) {
+  if (!path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
+    return NULL;
+  }
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return NULL;
+  }
+
+  unsigned char magic[4];
+  if (!cp_read_bytes(fp, magic, sizeof(magic), err, "failed to read cpd")) {
+    fclose(fp);
+    return NULL;
+  }
+  if (memcmp(magic, cp_cpd_magic, sizeof(magic)) != 0) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid cpd header");
+    return NULL;
+  }
+
+  uint32_t ncols_u32 = 0;
+  uint64_t nrows_u64 = 0;
+  if (!cp_read_u32(fp, &ncols_u32, err) ||
+      !cp_read_u64(fp, &nrows_u64, err)) {
+    fclose(fp);
+    return NULL;
+  }
+  if (ncols_u32 == 0) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid cpd column count");
+    return NULL;
+  }
+  if (nrows_u64 > (uint64_t)SIZE_MAX) {
+    fclose(fp);
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "cpd row count overflow");
+    return NULL;
+  }
+  size_t ncols = (size_t)ncols_u32;
+  size_t nrows = (size_t)nrows_u64;
+
+  char **names = (char **)calloc(ncols, sizeof(char *));
+  CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
+  if (!names || !dtypes) {
+    free(names);
+    free(dtypes);
+    fclose(fp);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t col = 0; col < ncols; ++col) {
+    uint32_t name_len = 0;
+    if (!cp_read_u32(fp, &name_len, err)) {
+      for (size_t i = 0; i < col; ++i) {
+        free(names[i]);
+      }
+      free(names);
+      free(dtypes);
+      fclose(fp);
+      return NULL;
+    }
+    if (name_len > 0) {
+      names[col] = (char *)malloc((size_t)name_len + 1);
+      if (!names[col]) {
+        for (size_t i = 0; i < col; ++i) {
+          free(names[i]);
+        }
+        free(names);
+        free(dtypes);
+        fclose(fp);
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return NULL;
+      }
+      if (!cp_read_bytes(fp, names[col], name_len, err, "failed to read cpd")) {
+        for (size_t i = 0; i <= col; ++i) {
+          free(names[i]);
+        }
+        free(names);
+        free(dtypes);
+        fclose(fp);
+        return NULL;
+      }
+      names[col][name_len] = '\0';
+    } else {
+      names[col] = cp_strdup("");
+      if (!names[col]) {
+        for (size_t i = 0; i < col; ++i) {
+          free(names[i]);
+        }
+        free(names);
+        free(dtypes);
+        fclose(fp);
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return NULL;
+      }
+    }
+    int dtype_byte = fgetc(fp);
+    if (dtype_byte == EOF) {
+      for (size_t i = 0; i <= col; ++i) {
+        free(names[i]);
+      }
+      free(names);
+      free(dtypes);
+      fclose(fp);
+      cp_error_set(err, CP_ERR_IO, 0, 0, "failed to read cpd");
+      return NULL;
+    }
+    switch (dtype_byte) {
+      case CP_DTYPE_INT64:
+      case CP_DTYPE_FLOAT64:
+      case CP_DTYPE_STRING:
+        dtypes[col] = (CpDType)dtype_byte;
+        break;
+      default:
+        for (size_t i = 0; i <= col; ++i) {
+          free(names[i]);
+        }
+        free(names);
+        free(dtypes);
+        fclose(fp);
+        cp_error_set(err, CP_ERR_PARSE, 0, col, "invalid cpd dtype");
+        return NULL;
+    }
+  }
+
+  const char **name_ptrs = (const char **)names;
+  CpDataFrame *df = cp_df_create(ncols, name_ptrs, dtypes, nrows, err);
+  for (size_t i = 0; i < ncols; ++i) {
+    free(names[i]);
+  }
+  free(names);
+  free(dtypes);
+
+  if (!df) {
+    fclose(fp);
+    return NULL;
+  }
+
+  for (size_t col = 0; col < ncols; ++col) {
+    CpSeries *series = df->cols[col];
+    if (!series) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series");
+      cp_df_free(df);
+      fclose(fp);
+      return NULL;
+    }
+    if (!cp_read_bytes(fp, series->is_null, nrows, err,
+                       "failed to read cpd")) {
+      cp_df_free(df);
+      fclose(fp);
+      return NULL;
+    }
+
+    switch (series->dtype) {
+      case CP_DTYPE_INT64: {
+        for (size_t row = 0; row < nrows; ++row) {
+          int64_t value = 0;
+          if (!cp_read_i64(fp, &value, err)) {
+            series->length = row;
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          series->data.i64[row] = value;
+          series->length = row + 1;
+        }
+        break;
+      }
+      case CP_DTYPE_FLOAT64: {
+        for (size_t row = 0; row < nrows; ++row) {
+          double value = 0.0;
+          if (!cp_read_f64(fp, &value, err)) {
+            series->length = row;
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          series->data.f64[row] = value;
+          series->length = row + 1;
+        }
+        break;
+      }
+      case CP_DTYPE_STRING: {
+        uint64_t total_bytes = 0;
+        if (!cp_read_u64(fp, &total_bytes, err)) {
+          cp_df_free(df);
+          fclose(fp);
+          return NULL;
+        }
+        if (nrows > 0 && nrows > SIZE_MAX / sizeof(uint64_t)) {
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          cp_df_free(df);
+          fclose(fp);
+          return NULL;
+        }
+        uint64_t *lengths =
+            (uint64_t *)calloc(nrows, sizeof(uint64_t));
+        if (nrows > 0 && !lengths) {
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          cp_df_free(df);
+          fclose(fp);
+          return NULL;
+        }
+        uint64_t length_sum = 0;
+        for (size_t row = 0; row < nrows; ++row) {
+          uint64_t len = 0;
+          if (!cp_read_u64(fp, &len, err)) {
+            free(lengths);
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          lengths[row] = len;
+          if (UINT64_MAX - length_sum < len) {
+            free(lengths);
+            cp_error_set(err, CP_ERR_PARSE, row, col, "cpd length overflow");
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          length_sum += len;
+        }
+        if (length_sum != total_bytes) {
+          free(lengths);
+          cp_error_set(err, CP_ERR_PARSE, 0, col, "cpd string size mismatch");
+          cp_df_free(df);
+          fclose(fp);
+          return NULL;
+        }
+        for (size_t row = 0; row < nrows; ++row) {
+          uint64_t len = lengths[row];
+          if (len > SIZE_MAX) {
+            free(lengths);
+            cp_error_set(err, CP_ERR_PARSE, row, col, "cpd string too large");
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          if (series->is_null[row]) {
+            if (len != 0) {
+              free(lengths);
+              cp_error_set(err, CP_ERR_PARSE, row, col,
+                           "cpd null string has data");
+              cp_df_free(df);
+              fclose(fp);
+              return NULL;
+            }
+            series->data.str[row] = NULL;
+            series->length = row + 1;
+            continue;
+          }
+          size_t len_sz = (size_t)len;
+          char *buf = (char *)malloc(len_sz + 1);
+          if (!buf) {
+            free(lengths);
+            cp_error_set(err, CP_ERR_OOM, row, col, "out of memory");
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          if (!cp_read_bytes(fp, buf, len_sz, err, "failed to read cpd")) {
+            free(buf);
+            free(lengths);
+            cp_df_free(df);
+            fclose(fp);
+            return NULL;
+          }
+          buf[len_sz] = '\0';
+          series->data.str[row] = buf;
+          series->length = row + 1;
+        }
+        free(lengths);
+        break;
+      }
+      default:
+        cp_error_set(err, CP_ERR_INVALID, 0, col, "unknown dtype");
+        cp_df_free(df);
+        fclose(fp);
+        return NULL;
+    }
+  }
+
+  df->nrows = nrows;
+  fclose(fp);
+  return df;
+}
+
 CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
   if (!path) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "path is required");
@@ -10377,6 +10796,141 @@ int cp_df_write_ndjson(const CpDataFrame *df,
       return 0;
     }
   }
+  fclose(fp);
+  return 1;
+}
+
+int cp_df_write_cpd(const CpDataFrame *df,
+                    const char *path,
+                    CpError *err) {
+  if (!df || !path) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid arguments");
+    return 0;
+  }
+  if (df->ncols == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "empty dataframe");
+    return 0;
+  }
+  if (df->ncols > UINT32_MAX) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "too many columns");
+    return 0;
+  }
+  FILE *fp = fopen(path, "wb");
+  if (!fp) {
+    cp_error_set(err, CP_ERR_IO, 0, 0, "failed to open file");
+    return 0;
+  }
+
+  if (!cp_write_bytes(fp, cp_cpd_magic, sizeof(cp_cpd_magic), err,
+                      "failed to write cpd") ||
+      !cp_write_u32(fp, (uint32_t)df->ncols, err) ||
+      !cp_write_u64(fp, (uint64_t)df->nrows, err)) {
+    fclose(fp);
+    return 0;
+  }
+
+  for (size_t col = 0; col < df->ncols; ++col) {
+    const char *name = df->cols[col]->name ? df->cols[col]->name : "";
+    size_t name_len = strlen(name);
+    if (name_len > UINT32_MAX) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "column name too long");
+      fclose(fp);
+      return 0;
+    }
+    if (!cp_write_u32(fp, (uint32_t)name_len, err) ||
+        !cp_write_bytes(fp, name, name_len, err, "failed to write cpd")) {
+      fclose(fp);
+      return 0;
+    }
+    if (fputc((unsigned char)df->cols[col]->dtype, fp) == EOF) {
+      cp_error_set(err, CP_ERR_IO, 0, col, "failed to write cpd");
+      fclose(fp);
+      return 0;
+    }
+  }
+
+  for (size_t col = 0; col < df->ncols; ++col) {
+    CpSeries *series = df->cols[col];
+    if (!series) {
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "invalid series");
+      fclose(fp);
+      return 0;
+    }
+    if (!cp_write_bytes(fp, series->is_null, df->nrows, err,
+                        "failed to write cpd")) {
+      fclose(fp);
+      return 0;
+    }
+    switch (series->dtype) {
+      case CP_DTYPE_INT64: {
+        for (size_t row = 0; row < df->nrows; ++row) {
+          if (!cp_write_i64(fp, series->data.i64[row], err)) {
+            fclose(fp);
+            return 0;
+          }
+        }
+        break;
+      }
+      case CP_DTYPE_FLOAT64: {
+        for (size_t row = 0; row < df->nrows; ++row) {
+          if (!cp_write_f64(fp, series->data.f64[row], err)) {
+            fclose(fp);
+            return 0;
+          }
+        }
+        break;
+      }
+      case CP_DTYPE_STRING: {
+        uint64_t total_bytes = 0;
+        for (size_t row = 0; row < df->nrows; ++row) {
+          if (series->is_null[row]) {
+            continue;
+          }
+          const char *value = series->data.str[row];
+          size_t len = value ? strlen(value) : 0;
+          if (UINT64_MAX - total_bytes < (uint64_t)len) {
+            cp_error_set(err, CP_ERR_INVALID, row, col,
+                         "string data too large");
+            fclose(fp);
+            return 0;
+          }
+          total_bytes += (uint64_t)len;
+        }
+        if (!cp_write_u64(fp, total_bytes, err)) {
+          fclose(fp);
+          return 0;
+        }
+        for (size_t row = 0; row < df->nrows; ++row) {
+          uint64_t len = 0;
+          if (!series->is_null[row]) {
+            const char *value = series->data.str[row];
+            len = value ? (uint64_t)strlen(value) : 0;
+          }
+          if (!cp_write_u64(fp, len, err)) {
+            fclose(fp);
+            return 0;
+          }
+        }
+        for (size_t row = 0; row < df->nrows; ++row) {
+          if (series->is_null[row]) {
+            continue;
+          }
+          const char *value = series->data.str[row];
+          size_t len = value ? strlen(value) : 0;
+          if (!cp_write_bytes(fp, value, len, err, "failed to write cpd")) {
+            fclose(fp);
+            return 0;
+          }
+        }
+        break;
+      }
+      default:
+        cp_error_set(err, CP_ERR_INVALID, 0, col, "unknown dtype");
+        fclose(fp);
+        return 0;
+    }
+  }
+
   fclose(fp);
   return 1;
 }
