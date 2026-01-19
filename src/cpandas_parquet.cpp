@@ -242,17 +242,18 @@ extern "C" CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
   }
   std::shared_ptr<arrow::io::ReadableFile> input = *input_result;
 
-  std::unique_ptr<parquet::arrow::FileReader> reader;
-  auto status =
-      parquet::arrow::OpenFile(input, arrow::default_memory_pool(), &reader);
-  if (!status.ok()) {
+  auto reader_result =
+      parquet::arrow::OpenFile(input, arrow::default_memory_pool());
+  if (!reader_result.ok()) {
     cp_error_set(err, CP_ERR_PARSE, 0, 0, "%s",
-                 status.ToString().c_str());
+                 reader_result.status().ToString().c_str());
     return NULL;
   }
+  std::unique_ptr<parquet::arrow::FileReader> reader =
+      std::move(reader_result).ValueOrDie();
 
   std::shared_ptr<arrow::Table> table;
-  status = reader->ReadTable(&table);
+  auto status = reader->ReadTable(&table);
   if (!status.ok() || !table) {
     cp_error_set(err, CP_ERR_PARSE, 0, 0, "%s",
                  status.ToString().c_str());
