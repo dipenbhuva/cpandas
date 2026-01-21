@@ -104,7 +104,7 @@ Indexing and missing values
   (e.g., forward/backward fill, interpolation).
 
 I/O and formats
-- Additional Parquet features (statistics, nested types, column encodings beyond dictionary).
+- Additional Parquet features (nested types, column encodings beyond dictionary).
 
 Performance and scalability
 - SIMD or parallel ops.
@@ -155,9 +155,10 @@ Advanced pandas features
 - `read_cpd`/`write_cpd` support a little-endian binary columnar format with
   schema, null masks, and per-column data blocks.
 - `read_parquet`/`write_parquet` implement a C-only subset: multiple row groups,
-  uncompressed/Snappy data pages, PLAIN and dictionary encodings, and primitive
-  types (int64, float64, string/UTF8) with optional nulls. GZIP compression is
-  supported when built with zlib and selected via `CPANDAS_PARQUET_CODEC=gzip`.
+  uncompressed/Snappy data pages, PLAIN and dictionary encodings, column
+  statistics (min/max/null_count), and primitive types (int64, float64,
+  string/UTF8) with optional nulls. GZIP compression is supported when built with
+  zlib and selected via `CPANDAS_PARQUET_CODEC=gzip`.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional

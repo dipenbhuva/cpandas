@@ -362,6 +362,26 @@ static int cp_compare_double(const void *a, const void *b) {
   return 0;
 }
 
+static int cp_compare_bytes(const unsigned char *a,
+                            size_t a_len,
+                            const unsigned char *b,
+                            size_t b_len) {
+  size_t min_len = a_len < b_len ? a_len : b_len;
+  if (min_len > 0) {
+    int cmp = memcmp(a, b, min_len);
+    if (cmp != 0) {
+      return cmp < 0 ? -1 : 1;
+    }
+  }
+  if (a_len < b_len) {
+    return -1;
+  }
+  if (a_len > b_len) {
+    return 1;
+  }
+  return 0;
+}
+
 static int cp_series_median(const CpSeries *series,
                             double *out,
                             size_t *out_count,
@@ -9582,6 +9602,19 @@ static int cp_thrift_write_field_binary(CpStrBuf *buf,
   return cp_thrift_write_binary(buf, bytes, len, err);
 }
 
+static int cp_thrift_write_field_binary_len(CpStrBuf *buf,
+                                            int16_t field_id,
+                                            const unsigned char *data,
+                                            size_t len,
+                                            int16_t *last_id,
+                                            CpError *err) {
+  if (!cp_thrift_write_field_begin(buf, CP_THRIFT_BINARY,
+                                   field_id, last_id, err)) {
+    return 0;
+  }
+  return cp_thrift_write_binary(buf, data, len, err);
+}
+
 static int cp_thrift_write_list_header(CpStrBuf *buf,
                                        uint8_t elem_type,
                                        size_t size,
@@ -11159,13 +11192,25 @@ typedef struct {
   int64_t total_compressed_size;
   int64_t total_uncompressed_size;
   int64_t num_values;
+  int64_t null_count;
   int encoding;
   int codec;
   int has_dictionary;
+  int has_statistics;
+  int has_min_max;
+  int64_t min_i64;
+  int64_t max_i64;
+  double min_f64;
+  double max_f64;
+  unsigned char *min_bytes;
+  size_t min_len;
+  unsigned char *max_bytes;
+  size_t max_len;
 } CpParquetColumnChunkMeta;
 
 typedef struct {
   CpParquetColumnChunkMeta *cols;
+  size_t ncols;
   int64_t num_rows;
   int64_t total_byte_size;
 } CpParquetRowGroupMeta;
@@ -11751,6 +11796,92 @@ static int cp_parquet_write_file_metadata(CpStrBuf *buf,
                                      &md_last, err)) {
         return 0;
       }
+      if (col->has_statistics) {
+        if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 8, &md_last,
+                                         err)) {
+          return 0;
+        }
+        int16_t stats_last = 0;
+        if (col->has_min_max) {
+          if (schema[i].dtype == CP_DTYPE_INT64) {
+            unsigned char min_buf[8];
+            unsigned char max_buf[8];
+            uint64_t min_val = (uint64_t)col->min_i64;
+            uint64_t max_val = (uint64_t)col->max_i64;
+            min_buf[0] = (unsigned char)(min_val & 0xffu);
+            min_buf[1] = (unsigned char)((min_val >> 8) & 0xffu);
+            min_buf[2] = (unsigned char)((min_val >> 16) & 0xffu);
+            min_buf[3] = (unsigned char)((min_val >> 24) & 0xffu);
+            min_buf[4] = (unsigned char)((min_val >> 32) & 0xffu);
+            min_buf[5] = (unsigned char)((min_val >> 40) & 0xffu);
+            min_buf[6] = (unsigned char)((min_val >> 48) & 0xffu);
+            min_buf[7] = (unsigned char)((min_val >> 56) & 0xffu);
+            max_buf[0] = (unsigned char)(max_val & 0xffu);
+            max_buf[1] = (unsigned char)((max_val >> 8) & 0xffu);
+            max_buf[2] = (unsigned char)((max_val >> 16) & 0xffu);
+            max_buf[3] = (unsigned char)((max_val >> 24) & 0xffu);
+            max_buf[4] = (unsigned char)((max_val >> 32) & 0xffu);
+            max_buf[5] = (unsigned char)((max_val >> 40) & 0xffu);
+            max_buf[6] = (unsigned char)((max_val >> 48) & 0xffu);
+            max_buf[7] = (unsigned char)((max_val >> 56) & 0xffu);
+            if (!cp_thrift_write_field_binary_len(buf, 1, min_buf,
+                                                  sizeof(min_buf),
+                                                  &stats_last, err) ||
+                !cp_thrift_write_field_binary_len(buf, 2, max_buf,
+                                                  sizeof(max_buf),
+                                                  &stats_last, err)) {
+              return 0;
+            }
+          } else if (schema[i].dtype == CP_DTYPE_FLOAT64) {
+            unsigned char min_buf[8];
+            unsigned char max_buf[8];
+            uint64_t min_bits = 0;
+            uint64_t max_bits = 0;
+            memcpy(&min_bits, &col->min_f64, sizeof(min_bits));
+            memcpy(&max_bits, &col->max_f64, sizeof(max_bits));
+            min_buf[0] = (unsigned char)(min_bits & 0xffu);
+            min_buf[1] = (unsigned char)((min_bits >> 8) & 0xffu);
+            min_buf[2] = (unsigned char)((min_bits >> 16) & 0xffu);
+            min_buf[3] = (unsigned char)((min_bits >> 24) & 0xffu);
+            min_buf[4] = (unsigned char)((min_bits >> 32) & 0xffu);
+            min_buf[5] = (unsigned char)((min_bits >> 40) & 0xffu);
+            min_buf[6] = (unsigned char)((min_bits >> 48) & 0xffu);
+            min_buf[7] = (unsigned char)((min_bits >> 56) & 0xffu);
+            max_buf[0] = (unsigned char)(max_bits & 0xffu);
+            max_buf[1] = (unsigned char)((max_bits >> 8) & 0xffu);
+            max_buf[2] = (unsigned char)((max_bits >> 16) & 0xffu);
+            max_buf[3] = (unsigned char)((max_bits >> 24) & 0xffu);
+            max_buf[4] = (unsigned char)((max_bits >> 32) & 0xffu);
+            max_buf[5] = (unsigned char)((max_bits >> 40) & 0xffu);
+            max_buf[6] = (unsigned char)((max_bits >> 48) & 0xffu);
+            max_buf[7] = (unsigned char)((max_bits >> 56) & 0xffu);
+            if (!cp_thrift_write_field_binary_len(buf, 1, min_buf,
+                                                  sizeof(min_buf),
+                                                  &stats_last, err) ||
+                !cp_thrift_write_field_binary_len(buf, 2, max_buf,
+                                                  sizeof(max_buf),
+                                                  &stats_last, err)) {
+              return 0;
+            }
+          } else if (schema[i].dtype == CP_DTYPE_STRING) {
+            if (!cp_thrift_write_field_binary_len(buf, 1, col->min_bytes,
+                                                  col->min_len, &stats_last,
+                                                  err) ||
+                !cp_thrift_write_field_binary_len(buf, 2, col->max_bytes,
+                                                  col->max_len, &stats_last,
+                                                  err)) {
+              return 0;
+            }
+          }
+        }
+        if (!cp_thrift_write_field_i64(buf, 3, col->null_count, &stats_last,
+                                       err)) {
+          return 0;
+        }
+        if (!cp_thrift_write_stop(buf, err)) {
+          return 0;
+        }
+      }
       if (!cp_thrift_write_field_i64(buf, 9, col->data_page_offset,
                                      &md_last, err)) {
         return 0;
@@ -11791,6 +11922,14 @@ static void cp_parquet_row_groups_free(CpParquetRowGroupMeta *groups,
     return;
   }
   for (size_t i = 0; i < count; ++i) {
+    if (groups[i].cols) {
+      for (size_t j = 0; j < groups[i].ncols; ++j) {
+        free(groups[i].cols[j].min_bytes);
+        free(groups[i].cols[j].max_bytes);
+        groups[i].cols[j].min_bytes = NULL;
+        groups[i].cols[j].max_bytes = NULL;
+      }
+    }
     free(groups[i].cols);
     groups[i].cols = NULL;
   }
@@ -15635,6 +15774,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
       rg_rows = row_group_size;
     }
     row_groups[rg].num_rows = (int64_t)rg_rows;
+    row_groups[rg].ncols = ncols;
     row_groups[rg].cols =
         (CpParquetColumnChunkMeta *)calloc(ncols,
                                            sizeof(CpParquetColumnChunkMeta));
@@ -15657,6 +15797,17 @@ int cp_df_write_parquet(const CpDataFrame *df,
       col_meta->dictionary_page_offset = -1;
       col_meta->has_dictionary = 0;
       col_meta->encoding = CP_PARQUET_ENC_PLAIN;
+      col_meta->has_statistics = 1;
+      col_meta->has_min_max = 0;
+      col_meta->null_count = 0;
+      col_meta->min_i64 = 0;
+      col_meta->max_i64 = 0;
+      col_meta->min_f64 = 0.0;
+      col_meta->max_f64 = 0.0;
+      col_meta->min_bytes = NULL;
+      col_meta->max_bytes = NULL;
+      col_meta->min_len = 0;
+      col_meta->max_len = 0;
 
       uint8_t *def_levels = NULL;
       size_t non_null = rg_rows;
@@ -15719,6 +15870,11 @@ int cp_df_write_parquet(const CpDataFrame *df,
       }
 
       int parquet_type = cp_parquet_type_for_dtype(series->dtype);
+      int has_minmax = 0;
+      int64_t min_i64 = 0;
+      int64_t max_i64 = 0;
+      double min_f64 = 0.0;
+      double max_f64 = 0.0;
       for (size_t row = 0; row < rg_rows; ++row) {
         size_t src_row = rg_start + row;
         if (schema[col].max_def_level > 0 && series->is_null[src_row]) {
@@ -15727,6 +15883,18 @@ int cp_df_write_parquet(const CpDataFrame *df,
         switch (parquet_type) {
           case CP_PARQUET_TYPE_INT64: {
             int64_t value = series->data.i64[src_row];
+            if (!has_minmax) {
+              min_i64 = value;
+              max_i64 = value;
+              has_minmax = 1;
+            } else {
+              if (value < min_i64) {
+                min_i64 = value;
+              }
+              if (value > max_i64) {
+                max_i64 = value;
+              }
+            }
             if (!cp_parquet_buf_append_u64(&values_buf,
                                            (uint64_t)value, err)) {
               cp_parquet_dict_index_free(&dict_index);
@@ -15753,6 +15921,20 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           case CP_PARQUET_TYPE_DOUBLE: {
             double value = series->data.f64[src_row];
+            if (!isnan(value)) {
+              if (!has_minmax) {
+                min_f64 = value;
+                max_f64 = value;
+                has_minmax = 1;
+              } else {
+                if (value < min_f64) {
+                  min_f64 = value;
+                }
+                if (value > max_f64) {
+                  max_f64 = value;
+                }
+              }
+            }
             if (!cp_parquet_buf_append_f64(&values_buf, value, err)) {
               cp_parquet_dict_index_free(&dict_index);
               free(indices);
@@ -15782,6 +15964,83 @@ int cp_df_write_parquet(const CpDataFrame *df,
               value = "";
             }
             size_t len = strlen(value);
+            if (!has_minmax) {
+              unsigned char *copy_min = NULL;
+              unsigned char *copy_max = NULL;
+              if (len > 0) {
+                copy_min = (unsigned char *)malloc(len);
+                if (!copy_min) {
+                  cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+                  cp_parquet_dict_index_free(&dict_index);
+                  free(indices);
+                  cp_strbuf_free(&values_buf);
+                  free(def_levels);
+                  goto cleanup;
+                }
+                memcpy(copy_min, value, len);
+                copy_max = (unsigned char *)malloc(len);
+                if (!copy_max) {
+                  free(copy_min);
+                  cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+                  cp_parquet_dict_index_free(&dict_index);
+                  free(indices);
+                  cp_strbuf_free(&values_buf);
+                  free(def_levels);
+                  goto cleanup;
+                }
+                memcpy(copy_max, value, len);
+              }
+              col_meta->min_bytes = copy_min;
+              col_meta->max_bytes = copy_max;
+              col_meta->min_len = len;
+              col_meta->max_len = len;
+              has_minmax = 1;
+            } else {
+              int cmp_min = cp_compare_bytes(
+                  (const unsigned char *)value, len,
+                  col_meta->min_bytes ? col_meta->min_bytes : (const unsigned char *)"",
+                  col_meta->min_len);
+              int cmp_max = cp_compare_bytes(
+                  (const unsigned char *)value, len,
+                  col_meta->max_bytes ? col_meta->max_bytes : (const unsigned char *)"",
+                  col_meta->max_len);
+              if (cmp_min < 0) {
+                unsigned char *copy = NULL;
+                if (len > 0) {
+                  copy = (unsigned char *)malloc(len);
+                  if (!copy) {
+                    cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+                    cp_parquet_dict_index_free(&dict_index);
+                    free(indices);
+                    cp_strbuf_free(&values_buf);
+                    free(def_levels);
+                    goto cleanup;
+                  }
+                  memcpy(copy, value, len);
+                }
+                free(col_meta->min_bytes);
+                col_meta->min_bytes = copy;
+                col_meta->min_len = len;
+              }
+              if (cmp_max > 0) {
+                unsigned char *copy = NULL;
+                if (len > 0) {
+                  copy = (unsigned char *)malloc(len);
+                  if (!copy) {
+                    cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+                    cp_parquet_dict_index_free(&dict_index);
+                    free(indices);
+                    cp_strbuf_free(&values_buf);
+                    free(def_levels);
+                    goto cleanup;
+                  }
+                  memcpy(copy, value, len);
+                }
+                free(col_meta->max_bytes);
+                col_meta->max_bytes = copy;
+                col_meta->max_len = len;
+              }
+            }
             if (len > UINT32_MAX) {
               cp_error_set(err, CP_ERR_INVALID, src_row, col,
                            "string too large");
@@ -15824,6 +16083,17 @@ int cp_df_write_parquet(const CpDataFrame *df,
             cp_strbuf_free(&values_buf);
             free(def_levels);
             goto cleanup;
+        }
+      }
+      col_meta->null_count = (int64_t)(rg_rows - non_null);
+      if (has_minmax) {
+        col_meta->has_min_max = 1;
+        if (parquet_type == CP_PARQUET_TYPE_INT64) {
+          col_meta->min_i64 = min_i64;
+          col_meta->max_i64 = max_i64;
+        } else if (parquet_type == CP_PARQUET_TYPE_DOUBLE) {
+          col_meta->min_f64 = min_f64;
+          col_meta->max_f64 = max_f64;
         }
       }
       if (dict_index_init && index_pos != non_null) {

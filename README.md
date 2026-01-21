@@ -56,11 +56,11 @@ typed, columnar data with null masks. It is intended for C-to-C workflows.
 
 cpandas supports a C-only Parquet subset: multiple row groups, uncompressed or
 Snappy-compressed data pages, PLAIN and dictionary encodings, and primitive
-columns (int64, float64, string/UTF8) with optional nulls. Dictionary encoding
-is applied when it reduces size. GZIP compression is available when built with
-zlib and can be selected with `CPANDAS_PARQUET_CODEC=gzip`. Nested schemas,
-statistics, and complex types are not supported yet. The default row-group size
-is 65,536 rows.
+columns (int64, float64, string/UTF8) with optional nulls. Column statistics
+(min/max/null_count) are written for each column chunk. Dictionary encoding is
+applied when it reduces size. GZIP compression is available when built with zlib
+and can be selected with `CPANDAS_PARQUET_CODEC=gzip`. Nested schemas and complex
+types are not supported yet. The default row-group size is 65,536 rows.
 
 ## Repo metadata (SEO)
 
