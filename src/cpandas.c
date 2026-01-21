@@ -10681,10 +10681,6 @@ static int cp_parquet_decode_levels(const unsigned char *data,
         return 0;
       }
       size_t value_count = (size_t)groups * 8;
-      if (out_idx + value_count > count) {
-        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
-        return 0;
-      }
       size_t bits_needed = value_count * (size_t)bit_width;
       size_t bytes_needed = (bits_needed + 7) / 8;
       if (pos + bytes_needed > data_len) {
@@ -10707,7 +10703,9 @@ static int cp_parquet_decode_levels(const unsigned char *data,
           cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def level");
           return 0;
         }
-        out[out_idx++] = value;
+        if (out_idx < count) {
+          out[out_idx++] = value;
+        }
       }
     } else {
       uint64_t run = header >> 1;
@@ -10835,10 +10833,6 @@ static int cp_parquet_decode_indices(const unsigned char *data,
         return 0;
       }
       size_t value_count = (size_t)groups * 8;
-      if (out_idx + value_count > count) {
-        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
-        return 0;
-      }
       size_t bits_needed = value_count * (size_t)bit_width;
       size_t bytes_needed = (bits_needed + 7) / 8;
       if (pos + bytes_needed > data_len) {
@@ -10861,7 +10855,9 @@ static int cp_parquet_decode_indices(const unsigned char *data,
           cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index value");
           return 0;
         }
-        out[out_idx++] = value;
+        if (out_idx < count) {
+          out[out_idx++] = value;
+        }
       }
     } else {
       uint64_t run = header >> 1;
