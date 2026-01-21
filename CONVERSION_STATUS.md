@@ -52,6 +52,7 @@ Data cleaning
 - Null mask extraction.
 - dropna (remove rows with any nulls).
 - fillna (per-column fill values).
+- fillna strategies (per-column: value/zero/min/max/mean/median).
 
 Validation and tooling
 - Unit tests for CSV parsing/writing, error cases, and aggregations.
@@ -98,8 +99,8 @@ Joins
 - Join performance tuning (parallelism, memory).
 
 Indexing and missing values
-- Missing value handling beyond blank/whitespace parsing and null flags
-  (e.g., column-wise strategies).
+- Missing value handling beyond per-column fill strategies
+  (e.g., forward/backward fill, interpolation).
 
 I/O and formats
 - Additional Parquet features (statistics, nested types, column encodings beyond dictionary).
@@ -136,6 +137,8 @@ Advanced pandas features
 - `to_datetime` parses `YYYY-MM-DD` or `YYYY/MM/DD` with optional
   `HH:MM[:SS][.fff]` time and optional `Z` or `±HH:MM` offsets into int64 epoch
   seconds (UTC); blanks are nulls.
+- `fillna_strategy` supports per-column strategies; mean/median only apply to
+  float64 columns, while min/max/zero apply to numeric columns.
 - `to_string` renders a space-aligned table with `null` for nulls.
 - `to_sql` writes a SQL script (CREATE TABLE + INSERT statements) with identifiers
   quoted and string values escaped via doubled single quotes.
