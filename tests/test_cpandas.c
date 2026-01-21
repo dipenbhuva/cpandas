@@ -877,6 +877,84 @@ static void test_parquet_io(void) {
   cp_df_free(df);
 }
 
+static void test_parquet_delta_encoding(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+#ifdef _WIN32
+  (void)err;
+  return;
+#else
+  const char *prev = getenv("CPANDAS_PARQUET_ENCODING");
+  char *prev_copy = prev ? dup_string(prev) : NULL;
+  setenv("CPANDAS_PARQUET_ENCODING", "delta", 1);
+
+  const char *names[] = {"id"};
+  CpDType dtypes[] = {CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(1, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    if (prev_copy) {
+      setenv("CPANDAS_PARQUET_ENCODING", prev_copy, 1);
+      free(prev_copy);
+    } else {
+      unsetenv("CPANDAS_PARQUET_ENCODING");
+    }
+    return;
+  }
+
+  for (size_t i = 0; i < 2000; ++i) {
+    char buf[32];
+    const char *value = "";
+    if (i % 11 != 0) {
+      snprintf(buf, sizeof(buf), "%zu", i + 100);
+      value = buf;
+    }
+    const char *row[] = {value};
+    CHECK(cp_df_append_row(df, row, 1, &err));
+  }
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (path) {
+    cp_error_clear(&err);
+    CHECK(cp_df_write_parquet(df, path, &err));
+    cp_error_clear(&err);
+    CpDataFrame *df2 = cp_df_read_parquet(path, &err);
+    CHECK(df2 != NULL);
+    if (df2) {
+      const CpSeries *id = cp_df_get_col(df2, "id");
+      CHECK(id != NULL);
+      if (id) {
+        size_t probe_rows[] = {0, 1, 10, 11, 1999};
+        for (size_t i = 0; i < 5; ++i) {
+          size_t row = probe_rows[i];
+          int64_t id_val = 0;
+          int is_null = 0;
+          CHECK(cp_series_get_int64(id, row, &id_val, &is_null));
+          if (row % 11 == 0) {
+            CHECK(is_null);
+          } else {
+            CHECK(!is_null && id_val == (int64_t)(row + 100));
+          }
+        }
+      }
+      cp_df_free(df2);
+    }
+    remove(path);
+    free(path);
+  }
+  cp_df_free(df);
+
+  if (prev_copy) {
+    setenv("CPANDAS_PARQUET_ENCODING", prev_copy, 1);
+    free(prev_copy);
+  } else {
+    unsetenv("CPANDAS_PARQUET_ENCODING");
+  }
+#endif
+}
+
 static void test_plot(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5073,6 +5151,7 @@ int main(void) {
   test_ndjson_io();
   test_cpd_io();
   test_parquet_io();
+  test_parquet_delta_encoding();
   test_plot();
   test_write_csv_header();
   test_append_row_errors();
