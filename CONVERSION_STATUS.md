@@ -142,7 +142,7 @@ Advanced pandas features
   float64 columns by default. `fillna_strategy_round` allows int64 mean/median
   with explicit rounding (nearest/floor/ceil/trunc). min/max/zero apply to numeric
   columns, ffill/bfill work across numeric/string columns, and interp fills
-  interior numeric gaps (int64 rounds to nearest with `llround`).
+  interior numeric gaps with configurable rounding for int64.
 - `to_string` renders a space-aligned table with `null` for nulls.
 - `to_sql` writes a SQL script (CREATE TABLE + INSERT statements) with identifiers
   quoted and string values escaped via doubled single quotes.

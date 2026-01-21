@@ -3703,8 +3703,14 @@ static int cp_fill_plan_build_bfill(const CpSeries *series,
   return 1;
 }
 
+static int cp_round_to_int64(double value,
+                             CpRoundMode mode,
+                             int64_t *out,
+                             CpError *err);
+
 static int cp_fill_plan_build_interp(const CpSeries *series,
                                      CpFillPlan *plan,
+                                     CpRoundMode round_mode,
                                      CpError *err) {
   if (!series || !plan) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid fill plan");
@@ -3775,14 +3781,9 @@ static int cp_fill_plan_build_interp(const CpSeries *series,
       double v = left_val + delta * t;
       plan->interp_valid[i] = 1;
       if (series->dtype == CP_DTYPE_INT64) {
-        long long rounded = llround(v);
-        if (rounded < (long long)INT64_MIN ||
-            rounded > (long long)INT64_MAX) {
-          cp_error_set(err, CP_ERR_INVALID, 0, 0,
-                       "interpolation overflow");
+        if (!cp_round_to_int64(v, round_mode, &plan->interp_i64[i], err)) {
           return 0;
         }
-        plan->interp_i64[i] = (int64_t)rounded;
       } else {
         plan->interp_f64[i] = v;
       }
@@ -4336,7 +4337,7 @@ static CpDataFrame *cp_df_fillna_strategy_impl(const CpDataFrame *df,
         }
         break;
       case CP_FILL_INTERP:
-        if (!cp_fill_plan_build_interp(series, plan, err)) {
+        if (!cp_fill_plan_build_interp(series, plan, round_mode, err)) {
           goto cleanup;
         }
         break;

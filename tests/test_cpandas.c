@@ -2092,6 +2092,61 @@ static void test_fillna_interpolate(void) {
   cp_df_free(df);
 }
 
+static void test_fillna_interpolate_rounding(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a"};
+  CpDType dtypes[] = {CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(1, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"0"};
+  const char *row2[] = {""};
+  const char *row3[] = {""};
+  const char *row4[] = {"10"};
+  CHECK(cp_df_append_row(df, row1, 1, &err));
+  CHECK(cp_df_append_row(df, row2, 1, &err));
+  CHECK(cp_df_append_row(df, row3, 1, &err));
+  CHECK(cp_df_append_row(df, row4, 1, &err));
+
+  CpFillStrategy interp[] = {CP_FILL_INTERP};
+  CpDataFrame *floor_df =
+      cp_df_fillna_strategy_round(df, interp, NULL, 1, CP_ROUND_FLOOR, &err);
+  CHECK(floor_df != NULL);
+  if (floor_df) {
+    const CpSeries *a = cp_df_get_col(floor_df, "a");
+    CHECK(a != NULL);
+    int64_t v = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(a, 1, &v, &is_null));
+    CHECK(!is_null && v == 3);
+    CHECK(cp_series_get_int64(a, 2, &v, &is_null));
+    CHECK(!is_null && v == 6);
+    cp_df_free(floor_df);
+  }
+
+  CpDataFrame *ceil_df =
+      cp_df_fillna_strategy_round(df, interp, NULL, 1, CP_ROUND_CEIL, &err);
+  CHECK(ceil_df != NULL);
+  if (ceil_df) {
+    const CpSeries *a = cp_df_get_col(ceil_df, "a");
+    CHECK(a != NULL);
+    int64_t v = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(a, 1, &v, &is_null));
+    CHECK(!is_null && v == 4);
+    CHECK(cp_series_get_int64(a, 2, &v, &is_null));
+    CHECK(!is_null && v == 7);
+    cp_df_free(ceil_df);
+  }
+
+  cp_df_free(df);
+}
+
 static void test_fillna_rounding_int64(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5034,6 +5089,7 @@ int main(void) {
   test_fillna_strategy();
   test_fillna_ffill_bfill();
   test_fillna_interpolate();
+  test_fillna_interpolate_rounding();
   test_fillna_rounding_int64();
   test_series_ffill_bfill();
   test_unique_counts_int64();
