@@ -1869,6 +1869,68 @@ static void test_dtypes_and_rename_drop_fill(void) {
   cp_df_free(df);
 }
 
+static void test_fillna_strategy(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a", "b", "c"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "1.5", "x"};
+  const char *row2[] = {"", "", ""};
+  const char *row3[] = {"3", "2.5", "y"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  CpFillStrategy strategies[] = {
+      CP_FILL_MIN,
+      CP_FILL_MEAN,
+      CP_FILL_VALUE
+  };
+  const char *fill_values[] = {NULL, NULL, "unknown"};
+  CpDataFrame *filled =
+      cp_df_fillna_strategy(df, strategies, fill_values, 3, &err);
+  CHECK(filled != NULL);
+  if (filled) {
+    const CpSeries *a = cp_df_get_col(filled, "a");
+    const CpSeries *b = cp_df_get_col(filled, "b");
+    const CpSeries *c = cp_df_get_col(filled, "c");
+    CHECK(a && b && c);
+
+    int64_t a_val = 0;
+    double b_val = 0.0;
+    const char *c_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(a, 1, &a_val, &is_null));
+    CHECK(!is_null && a_val == 1);
+    CHECK(cp_series_get_float64(b, 1, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 2.0) < 1e-9);
+    CHECK(cp_series_get_string(c, 1, &c_val, &is_null));
+    CHECK(!is_null && strcmp(c_val, "unknown") == 0);
+    cp_df_free(filled);
+  }
+
+  cp_error_clear(&err);
+  CpFillStrategy bad_strategies[] = {
+      CP_FILL_MEAN,
+      CP_FILL_NONE,
+      CP_FILL_NONE
+  };
+  CpDataFrame *bad =
+      cp_df_fillna_strategy(df, bad_strategies, NULL, 3, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_df_free(df);
+}
+
 static void test_unique_counts_int64(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4707,6 +4769,7 @@ int main(void) {
   test_head_tail();
   test_metadata_helpers();
   test_dtypes_and_rename_drop_fill();
+  test_fillna_strategy();
   test_unique_counts_int64();
   test_unique_counts_string();
   test_sample();

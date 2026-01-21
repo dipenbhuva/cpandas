@@ -3594,6 +3594,97 @@ CpDataFrame *cp_df_dropna(const CpDataFrame *df, CpError *err) {
   return out;
 }
 
+static CpDataFrame *cp_df_fillna_apply(const CpDataFrame *df,
+                                       const int *fill_enabled,
+                                       const int64_t *fill_i64,
+                                       const double *fill_f64,
+                                       const char **fill_str,
+                                       CpError *err) {
+  if (!df || !fill_enabled || !fill_i64 || !fill_f64 || !fill_str) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid fillna arguments");
+    return NULL;
+  }
+
+  size_t ncols = df->ncols;
+  size_t nrows = df->nrows;
+  CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
+  const char **names = (const char **)malloc(ncols * sizeof(const char *));
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(ncols * sizeof(const CpSeries *));
+  if (!dtypes || !names || !src_cols) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t col = 0; col < ncols; ++col) {
+    src_cols[col] = df->cols[col];
+    names[col] = df->cols[col]->name;
+    dtypes[col] = df->cols[col]->dtype;
+  }
+
+  CpDataFrame *out = cp_df_create(ncols, names, dtypes, nrows, err);
+  if (!out) {
+    free(dtypes);
+    free(names);
+    free(src_cols);
+    return NULL;
+  }
+
+  for (size_t row = 0; row < nrows; ++row) {
+    for (size_t col = 0; col < ncols; ++col) {
+      CpSeries *dest = out->cols[col];
+      const CpSeries *src = src_cols[col];
+      if (src->is_null[row] && fill_enabled[col]) {
+        int ok = 0;
+        switch (src->dtype) {
+          case CP_DTYPE_INT64:
+            ok = cp_series_append_int64(dest, fill_i64[col], 0, err);
+            break;
+          case CP_DTYPE_FLOAT64:
+            ok = cp_series_append_float64(dest, fill_f64[col], 0, err);
+            break;
+          case CP_DTYPE_STRING:
+            ok = cp_series_append_string(dest, fill_str[col], 0, err);
+            break;
+          default:
+            ok = 0;
+            cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
+            break;
+        }
+        if (!ok) {
+          for (size_t j = 0; j < col; ++j) {
+            cp_series_pop(out->cols[j]);
+          }
+          cp_df_free(out);
+          out = NULL;
+          break;
+        }
+      } else {
+        if (!cp_series_append_from(dest, src, row, err)) {
+          for (size_t j = 0; j < col; ++j) {
+            cp_series_pop(out->cols[j]);
+          }
+          cp_df_free(out);
+          out = NULL;
+          break;
+        }
+      }
+    }
+    if (!out) {
+      break;
+    }
+    out->nrows += 1;
+  }
+
+  free(dtypes);
+  free(names);
+  free(src_cols);
+  return out;
+}
+
 CpDataFrame *cp_df_fillna(const CpDataFrame *df,
                           const char **values,
                           size_t count,
@@ -3608,7 +3699,6 @@ CpDataFrame *cp_df_fillna(const CpDataFrame *df,
   }
 
   size_t ncols = df->ncols;
-  size_t nrows = df->nrows;
   int *fill_enabled = (int *)calloc(ncols, sizeof(int));
   int64_t *fill_i64 = (int64_t *)calloc(ncols, sizeof(int64_t));
   double *fill_f64 = (double *)calloc(ncols, sizeof(double));
@@ -3686,14 +3776,36 @@ CpDataFrame *cp_df_fillna(const CpDataFrame *df,
     }
   }
 
-  CpDType *dtypes = (CpDType *)malloc(ncols * sizeof(CpDType));
-  const char **names = (const char **)malloc(ncols * sizeof(const char *));
-  const CpSeries **src_cols =
-      (const CpSeries **)malloc(ncols * sizeof(const CpSeries *));
-  if (!dtypes || !names || !src_cols) {
-    free(dtypes);
-    free(names);
-    free(src_cols);
+  CpDataFrame *out =
+      cp_df_fillna_apply(df, fill_enabled, fill_i64, fill_f64, fill_str, err);
+  free(fill_enabled);
+  free(fill_i64);
+  free(fill_f64);
+  free(fill_str);
+  return out;
+}
+
+CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
+                                   const CpFillStrategy *strategies,
+                                   const char **values,
+                                   size_t count,
+                                   CpError *err) {
+  if (!df || !strategies) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid fillna arguments");
+    return NULL;
+  }
+  if (count != df->ncols) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "fill strategy count mismatch");
+    return NULL;
+  }
+
+  size_t ncols = df->ncols;
+  int *fill_enabled = (int *)calloc(ncols, sizeof(int));
+  int64_t *fill_i64 = (int64_t *)calloc(ncols, sizeof(int64_t));
+  double *fill_f64 = (double *)calloc(ncols, sizeof(double));
+  const char **fill_str =
+      (const char **)calloc(ncols, sizeof(const char *));
+  if (!fill_enabled || !fill_i64 || !fill_f64 || !fill_str) {
     free(fill_enabled);
     free(fill_i64);
     free(fill_f64);
@@ -3703,77 +3815,152 @@ CpDataFrame *cp_df_fillna(const CpDataFrame *df,
   }
 
   for (size_t col = 0; col < ncols; ++col) {
-    src_cols[col] = df->cols[col];
-    names[col] = df->cols[col]->name;
-    dtypes[col] = df->cols[col]->dtype;
-  }
-
-  CpDataFrame *out = cp_df_create(ncols, names, dtypes, nrows, err);
-  if (!out) {
-    free(dtypes);
-    free(names);
-    free(src_cols);
-    free(fill_enabled);
-    free(fill_i64);
-    free(fill_f64);
-    free(fill_str);
-    return NULL;
-  }
-
-  for (size_t row = 0; row < nrows; ++row) {
-    for (size_t col = 0; col < ncols; ++col) {
-      CpSeries *dest = out->cols[col];
-      const CpSeries *src = src_cols[col];
-      if (src->is_null[row] && fill_enabled[col]) {
-        int ok = 0;
-        switch (src->dtype) {
-          case CP_DTYPE_INT64:
-            ok = cp_series_append_int64(dest, fill_i64[col], 0, err);
-            break;
-          case CP_DTYPE_FLOAT64:
-            ok = cp_series_append_float64(dest, fill_f64[col], 0, err);
-            break;
-          case CP_DTYPE_STRING:
-            ok = cp_series_append_string(dest, fill_str[col], 0, err);
-            break;
-          default:
-            ok = 0;
-            cp_error_set(err, CP_ERR_INVALID, row, col, "unknown dtype");
-            break;
+    CpSeries *series = df->cols[col];
+    CpFillStrategy strategy = strategies[col];
+    int is_null = 0;
+    switch (strategy) {
+      case CP_FILL_NONE:
+        fill_enabled[col] = 0;
+        break;
+      case CP_FILL_VALUE:
+        if (!values || !values[col]) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "fill value required");
+          goto cleanup;
         }
-        if (!ok) {
-          for (size_t j = 0; j < col; ++j) {
-            cp_series_pop(out->cols[j]);
+        fill_enabled[col] = 1;
+        if (series->dtype == CP_DTYPE_INT64) {
+          int64_t v = 0;
+          if (!cp_parse_int64(values[col], &v, &is_null, err, 0, col)) {
+            goto cleanup;
           }
-          cp_df_free(out);
-          out = NULL;
-          break;
-        }
-      } else {
-        if (!cp_series_append_from(dest, src, row, err)) {
-          for (size_t j = 0; j < col; ++j) {
-            cp_series_pop(out->cols[j]);
+          if (is_null) {
+            cp_error_set(err, CP_ERR_INVALID, 0, col,
+                         "fill value is null");
+            goto cleanup;
           }
-          cp_df_free(out);
-          out = NULL;
-          break;
+          fill_i64[col] = v;
+        } else if (series->dtype == CP_DTYPE_FLOAT64) {
+          double v = 0.0;
+          if (!cp_parse_float64(values[col], &v, &is_null, err, 0, col)) {
+            goto cleanup;
+          }
+          if (is_null) {
+            cp_error_set(err, CP_ERR_INVALID, 0, col,
+                         "fill value is null");
+            goto cleanup;
+          }
+          fill_f64[col] = v;
+        } else if (series->dtype == CP_DTYPE_STRING) {
+          fill_str[col] = values[col];
+        } else {
+          cp_error_set(err, CP_ERR_INVALID, 0, col, "unknown dtype");
+          goto cleanup;
         }
+        break;
+      case CP_FILL_ZERO:
+        if (series->dtype == CP_DTYPE_INT64) {
+          fill_i64[col] = 0;
+        } else if (series->dtype == CP_DTYPE_FLOAT64) {
+          fill_f64[col] = 0.0;
+        } else {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "zero fill only supported for numeric columns");
+          goto cleanup;
+        }
+        fill_enabled[col] = 1;
+        break;
+      case CP_FILL_MEAN: {
+        if (series->dtype == CP_DTYPE_STRING) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "mean fill not supported for strings");
+          goto cleanup;
+        }
+        if (series->dtype == CP_DTYPE_INT64) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "mean fill not supported for int64");
+          goto cleanup;
+        }
+        double mean = 0.0;
+        if (!cp_series_mean(series, &mean, NULL, NULL, err)) {
+          goto cleanup;
+        }
+        fill_f64[col] = mean;
+        fill_enabled[col] = 1;
+        break;
       }
+      case CP_FILL_MEDIAN: {
+        if (series->dtype == CP_DTYPE_STRING) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "median fill not supported for strings");
+          goto cleanup;
+        }
+        if (series->dtype == CP_DTYPE_INT64) {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "median fill not supported for int64");
+          goto cleanup;
+        }
+        double median = 0.0;
+        if (!cp_series_median(series, &median, NULL, NULL, err)) {
+          goto cleanup;
+        }
+        fill_f64[col] = median;
+        fill_enabled[col] = 1;
+        break;
+      }
+      case CP_FILL_MIN:
+        if (series->dtype == CP_DTYPE_INT64) {
+          if (!cp_series_min_int64(series, &fill_i64[col], NULL, err)) {
+            goto cleanup;
+          }
+        } else if (series->dtype == CP_DTYPE_FLOAT64) {
+          if (!cp_series_min_float64(series, &fill_f64[col], NULL, err)) {
+            goto cleanup;
+          }
+        } else {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "min fill only supported for numeric columns");
+          goto cleanup;
+        }
+        fill_enabled[col] = 1;
+        break;
+      case CP_FILL_MAX:
+        if (series->dtype == CP_DTYPE_INT64) {
+          if (!cp_series_max_int64(series, &fill_i64[col], NULL, err)) {
+            goto cleanup;
+          }
+        } else if (series->dtype == CP_DTYPE_FLOAT64) {
+          if (!cp_series_max_float64(series, &fill_f64[col], NULL, err)) {
+            goto cleanup;
+          }
+        } else {
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "max fill only supported for numeric columns");
+          goto cleanup;
+        }
+        fill_enabled[col] = 1;
+        break;
+      default:
+        cp_error_set(err, CP_ERR_INVALID, 0, col,
+                     "invalid fill strategy");
+        goto cleanup;
     }
-    if (!out) {
-      break;
-    }
-    out->nrows += 1;
   }
 
-  free(dtypes);
-  free(names);
-  free(src_cols);
+  CpDataFrame *out =
+      cp_df_fillna_apply(df, fill_enabled, fill_i64, fill_f64, fill_str, err);
   free(fill_enabled);
   free(fill_i64);
   free(fill_f64);
   free(fill_str);
   return out;
+
+cleanup:
+  free(fill_enabled);
+  free(fill_i64);
+  free(fill_f64);
+  free(fill_str);
+  return NULL;
 }
 
 static int cp_df_append_value_count_row(CpDataFrame *out,

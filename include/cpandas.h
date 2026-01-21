@@ -72,6 +72,16 @@ typedef enum {
   CP_CONCAT_COLS = 1
 } CpConcatAxis;
 
+typedef enum {
+  CP_FILL_NONE = 0,
+  CP_FILL_VALUE = 1,
+  CP_FILL_ZERO = 2,
+  CP_FILL_MEAN = 3,
+  CP_FILL_MEDIAN = 4,
+  CP_FILL_MIN = 5,
+  CP_FILL_MAX = 6
+} CpFillStrategy;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -311,6 +321,11 @@ CpDataFrame *cp_df_fillna(const CpDataFrame *df,
                           const char **values,
                           size_t count,
                           CpError *err);
+CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
+                                   const CpFillStrategy *strategies,
+                                   const char **values,
+                                   size_t count,
+                                   CpError *err);
 CpDataFrame *cp_df_unique(const CpDataFrame *df,
                           const char *name,
                           CpError *err);
