@@ -53,6 +53,29 @@ static char *make_temp_path(void) {
 #endif
 }
 
+static char *resolve_fixture_path(const char *rel_path) {
+  if (!rel_path || rel_path[0] == '\0') {
+    return NULL;
+  }
+  const char *candidates[] = {rel_path, NULL};
+  for (size_t i = 0; candidates[i]; ++i) {
+    FILE *fp = fopen(candidates[i], "rb");
+    if (fp) {
+      fclose(fp);
+      return dup_string(candidates[i]);
+    }
+  }
+  char buf[1024];
+  if (snprintf(buf, sizeof(buf), "../%s", rel_path) >= 0) {
+    FILE *fp = fopen(buf, "rb");
+    if (fp) {
+      fclose(fp);
+      return dup_string(buf);
+    }
+  }
+  return NULL;
+}
+
 static int write_file(const char *path, const char *content) {
   FILE *fp = fopen(path, "wb");
   if (!fp) {
@@ -953,6 +976,52 @@ static void test_parquet_delta_encoding(void) {
     unsetenv("CPANDAS_PARQUET_ENCODING");
   }
 #endif
+}
+
+static void test_parquet_nested_struct(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  char *path = resolve_fixture_path("tests/fixtures/nested_struct.parquet");
+  CHECK(path != NULL);
+  if (!path) {
+    return;
+  }
+  CpDataFrame *df = cp_df_read_parquet(path, &err);
+  CHECK(df != NULL);
+  if (df) {
+    CHECK(cp_df_nrows(df) == 4);
+    const CpSeries *id = cp_df_get_col(df, "user.id");
+    const CpSeries *name = cp_df_get_col(df, "user.name");
+    CHECK(id && name);
+    if (id && name) {
+      int64_t id_val = 0;
+      const char *name_val = NULL;
+      int is_null = 0;
+
+      CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+      CHECK(!is_null && id_val == 1);
+      CHECK(cp_series_get_string(name, 0, &name_val, &is_null));
+      CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+
+      CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+      CHECK(is_null);
+      CHECK(cp_series_get_string(name, 1, &name_val, &is_null));
+      CHECK(is_null);
+
+      CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+      CHECK(!is_null && id_val == 3);
+      CHECK(cp_series_get_string(name, 2, &name_val, &is_null));
+      CHECK(is_null);
+
+      CHECK(cp_series_get_int64(id, 3, &id_val, &is_null));
+      CHECK(!is_null && id_val == 4);
+      CHECK(cp_series_get_string(name, 3, &name_val, &is_null));
+      CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+    }
+    cp_df_free(df);
+  }
+  free(path);
 }
 
 static void test_plot(void) {
@@ -5152,6 +5221,7 @@ int main(void) {
   test_cpd_io();
   test_parquet_io();
   test_parquet_delta_encoding();
+  test_parquet_nested_struct();
   test_plot();
   test_write_csv_header();
   test_append_row_errors();
