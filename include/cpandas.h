@@ -85,6 +85,13 @@ typedef enum {
   CP_FILL_INTERP = 9
 } CpFillStrategy;
 
+typedef enum {
+  CP_ROUND_NEAREST = 0,
+  CP_ROUND_FLOOR = 1,
+  CP_ROUND_CEIL = 2,
+  CP_ROUND_TRUNC = 3
+} CpRoundMode;
+
 typedef struct {
   CpErrCode code;
   char message[256];
@@ -329,6 +336,12 @@ CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
                                    const char **values,
                                    size_t count,
                                    CpError *err);
+CpDataFrame *cp_df_fillna_strategy_round(const CpDataFrame *df,
+                                         const CpFillStrategy *strategies,
+                                         const char **values,
+                                         size_t count,
+                                         CpRoundMode round_mode,
+                                         CpError *err);
 CpDataFrame *cp_df_unique(const CpDataFrame *df,
                           const char *name,
                           CpError *err);
@@ -546,6 +559,9 @@ size_t cp_series_len(const CpSeries *s);
 int cp_series_get_int64(const CpSeries *s, size_t idx, int64_t *out, int *is_null);
 int cp_series_get_float64(const CpSeries *s, size_t idx, double *out, int *is_null);
 int cp_series_get_string(const CpSeries *s, size_t idx, const char **out, int *is_null);
+void cp_series_free(CpSeries *s);
+CpSeries *cp_series_ffill(const CpSeries *s, CpError *err);
+CpSeries *cp_series_bfill(const CpSeries *s, CpError *err);
 
 int cp_series_count(const CpSeries *s, size_t *out, size_t *out_nulls, CpError *err);
 int cp_series_sum_int64(const CpSeries *s,

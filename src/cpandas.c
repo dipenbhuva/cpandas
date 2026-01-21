@@ -1347,7 +1347,7 @@ static int cp_series_reserve(CpSeries *s, size_t needed, CpError *err) {
   return 1;
 }
 
-static void cp_series_free(CpSeries *s) {
+void cp_series_free(CpSeries *s) {
   if (!s) {
     return;
   }
@@ -3791,6 +3791,44 @@ static int cp_fill_plan_build_interp(const CpSeries *series,
   return 1;
 }
 
+static int cp_round_to_int64(double value,
+                             CpRoundMode mode,
+                             int64_t *out,
+                             CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid rounding output");
+    return 0;
+  }
+  if (!isfinite(value)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid rounding input");
+    return 0;
+  }
+  double rounded = 0.0;
+  switch (mode) {
+    case CP_ROUND_NEAREST:
+      rounded = round(value);
+      break;
+    case CP_ROUND_FLOOR:
+      rounded = floor(value);
+      break;
+    case CP_ROUND_CEIL:
+      rounded = ceil(value);
+      break;
+    case CP_ROUND_TRUNC:
+      rounded = trunc(value);
+      break;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid rounding mode");
+      return 0;
+  }
+  if (rounded < (double)INT64_MIN || rounded > (double)INT64_MAX) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "rounding overflow");
+    return 0;
+  }
+  *out = (int64_t)rounded;
+  return 1;
+}
+
 static CpDataFrame *cp_df_fillna_apply(const CpDataFrame *df,
                                        const int *fill_enabled,
                                        const int64_t *fill_i64,
@@ -4118,11 +4156,13 @@ CpDataFrame *cp_df_fillna(const CpDataFrame *df,
   return out;
 }
 
-CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
-                                   const CpFillStrategy *strategies,
-                                   const char **values,
-                                   size_t count,
-                                   CpError *err) {
+static CpDataFrame *cp_df_fillna_strategy_impl(const CpDataFrame *df,
+                                               const CpFillStrategy *strategies,
+                                               const char **values,
+                                               size_t count,
+                                               int allow_int_round,
+                                               CpRoundMode round_mode,
+                                               CpError *err) {
   if (!df || !strategies) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid fillna arguments");
     return NULL;
@@ -4203,9 +4243,20 @@ CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
           goto cleanup;
         }
         if (series->dtype == CP_DTYPE_INT64) {
-          cp_error_set(err, CP_ERR_INVALID, 0, col,
-                       "mean fill not supported for int64");
-          goto cleanup;
+          if (!allow_int_round) {
+            cp_error_set(err, CP_ERR_INVALID, 0, col,
+                         "mean fill not supported for int64");
+            goto cleanup;
+          }
+          double mean = 0.0;
+          if (!cp_series_mean(series, &mean, NULL, NULL, err)) {
+            goto cleanup;
+          }
+          if (!cp_round_to_int64(mean, round_mode, &plan->fill_i64, err)) {
+            goto cleanup;
+          }
+          plan->fill_enabled = 1;
+          break;
         }
         double mean = 0.0;
         if (!cp_series_mean(series, &mean, NULL, NULL, err)) {
@@ -4222,9 +4273,20 @@ CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
           goto cleanup;
         }
         if (series->dtype == CP_DTYPE_INT64) {
-          cp_error_set(err, CP_ERR_INVALID, 0, col,
-                       "median fill not supported for int64");
-          goto cleanup;
+          if (!allow_int_round) {
+            cp_error_set(err, CP_ERR_INVALID, 0, col,
+                         "median fill not supported for int64");
+            goto cleanup;
+          }
+          double median = 0.0;
+          if (!cp_series_median(series, &median, NULL, NULL, err)) {
+            goto cleanup;
+          }
+          if (!cp_round_to_int64(median, round_mode, &plan->fill_i64, err)) {
+            goto cleanup;
+          }
+          plan->fill_enabled = 1;
+          break;
         }
         double median = 0.0;
         if (!cp_series_median(series, &median, NULL, NULL, err)) {
@@ -4292,6 +4354,25 @@ CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
 cleanup:
   cp_fill_plan_free(plans, ncols);
   return NULL;
+}
+
+CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
+                                   const CpFillStrategy *strategies,
+                                   const char **values,
+                                   size_t count,
+                                   CpError *err) {
+  return cp_df_fillna_strategy_impl(df, strategies, values, count, 0,
+                                    CP_ROUND_NEAREST, err);
+}
+
+CpDataFrame *cp_df_fillna_strategy_round(const CpDataFrame *df,
+                                         const CpFillStrategy *strategies,
+                                         const char **values,
+                                         size_t count,
+                                         CpRoundMode round_mode,
+                                         CpError *err) {
+  return cp_df_fillna_strategy_impl(df, strategies, values, count, 1,
+                                    round_mode, err);
 }
 
 static int cp_df_append_value_count_row(CpDataFrame *out,
@@ -16881,6 +16962,199 @@ int cp_series_get_string(const CpSeries *s,
     *is_null = s->is_null[idx] ? 1 : 0;
   }
   return 1;
+}
+
+CpSeries *cp_series_ffill(const CpSeries *s, CpError *err) {
+  if (!s) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid series");
+    return NULL;
+  }
+  CpSeries *out = cp_series_create(s->name, s->dtype, s->length, err);
+  if (!out) {
+    return NULL;
+  }
+  int has_value = 0;
+  int64_t last_i64 = 0;
+  double last_f64 = 0.0;
+  const char *last_str = NULL;
+
+  for (size_t i = 0; i < s->length; ++i) {
+    if (!s->is_null[i]) {
+      has_value = 1;
+      if (s->dtype == CP_DTYPE_INT64) {
+        last_i64 = s->data.i64[i];
+        if (!cp_series_append_int64(out, last_i64, 0, err)) {
+          cp_series_free(out);
+          return NULL;
+        }
+      } else if (s->dtype == CP_DTYPE_FLOAT64) {
+        last_f64 = s->data.f64[i];
+        if (!cp_series_append_float64(out, last_f64, 0, err)) {
+          cp_series_free(out);
+          return NULL;
+        }
+      } else if (s->dtype == CP_DTYPE_STRING) {
+        last_str = s->data.str[i];
+        if (!cp_series_append_string(out, last_str, 0, err)) {
+          cp_series_free(out);
+          return NULL;
+        }
+      } else {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+        cp_series_free(out);
+        return NULL;
+      }
+    } else if (has_value) {
+      if (s->dtype == CP_DTYPE_INT64) {
+        if (!cp_series_append_int64(out, last_i64, 0, err)) {
+          cp_series_free(out);
+          return NULL;
+        }
+      } else if (s->dtype == CP_DTYPE_FLOAT64) {
+        if (!cp_series_append_float64(out, last_f64, 0, err)) {
+          cp_series_free(out);
+          return NULL;
+        }
+      } else if (s->dtype == CP_DTYPE_STRING) {
+        if (!cp_series_append_string(out, last_str, 0, err)) {
+          cp_series_free(out);
+          return NULL;
+        }
+      }
+    } else {
+      if (!cp_series_append_null(out, err)) {
+        cp_series_free(out);
+        return NULL;
+      }
+    }
+  }
+  return out;
+}
+
+CpSeries *cp_series_bfill(const CpSeries *s, CpError *err) {
+  if (!s) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid series");
+    return NULL;
+  }
+  size_t len = s->length;
+  uint8_t *nulls = NULL;
+  int64_t *vals_i64 = NULL;
+  double *vals_f64 = NULL;
+  const char **vals_str = NULL;
+  if (len > 0) {
+    nulls = (uint8_t *)malloc(len * sizeof(uint8_t));
+    if (!nulls) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    if (s->dtype == CP_DTYPE_INT64) {
+      vals_i64 = (int64_t *)malloc(len * sizeof(int64_t));
+      if (!vals_i64) {
+        free(nulls);
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return NULL;
+      }
+    } else if (s->dtype == CP_DTYPE_FLOAT64) {
+      vals_f64 = (double *)malloc(len * sizeof(double));
+      if (!vals_f64) {
+        free(nulls);
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return NULL;
+      }
+    } else if (s->dtype == CP_DTYPE_STRING) {
+      vals_str = (const char **)malloc(len * sizeof(const char *));
+      if (!vals_str) {
+        free(nulls);
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        return NULL;
+      }
+    } else {
+      free(nulls);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+      return NULL;
+    }
+  }
+
+  int has_value = 0;
+  int64_t next_i64 = 0;
+  double next_f64 = 0.0;
+  const char *next_str = NULL;
+  for (size_t i = len; i-- > 0;) {
+    if (!s->is_null[i]) {
+      has_value = 1;
+      nulls[i] = 0;
+      if (s->dtype == CP_DTYPE_INT64) {
+        next_i64 = s->data.i64[i];
+        vals_i64[i] = next_i64;
+      } else if (s->dtype == CP_DTYPE_FLOAT64) {
+        next_f64 = s->data.f64[i];
+        vals_f64[i] = next_f64;
+      } else {
+        next_str = s->data.str[i];
+        vals_str[i] = next_str;
+      }
+    } else if (has_value) {
+      nulls[i] = 0;
+      if (s->dtype == CP_DTYPE_INT64) {
+        vals_i64[i] = next_i64;
+      } else if (s->dtype == CP_DTYPE_FLOAT64) {
+        vals_f64[i] = next_f64;
+      } else {
+        vals_str[i] = next_str;
+      }
+    } else {
+      nulls[i] = 1;
+      if (s->dtype == CP_DTYPE_INT64) {
+        vals_i64[i] = 0;
+      } else if (s->dtype == CP_DTYPE_FLOAT64) {
+        vals_f64[i] = 0.0;
+      } else if (s->dtype == CP_DTYPE_STRING) {
+        vals_str[i] = NULL;
+      }
+    }
+  }
+
+  CpSeries *out = cp_series_create(s->name, s->dtype, len, err);
+  if (!out) {
+    free(nulls);
+    free(vals_i64);
+    free(vals_f64);
+    free(vals_str);
+    return NULL;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    if (nulls[i]) {
+      if (!cp_series_append_null(out, err)) {
+        cp_series_free(out);
+        out = NULL;
+        break;
+      }
+    } else if (s->dtype == CP_DTYPE_INT64) {
+      if (!cp_series_append_int64(out, vals_i64[i], 0, err)) {
+        cp_series_free(out);
+        out = NULL;
+        break;
+      }
+    } else if (s->dtype == CP_DTYPE_FLOAT64) {
+      if (!cp_series_append_float64(out, vals_f64[i], 0, err)) {
+        cp_series_free(out);
+        out = NULL;
+        break;
+      }
+    } else {
+      if (!cp_series_append_string(out, vals_str[i], 0, err)) {
+        cp_series_free(out);
+        out = NULL;
+        break;
+      }
+    }
+  }
+
+  free(nulls);
+  free(vals_i64);
+  free(vals_f64);
+  free(vals_str);
+  return out;
 }
 
 int cp_series_count(const CpSeries *s, size_t *out, size_t *out_nulls, CpError *err) {

@@ -2092,6 +2092,107 @@ static void test_fillna_interpolate(void) {
   cp_df_free(df);
 }
 
+static void test_fillna_rounding_int64(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a"};
+  CpDType dtypes[] = {CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(1, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1"};
+  const char *row2[] = {""};
+  const char *row3[] = {"4"};
+  CHECK(cp_df_append_row(df, row1, 1, &err));
+  CHECK(cp_df_append_row(df, row2, 1, &err));
+  CHECK(cp_df_append_row(df, row3, 1, &err));
+
+  CpFillStrategy mean[] = {CP_FILL_MEAN};
+  CpDataFrame *mean_floor =
+      cp_df_fillna_strategy_round(df, mean, NULL, 1, CP_ROUND_FLOOR, &err);
+  CHECK(mean_floor != NULL);
+  if (mean_floor) {
+    const CpSeries *a = cp_df_get_col(mean_floor, "a");
+    CHECK(a != NULL);
+    int64_t v = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(a, 1, &v, &is_null));
+    CHECK(!is_null && v == 2);
+    cp_df_free(mean_floor);
+  }
+
+  CpFillStrategy median[] = {CP_FILL_MEDIAN};
+  CpDataFrame *median_ceil =
+      cp_df_fillna_strategy_round(df, median, NULL, 1, CP_ROUND_CEIL, &err);
+  CHECK(median_ceil != NULL);
+  if (median_ceil) {
+    const CpSeries *a = cp_df_get_col(median_ceil, "a");
+    CHECK(a != NULL);
+    int64_t v = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(a, 1, &v, &is_null));
+    CHECK(!is_null && v == 3);
+    cp_df_free(median_ceil);
+  }
+
+  cp_df_free(df);
+}
+
+static void test_series_ffill_bfill(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a"};
+  CpDType dtypes[] = {CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(1, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1"};
+  const char *row2[] = {""};
+  const char *row3[] = {"3"};
+  const char *row4[] = {""};
+  CHECK(cp_df_append_row(df, row1, 1, &err));
+  CHECK(cp_df_append_row(df, row2, 1, &err));
+  CHECK(cp_df_append_row(df, row3, 1, &err));
+  CHECK(cp_df_append_row(df, row4, 1, &err));
+
+  const CpSeries *col = cp_df_get_col(df, "a");
+  CHECK(col != NULL);
+
+  CpSeries *ffill = cp_series_ffill(col, &err);
+  CHECK(ffill != NULL);
+  if (ffill) {
+    int64_t v = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(ffill, 1, &v, &is_null));
+    CHECK(!is_null && v == 1);
+    CHECK(cp_series_get_int64(ffill, 3, &v, &is_null));
+    CHECK(!is_null && v == 3);
+    cp_series_free(ffill);
+  }
+
+  CpSeries *bfill = cp_series_bfill(col, &err);
+  CHECK(bfill != NULL);
+  if (bfill) {
+    int64_t v = 0;
+    int is_null = 0;
+    CHECK(cp_series_get_int64(bfill, 1, &v, &is_null));
+    CHECK(!is_null && v == 3);
+    CHECK(cp_series_get_int64(bfill, 3, &v, &is_null));
+    CHECK(is_null);
+    cp_series_free(bfill);
+  }
+
+  cp_df_free(df);
+}
+
 static void test_unique_counts_int64(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4933,6 +5034,8 @@ int main(void) {
   test_fillna_strategy();
   test_fillna_ffill_bfill();
   test_fillna_interpolate();
+  test_fillna_rounding_int64();
+  test_series_ffill_bfill();
   test_unique_counts_int64();
   test_unique_counts_string();
   test_sample();
