@@ -3608,6 +3608,9 @@ typedef struct {
   int64_t *bfill_i64;
   double *bfill_f64;
   const char **bfill_str;
+  uint8_t *interp_valid;
+  int64_t *interp_i64;
+  double *interp_f64;
 } CpFillPlan;
 
 static void cp_fill_plan_free(CpFillPlan *plans, size_t count) {
@@ -3619,6 +3622,9 @@ static void cp_fill_plan_free(CpFillPlan *plans, size_t count) {
     free(plans[i].bfill_i64);
     free(plans[i].bfill_f64);
     free(plans[i].bfill_str);
+    free(plans[i].interp_valid);
+    free(plans[i].interp_i64);
+    free(plans[i].interp_f64);
   }
   free(plans);
 }
@@ -3692,6 +3698,94 @@ static int cp_fill_plan_build_bfill(const CpSeries *series,
       plan->bfill_f64[row] = last_f64;
     } else {
       plan->bfill_str[row] = last_str;
+    }
+  }
+  return 1;
+}
+
+static int cp_fill_plan_build_interp(const CpSeries *series,
+                                     CpFillPlan *plan,
+                                     CpError *err) {
+  if (!series || !plan) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid fill plan");
+    return 0;
+  }
+  if (series->dtype != CP_DTYPE_INT64 && series->dtype != CP_DTYPE_FLOAT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                 "interpolation only supported for numeric columns");
+    return 0;
+  }
+  size_t nrows = series->length;
+  if (nrows == 0) {
+    return 1;
+  }
+  plan->interp_valid = (uint8_t *)calloc(nrows, sizeof(uint8_t));
+  if (!plan->interp_valid) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  if (series->dtype == CP_DTYPE_INT64) {
+    plan->interp_i64 = (int64_t *)malloc(nrows * sizeof(int64_t));
+    if (!plan->interp_i64) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+  } else {
+    plan->interp_f64 = (double *)malloc(nrows * sizeof(double));
+    if (!plan->interp_f64) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+  }
+
+  size_t row = 0;
+  while (row < nrows) {
+    if (!series->is_null[row]) {
+      row += 1;
+      continue;
+    }
+    size_t start = row;
+    while (row < nrows && series->is_null[row]) {
+      row += 1;
+    }
+    size_t end = row;
+    if (start == 0 || end >= nrows) {
+      continue;
+    }
+    size_t left = start - 1;
+    if (series->is_null[left]) {
+      continue;
+    }
+    if (series->is_null[end]) {
+      continue;
+    }
+    double left_val = 0.0;
+    double right_val = 0.0;
+    if (series->dtype == CP_DTYPE_INT64) {
+      left_val = (double)series->data.i64[left];
+      right_val = (double)series->data.i64[end];
+    } else {
+      left_val = series->data.f64[left];
+      right_val = series->data.f64[end];
+    }
+    double delta = right_val - left_val;
+    size_t gap = end - left;
+    for (size_t i = start; i < end; ++i) {
+      double t = (double)(i - left) / (double)gap;
+      double v = left_val + delta * t;
+      plan->interp_valid[i] = 1;
+      if (series->dtype == CP_DTYPE_INT64) {
+        long long rounded = llround(v);
+        if (rounded < (long long)INT64_MIN ||
+            rounded > (long long)INT64_MAX) {
+          cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                       "interpolation overflow");
+          return 0;
+        }
+        plan->interp_i64[i] = (int64_t)rounded;
+      } else {
+        plan->interp_f64[i] = v;
+      }
     }
   }
   return 1;
@@ -3869,6 +3963,19 @@ static CpDataFrame *cp_df_fillna_apply_strategy(const CpDataFrame *df,
                 ok = cp_series_append_float64(dest, plan->bfill_f64[row], 0, err);
               } else {
                 ok = cp_series_append_string(dest, plan->bfill_str[row], 0, err);
+              }
+            } else {
+              ok = cp_series_append_from(dest, src, row, err);
+            }
+            break;
+          case CP_FILL_INTERP:
+            if (plan->interp_valid && plan->interp_valid[row]) {
+              if (src->dtype == CP_DTYPE_INT64) {
+                ok = cp_series_append_int64(dest, plan->interp_i64[row], 0, err);
+              } else if (src->dtype == CP_DTYPE_FLOAT64) {
+                ok = cp_series_append_float64(dest, plan->interp_f64[row], 0, err);
+              } else {
+                ok = cp_series_append_from(dest, src, row, err);
               }
             } else {
               ok = cp_series_append_from(dest, src, row, err);
@@ -4163,6 +4270,11 @@ CpDataFrame *cp_df_fillna_strategy(const CpDataFrame *df,
         break;
       case CP_FILL_BFILL:
         if (!cp_fill_plan_build_bfill(series, plan, err)) {
+          goto cleanup;
+        }
+        break;
+      case CP_FILL_INTERP:
+        if (!cp_fill_plan_build_interp(series, plan, err)) {
           goto cleanup;
         }
         break;

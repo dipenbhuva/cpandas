@@ -81,7 +81,8 @@ typedef enum {
   CP_FILL_MIN = 5,
   CP_FILL_MAX = 6,
   CP_FILL_FFILL = 7,
-  CP_FILL_BFILL = 8
+  CP_FILL_BFILL = 8,
+  CP_FILL_INTERP = 9
 } CpFillStrategy;
 
 typedef struct {

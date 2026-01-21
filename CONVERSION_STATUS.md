@@ -52,7 +52,7 @@ Data cleaning
 - Null mask extraction.
 - dropna (remove rows with any nulls).
 - fillna (per-column fill values).
-- fillna strategies (per-column: value/zero/min/max/mean/median/ffill/bfill).
+- fillna strategies (per-column: value/zero/min/max/mean/median/ffill/bfill/interp).
 
 Validation and tooling
 - Unit tests for CSV parsing/writing, error cases, and aggregations.
@@ -138,8 +138,9 @@ Advanced pandas features
   `HH:MM[:SS][.fff]` time and optional `Z` or `±HH:MM` offsets into int64 epoch
   seconds (UTC); blanks are nulls.
 - `fillna_strategy` supports per-column strategies; mean/median only apply to
-  float64 columns, while min/max/zero apply to numeric columns and ffill/bfill
-  work across numeric/string columns.
+  float64 columns, min/max/zero apply to numeric columns, ffill/bfill work across
+  numeric/string columns, and interp fills interior numeric gaps (int64 rounds to
+  nearest with `llround`).
 - `to_string` renders a space-aligned table with `null` for nulls.
 - `to_sql` writes a SQL script (CREATE TABLE + INSERT statements) with identifiers
   quoted and string values escaped via doubled single quotes.

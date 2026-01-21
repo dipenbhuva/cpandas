@@ -2021,6 +2021,77 @@ static void test_fillna_ffill_bfill(void) {
   cp_df_free(df);
 }
 
+static void test_fillna_interpolate(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a", "b", "c"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"0", "0.0", "x"};
+  const char *row2[] = {"", "", "y"};
+  const char *row3[] = {"", "", "z"};
+  const char *row4[] = {"10", "10.0", ""};
+  const char *row5[] = {"", "", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+  CHECK(cp_df_append_row(df, row5, 3, &err));
+
+  CpFillStrategy interp[] = {
+      CP_FILL_INTERP,
+      CP_FILL_INTERP,
+      CP_FILL_NONE
+  };
+  CpDataFrame *filled =
+      cp_df_fillna_strategy(df, interp, NULL, 3, &err);
+  CHECK(filled != NULL);
+  if (filled) {
+    const CpSeries *a = cp_df_get_col(filled, "a");
+    const CpSeries *b = cp_df_get_col(filled, "b");
+    CHECK(a && b);
+
+    int64_t a_val = 0;
+    double b_val = 0.0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(a, 1, &a_val, &is_null));
+    CHECK(!is_null && a_val == 3);
+    CHECK(cp_series_get_int64(a, 2, &a_val, &is_null));
+    CHECK(!is_null && a_val == 7);
+    CHECK(cp_series_get_int64(a, 4, &a_val, &is_null));
+    CHECK(is_null);
+
+    CHECK(cp_series_get_float64(b, 1, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 3.3333333333) < 1e-6);
+    CHECK(cp_series_get_float64(b, 2, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 6.6666666667) < 1e-6);
+    CHECK(cp_series_get_float64(b, 4, &b_val, &is_null));
+    CHECK(is_null);
+
+    cp_df_free(filled);
+  }
+
+  cp_error_clear(&err);
+  CpFillStrategy bad_interp[] = {
+      CP_FILL_NONE,
+      CP_FILL_NONE,
+      CP_FILL_INTERP
+  };
+  CpDataFrame *bad =
+      cp_df_fillna_strategy(df, bad_interp, NULL, 3, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_df_free(df);
+}
+
 static void test_unique_counts_int64(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4861,6 +4932,7 @@ int main(void) {
   test_dtypes_and_rename_drop_fill();
   test_fillna_strategy();
   test_fillna_ffill_bfill();
+  test_fillna_interpolate();
   test_unique_counts_int64();
   test_unique_counts_string();
   test_sample();
