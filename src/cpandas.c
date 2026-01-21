@@ -10675,25 +10675,57 @@ static int cp_parquet_decode_levels(const unsigned char *data,
       }
     }
     if (header & 1) {
-      cp_error_set(err, CP_ERR_PARSE, 0, 0,
-                   "bit-packed levels not supported");
-      return 0;
-    }
-    uint64_t run = header >> 1;
-    if (pos + value_bytes > data_len) {
-      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
-      return 0;
-    }
-    uint8_t value = 0;
-    for (size_t b = 0; b < value_bytes; ++b) {
-      value |= (uint8_t)(data[pos++] << (b * 8));
-    }
-    if (value > max_level) {
-      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def level");
-      return 0;
-    }
-    for (uint64_t i = 0; i < run && out_idx < count; ++i) {
-      out[out_idx++] = value;
+      uint64_t groups = header >> 1;
+      if (groups > SIZE_MAX / 8) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+        return 0;
+      }
+      size_t value_count = (size_t)groups * 8;
+      if (out_idx + value_count > count) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+        return 0;
+      }
+      size_t bits_needed = value_count * (size_t)bit_width;
+      size_t bytes_needed = (bits_needed + 7) / 8;
+      if (pos + bytes_needed > data_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+        return 0;
+      }
+      uint64_t buffer = 0;
+      int bits_in_buffer = 0;
+      uint64_t mask = (bit_width == 64) ? UINT64_MAX
+                                        : ((1ULL << bit_width) - 1);
+      for (size_t i = 0; i < value_count; ++i) {
+        while (bits_in_buffer < bit_width) {
+          buffer |= ((uint64_t)data[pos++]) << bits_in_buffer;
+          bits_in_buffer += 8;
+        }
+        uint8_t value = (uint8_t)(buffer & mask);
+        buffer >>= bit_width;
+        bits_in_buffer -= bit_width;
+        if (value > max_level) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def level");
+          return 0;
+        }
+        out[out_idx++] = value;
+      }
+    } else {
+      uint64_t run = header >> 1;
+      if (pos + value_bytes > data_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+        return 0;
+      }
+      uint8_t value = 0;
+      for (size_t b = 0; b < value_bytes; ++b) {
+        value |= (uint8_t)(data[pos++] << (b * 8));
+      }
+      if (value > max_level) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def level");
+        return 0;
+      }
+      for (uint64_t i = 0; i < run && out_idx < count; ++i) {
+        out[out_idx++] = value;
+      }
     }
   }
   if (out_idx != count) {
@@ -10797,25 +10829,57 @@ static int cp_parquet_decode_indices(const unsigned char *data,
       }
     }
     if (header & 1) {
-      cp_error_set(err, CP_ERR_PARSE, 0, 0,
-                   "bit-packed indices not supported");
-      return 0;
-    }
-    uint64_t run = header >> 1;
-    if (pos + value_bytes > data_len) {
-      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
-      return 0;
-    }
-    uint32_t value = 0;
-    for (size_t b = 0; b < value_bytes; ++b) {
-      value |= (uint32_t)(data[pos++] << (b * 8));
-    }
-    if (value > max_value) {
-      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index value");
-      return 0;
-    }
-    for (uint64_t i = 0; i < run && out_idx < count; ++i) {
-      out[out_idx++] = value;
+      uint64_t groups = header >> 1;
+      if (groups > SIZE_MAX / 8) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+        return 0;
+      }
+      size_t value_count = (size_t)groups * 8;
+      if (out_idx + value_count > count) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+        return 0;
+      }
+      size_t bits_needed = value_count * (size_t)bit_width;
+      size_t bytes_needed = (bits_needed + 7) / 8;
+      if (pos + bytes_needed > data_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+        return 0;
+      }
+      uint64_t buffer = 0;
+      int bits_in_buffer = 0;
+      uint64_t mask = (bit_width == 64) ? UINT64_MAX
+                                        : ((1ULL << bit_width) - 1);
+      for (size_t i = 0; i < value_count; ++i) {
+        while (bits_in_buffer < bit_width) {
+          buffer |= ((uint64_t)data[pos++]) << bits_in_buffer;
+          bits_in_buffer += 8;
+        }
+        uint32_t value = (uint32_t)(buffer & mask);
+        buffer >>= bit_width;
+        bits_in_buffer -= bit_width;
+        if (value > max_value) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index value");
+          return 0;
+        }
+        out[out_idx++] = value;
+      }
+    } else {
+      uint64_t run = header >> 1;
+      if (pos + value_bytes > data_len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index data");
+        return 0;
+      }
+      uint32_t value = 0;
+      for (size_t b = 0; b < value_bytes; ++b) {
+        value |= (uint32_t)(data[pos++] << (b * 8));
+      }
+      if (value > max_value) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid index value");
+        return 0;
+      }
+      for (uint64_t i = 0; i < run && out_idx < count; ++i) {
+        out[out_idx++] = value;
+      }
     }
   }
   if (out_idx != count) {
@@ -12366,6 +12430,12 @@ typedef struct {
   char *name;
 } CpParquetSchemaElement;
 
+typedef struct {
+  char *name;
+  int def_level;
+  int remaining_children;
+} CpParquetSchemaFrame;
+
 static void cp_parquet_schema_element_free(CpParquetSchemaElement *elem) {
   if (!elem) {
     return;
@@ -12508,18 +12578,37 @@ static int cp_parquet_read_column_meta(CpThriftReader *r,
           cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid path_in_schema");
           return 0;
         }
+        CpStrBuf path_buf = (CpStrBuf){0};
+        if (!cp_strbuf_init(&path_buf, 0, err)) {
+          return 0;
+        }
         for (size_t i = 0; i < count; ++i) {
           char *name = NULL;
           if (!cp_thrift_read_string(r, &name, err)) {
+            cp_strbuf_free(&path_buf);
             return 0;
           }
-          if (i == 0) {
-            out->name = name;
-            out->has_name = 1;
-          } else {
-            free(name);
+          if (path_buf.len > 0) {
+            if (!cp_strbuf_append_char(&path_buf, '.', err)) {
+              free(name);
+              cp_strbuf_free(&path_buf);
+              return 0;
+            }
           }
+          if (!cp_strbuf_append(&path_buf, name, strlen(name), err)) {
+            free(name);
+            cp_strbuf_free(&path_buf);
+            return 0;
+          }
+          free(name);
         }
+        out->name = cp_strndup(path_buf.data, path_buf.len);
+        cp_strbuf_free(&path_buf);
+        if (!out->name) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          return 0;
+        }
+        out->has_name = 1;
         break;
       }
       case 4: {
@@ -12605,21 +12694,75 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
           cp_parquet_meta_free(out);
           return 0;
         }
-        CpParquetSchemaElement elem;
-        if (!cp_parquet_read_schema_element(&r, &elem, err)) {
+        CpParquetSchemaElement *elems =
+            (CpParquetSchemaElement *)calloc(count,
+                                             sizeof(CpParquetSchemaElement));
+        CpParquetSchemaFrame *frames = NULL;
+        size_t depth = 0;
+        size_t leaf_count = 0;
+        size_t out_idx = 0;
+        int expected_children = 0;
+        if (!elems) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
           cp_parquet_meta_free(out);
           return 0;
         }
-        int expected_children = elem.has_num_children
-                                    ? elem.num_children
-                                    : (int)(count - 1);
-        cp_parquet_schema_element_free(&elem);
-        if (expected_children != (int)(count - 1)) {
+        for (size_t i = 0; i < count; ++i) {
+          if (!cp_parquet_read_schema_element(&r, &elems[i], err)) {
+            for (size_t j = 0; j <= i; ++j) {
+              cp_parquet_schema_element_free(&elems[j]);
+            }
+            free(elems);
+            cp_parquet_meta_free(out);
+            return 0;
+          }
+        }
+
+        expected_children = elems[0].has_num_children
+                                ? elems[0].num_children
+                                : (int)(count - 1);
+        if (expected_children < 0 || expected_children != (int)(count - 1)) {
           cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
-          cp_parquet_meta_free(out);
-          return 0;
+          goto schema_fail;
         }
-        out->ncols = count - 1;
+        if (elems[0].has_repetition &&
+            elems[0].repetition_type != CP_PARQUET_REP_REQUIRED) {
+          cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                       "unsupported parquet repetition");
+          goto schema_fail;
+        }
+
+        for (size_t i = 1; i < count; ++i) {
+          CpParquetSchemaElement *elem = &elems[i];
+          if (elem->has_repetition &&
+              elem->repetition_type != CP_PARQUET_REP_REQUIRED &&
+              elem->repetition_type != CP_PARQUET_REP_OPTIONAL) {
+            cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                         "unsupported parquet repetition");
+            goto schema_fail;
+          }
+          if (elem->has_num_children && elem->num_children < 0) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+            goto schema_fail;
+          }
+          if (elem->has_type) {
+            if (elem->has_num_children && elem->num_children > 0) {
+              cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                           "unsupported parquet schema");
+              goto schema_fail;
+            }
+            leaf_count += 1;
+          } else if (!elem->has_num_children || elem->num_children == 0) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+            goto schema_fail;
+          }
+        }
+        if (leaf_count == 0) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+          goto schema_fail;
+        }
+
+        out->ncols = leaf_count;
         out->names = (char **)calloc(out->ncols, sizeof(char *));
         out->dtypes = (CpDType *)malloc(out->ncols * sizeof(CpDType));
         out->parquet_types = (int *)malloc(out->ncols * sizeof(int));
@@ -12627,47 +12770,143 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
         if (!out->names || !out->dtypes || !out->parquet_types ||
             !out->max_def_levels) {
           cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-          cp_parquet_meta_free(out);
-          return 0;
+          goto schema_fail;
         }
-        for (size_t i = 0; i < out->ncols; ++i) {
-          CpParquetSchemaElement col;
-          if (!cp_parquet_read_schema_element(&r, &col, err)) {
-            cp_parquet_schema_element_free(&col);
-            cp_parquet_meta_free(out);
-            return 0;
+
+        frames = (CpParquetSchemaFrame *)calloc(count,
+                                                sizeof(CpParquetSchemaFrame));
+        if (!frames) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          goto schema_fail;
+        }
+        frames[depth++] = (CpParquetSchemaFrame){.name = NULL,
+                                                 .def_level = 0,
+                                                 .remaining_children =
+                                                     expected_children};
+
+        for (size_t i = 1; i < count; ++i) {
+          CpParquetSchemaElement *elem = &elems[i];
+          while (depth > 0 && frames[depth - 1].remaining_children == 0) {
+            free(frames[depth - 1].name);
+            frames[depth - 1].name = NULL;
+            depth -= 1;
           }
-          if (!col.name || !col.has_type) {
-            cp_parquet_schema_element_free(&col);
+          if (depth == 0) {
             cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
-            cp_parquet_meta_free(out);
-            return 0;
+            goto schema_fail;
           }
-          CpDType dtype;
-          if (!cp_parquet_dtype_from_type(col.type, &dtype, err)) {
-            cp_parquet_schema_element_free(&col);
-            cp_parquet_meta_free(out);
-            return 0;
+          if (!elem->name) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+            goto schema_fail;
           }
-          out->names[i] = col.name;
-          out->dtypes[i] = dtype;
-          out->parquet_types[i] = col.type;
-          if (col.has_repetition &&
-              col.repetition_type == CP_PARQUET_REP_OPTIONAL) {
-            out->max_def_levels[i] = 1;
-          } else if (col.has_repetition &&
-                     col.repetition_type != CP_PARQUET_REP_REQUIRED) {
-            cp_parquet_schema_element_free(&col);
+          int repetition = elem->has_repetition
+                               ? elem->repetition_type
+                               : CP_PARQUET_REP_REQUIRED;
+          int def_inc = 0;
+          if (repetition == CP_PARQUET_REP_OPTIONAL) {
+            def_inc = 1;
+          } else if (repetition != CP_PARQUET_REP_REQUIRED) {
             cp_error_set(err, CP_ERR_INVALID, 0, 0,
                          "unsupported parquet repetition");
-            cp_parquet_meta_free(out);
-            return 0;
+            goto schema_fail;
           }
-          col.name = NULL;
-          cp_parquet_schema_element_free(&col);
+          int def_level = frames[depth - 1].def_level + def_inc;
+          if (elem->has_num_children && elem->num_children > 0) {
+            frames[depth - 1].remaining_children -= 1;
+            frames[depth].name = elem->name;
+            frames[depth].def_level = def_level;
+            frames[depth].remaining_children = elem->num_children;
+            depth += 1;
+            elem->name = NULL;
+            continue;
+          }
+          if (!elem->has_type) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+            goto schema_fail;
+          }
+          frames[depth - 1].remaining_children -= 1;
+          CpDType dtype;
+          if (!cp_parquet_dtype_from_type(elem->type, &dtype, err)) {
+            goto schema_fail;
+          }
+          CpStrBuf name_buf = (CpStrBuf){0};
+          if (!cp_strbuf_init(&name_buf, 0, err)) {
+            goto schema_fail;
+          }
+          for (size_t d = 1; d < depth; ++d) {
+            if (!frames[d].name) {
+              continue;
+            }
+            if (name_buf.len > 0) {
+              if (!cp_strbuf_append_char(&name_buf, '.', err)) {
+                cp_strbuf_free(&name_buf);
+                goto schema_fail;
+              }
+            }
+            if (!cp_strbuf_append(&name_buf, frames[d].name,
+                                  strlen(frames[d].name), err)) {
+              cp_strbuf_free(&name_buf);
+              goto schema_fail;
+            }
+          }
+          if (name_buf.len > 0) {
+            if (!cp_strbuf_append_char(&name_buf, '.', err)) {
+              cp_strbuf_free(&name_buf);
+              goto schema_fail;
+            }
+          }
+          if (!cp_strbuf_append(&name_buf, elem->name,
+                                strlen(elem->name), err)) {
+            cp_strbuf_free(&name_buf);
+            goto schema_fail;
+          }
+          out->names[out_idx] = cp_strndup(name_buf.data, name_buf.len);
+          cp_strbuf_free(&name_buf);
+          if (!out->names[out_idx]) {
+            cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+            goto schema_fail;
+          }
+          out->dtypes[out_idx] = dtype;
+          out->parquet_types[out_idx] = elem->type;
+          out->max_def_levels[out_idx] = def_level;
+          out_idx += 1;
         }
+
+        while (depth > 0) {
+          if (frames[depth - 1].remaining_children != 0) {
+            cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+            goto schema_fail;
+          }
+          free(frames[depth - 1].name);
+          frames[depth - 1].name = NULL;
+          depth -= 1;
+        }
+        if (out_idx != leaf_count) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
+          goto schema_fail;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+          cp_parquet_schema_element_free(&elems[i]);
+        }
+        free(elems);
+        free(frames);
         have_schema = 1;
         break;
+
+      schema_fail:
+        if (frames) {
+          for (size_t i = 0; i < depth; ++i) {
+            free(frames[i].name);
+          }
+          free(frames);
+        }
+        for (size_t i = 0; i < count; ++i) {
+          cp_parquet_schema_element_free(&elems[i]);
+        }
+        free(elems);
+        cp_parquet_meta_free(out);
+        return 0;
       }
       case 3: {
         int64_t value = 0;
@@ -15008,7 +15247,30 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
 
       size_t offset = 0;
       uint8_t *def_levels = NULL;
+      uint8_t max_def = 0;
       if (meta.max_def_levels[col] > 0 && rg_rows > 0) {
+        if (meta.max_def_levels[col] > 255) {
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "unsupported def level");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        max_def = (uint8_t)meta.max_def_levels[col];
         uint32_t def_len = 0;
         if (!cp_parquet_read_u32(page, page_size, &offset, &def_len, err)) {
           free(page);
@@ -15070,7 +15332,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
           fclose(fp);
           return NULL;
         }
-        if (!cp_parquet_decode_levels(page + offset, def_len, rg_rows, 1,
+        if (!cp_parquet_decode_levels(page + offset, def_len, rg_rows, max_def,
                                       def_levels, err)) {
           free(def_levels);
           free(page);
@@ -15097,9 +15359,9 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
       size_t non_null = 0;
       if (meta.max_def_levels[col] > 0) {
         for (size_t r = 0; r < rg_rows; ++r) {
-          if (def_levels[r] == 1) {
+          if (def_levels[r] == max_def) {
             non_null += 1;
-          } else if (def_levels[r] != 0) {
+          } else if (def_levels[r] > max_def) {
             free(def_levels);
             free(page);
             if (dict_i64) {
@@ -15302,7 +15564,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         size_t out_row = row_offset + row;
         int is_null = 0;
         if (meta.max_def_levels[col] > 0) {
-          is_null = def_levels ? (def_levels[row] == 0) : 0;
+          is_null = def_levels ? (def_levels[row] != max_def) : 0;
         }
         series->is_null[out_row] = is_null ? 1 : 0;
         if (is_null) {

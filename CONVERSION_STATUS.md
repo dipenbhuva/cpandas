@@ -103,8 +103,7 @@ Indexing and missing values
 - None.
 
 I/O and formats
-- Additional Parquet features (nested types, encodings beyond delta binary packed
-  for int64).
+- Additional Parquet features (repeated/list/map types, nested write support).
 
 Performance and scalability
 - SIMD or parallel ops.
