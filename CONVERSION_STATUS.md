@@ -100,11 +100,11 @@ Joins
 - Join performance tuning (parallelism, memory).
 
 Indexing and missing values
-- Missing value handling beyond per-column fill strategies
-  (e.g., forward/backward fill, interpolation).
+- None.
 
 I/O and formats
-- Additional Parquet features (nested types, column encodings beyond dictionary).
+- Additional Parquet features (nested types, encodings beyond delta binary packed
+  for int64).
 
 Performance and scalability
 - SIMD or parallel ops.

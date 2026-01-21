@@ -10435,6 +10435,7 @@ static int cp_snappy_decompress(const unsigned char *data,
 #define CP_PARQUET_ENC_PLAIN 0
 #define CP_PARQUET_ENC_PLAIN_DICTIONARY 1
 #define CP_PARQUET_ENC_RLE 2
+#define CP_PARQUET_ENC_DELTA_BINARY_PACKED 4
 #define CP_PARQUET_ENC_RLE_DICTIONARY 7
 
 #define CP_PARQUET_CODEC_UNCOMPRESSED 0
@@ -10449,6 +10450,13 @@ static int cp_snappy_decompress(const unsigned char *data,
 
 #define CP_PARQUET_CONVERTED_UTF8 9
 #define CP_PARQUET_DEFAULT_ROW_GROUP 65536
+#define CP_PARQUET_DELTA_BLOCK_SIZE 128
+#define CP_PARQUET_DELTA_MINI_BLOCKS 4
+
+#define CP_PARQUET_ENCODING_AUTO 0
+#define CP_PARQUET_ENCODING_PLAIN 1
+#define CP_PARQUET_ENCODING_DICTIONARY 2
+#define CP_PARQUET_ENCODING_DELTA 3
 
 static int cp_parquet_compress(int codec,
                                const unsigned char *data,
@@ -10939,6 +10947,394 @@ static int cp_parquet_read_f64(const unsigned char *data,
   return 1;
 }
 
+static int cp_parquet_bit_width_u64(uint64_t value) {
+  int width = 0;
+  while (value > 0) {
+    width += 1;
+    value >>= 1;
+  }
+  return width;
+}
+
+static int cp_parquet_pack_bits_u64(const uint64_t *values,
+                                    size_t count,
+                                    int bit_width,
+                                    CpStrBuf *out,
+                                    CpError *err) {
+  if (!out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid bit pack buffer");
+    return 0;
+  }
+  if (bit_width <= 0) {
+    return 1;
+  }
+  if (bit_width > 64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid bit width");
+    return 0;
+  }
+  if (bit_width == 64) {
+    for (size_t i = 0; i < count; ++i) {
+      if (!cp_parquet_buf_append_u64(out, values[i], err)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+
+  uint64_t buffer = 0;
+  int bits_in_buffer = 0;
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t value = values[i];
+    if ((value >> bit_width) != 0) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid delta bit width");
+      return 0;
+    }
+    int remaining = bit_width;
+    while (remaining > 0) {
+      int space = 64 - bits_in_buffer;
+      int take = remaining < space ? remaining : space;
+      uint64_t mask =
+          take == 64 ? UINT64_MAX : ((1ULL << (unsigned)take) - 1);
+      buffer |= (value & mask) << bits_in_buffer;
+      value >>= take;
+      bits_in_buffer += take;
+      remaining -= take;
+      while (bits_in_buffer >= 8) {
+        unsigned char byte = (unsigned char)(buffer & 0xffu);
+        if (!cp_buf_append_u8(out, byte, err)) {
+          return 0;
+        }
+        buffer >>= 8;
+        bits_in_buffer -= 8;
+      }
+    }
+  }
+  if (bits_in_buffer > 0) {
+    unsigned char byte = (unsigned char)(buffer & 0xffu);
+    if (!cp_buf_append_u8(out, byte, err)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int cp_parquet_unpack_bits_u64(const unsigned char *data,
+                                      size_t len,
+                                      size_t *offset,
+                                      size_t count,
+                                      int bit_width,
+                                      uint64_t *out,
+                                      CpError *err) {
+  if (!data || !offset || (!out && count > 0)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid bit unpack input");
+    return 0;
+  }
+  if (bit_width < 0 || bit_width > 64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid bit width");
+    return 0;
+  }
+  if (count == 0 || bit_width == 0) {
+    for (size_t i = 0; i < count; ++i) {
+      out[i] = 0;
+    }
+    return 1;
+  }
+  if (bit_width == 64) {
+    if (count > (SIZE_MAX / 8)) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "bit unpack overflow");
+      return 0;
+    }
+    size_t needed = count * 8;
+    if (*offset + needed > len) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid bit packed data");
+      return 0;
+    }
+    size_t pos = *offset;
+    for (size_t i = 0; i < count; ++i) {
+      uint64_t value = 0;
+      value |= (uint64_t)data[pos];
+      value |= (uint64_t)data[pos + 1] << 8;
+      value |= (uint64_t)data[pos + 2] << 16;
+      value |= (uint64_t)data[pos + 3] << 24;
+      value |= (uint64_t)data[pos + 4] << 32;
+      value |= (uint64_t)data[pos + 5] << 40;
+      value |= (uint64_t)data[pos + 6] << 48;
+      value |= (uint64_t)data[pos + 7] << 56;
+      out[i] = value;
+      pos += 8;
+    }
+    *offset = pos;
+    return 1;
+  }
+  if (count > (SIZE_MAX / (size_t)bit_width)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "bit unpack overflow");
+    return 0;
+  }
+  size_t bits_needed = count * (size_t)bit_width;
+  size_t bytes_needed = (bits_needed + 7) / 8;
+  if (*offset + bytes_needed > len) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid bit packed data");
+    return 0;
+  }
+  size_t pos = *offset;
+  uint64_t buffer = 0;
+  int bits_in_buffer = 0;
+  uint64_t mask = (bit_width == 64) ? UINT64_MAX : ((1ULL << bit_width) - 1);
+  for (size_t i = 0; i < count; ++i) {
+    while (bits_in_buffer < bit_width) {
+      if (pos >= len) {
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid bit packed data");
+        return 0;
+      }
+      buffer |= ((uint64_t)data[pos++]) << bits_in_buffer;
+      bits_in_buffer += 8;
+    }
+    out[i] = buffer & mask;
+    buffer >>= bit_width;
+    bits_in_buffer -= bit_width;
+  }
+  *offset = pos;
+  return 1;
+}
+
+static int cp_parquet_encode_delta_binary_packed_i64(const unsigned char *data,
+                                                     size_t data_len,
+                                                     size_t count,
+                                                     CpStrBuf *out,
+                                                     CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid delta input");
+    return 0;
+  }
+  if (count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "delta requires values");
+    return 0;
+  }
+  uint64_t block_size = CP_PARQUET_DELTA_BLOCK_SIZE;
+  uint64_t mini_blocks = CP_PARQUET_DELTA_MINI_BLOCKS;
+  if (block_size == 0 || mini_blocks == 0 || block_size % mini_blocks != 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid delta layout");
+    return 0;
+  }
+
+  size_t offset = 0;
+  uint64_t first_u = 0;
+  if (!cp_parquet_read_u64(data, data_len, &offset, &first_u, err)) {
+    return 0;
+  }
+  int64_t first = (int64_t)first_u;
+
+  if (!cp_thrift_write_uvarint(out, block_size, err) ||
+      !cp_thrift_write_uvarint(out, mini_blocks, err) ||
+      !cp_thrift_write_uvarint(out, (uint64_t)count, err) ||
+      !cp_thrift_write_varint(out, first, err)) {
+    return 0;
+  }
+  if (count == 1) {
+    return 1;
+  }
+
+  size_t mini_block_size = (size_t)(block_size / mini_blocks);
+  int64_t deltas[CP_PARQUET_DELTA_BLOCK_SIZE];
+  uint64_t adjusted[CP_PARQUET_DELTA_BLOCK_SIZE];
+  uint8_t bit_widths[CP_PARQUET_DELTA_MINI_BLOCKS];
+  uint64_t pack_values[CP_PARQUET_DELTA_BLOCK_SIZE / CP_PARQUET_DELTA_MINI_BLOCKS];
+
+  size_t values_written = 1;
+  int64_t prev = first;
+  while (values_written < count) {
+    size_t remaining = count - values_written;
+    size_t block_values = remaining;
+    if (block_values > block_size) {
+      block_values = (size_t)block_size;
+    }
+    int64_t min_delta = INT64_MAX;
+    for (size_t i = 0; i < block_values; ++i) {
+      uint64_t raw = 0;
+      if (!cp_parquet_read_u64(data, data_len, &offset, &raw, err)) {
+        return 0;
+      }
+      int64_t value = (int64_t)raw;
+      int64_t delta = (int64_t)((uint64_t)value - (uint64_t)prev);
+      deltas[i] = delta;
+      prev = value;
+      if (delta < min_delta) {
+        min_delta = delta;
+      }
+    }
+    for (size_t i = 0; i < block_values; ++i) {
+      adjusted[i] = (uint64_t)deltas[i] - (uint64_t)min_delta;
+    }
+    for (size_t i = block_values; i < block_size; ++i) {
+      adjusted[i] = 0;
+    }
+
+    size_t block_offset = 0;
+    for (size_t m = 0; m < (size_t)mini_blocks; ++m) {
+      uint64_t max_adj = 0;
+      size_t values_in_mini = 0;
+      if (block_offset < block_values) {
+        values_in_mini = block_values - block_offset;
+        if (values_in_mini > mini_block_size) {
+          values_in_mini = mini_block_size;
+        }
+      }
+      for (size_t j = 0; j < values_in_mini; ++j) {
+        uint64_t value = adjusted[block_offset + j];
+        if (value > max_adj) {
+          max_adj = value;
+        }
+      }
+      bit_widths[m] = (uint8_t)cp_parquet_bit_width_u64(max_adj);
+      block_offset += mini_block_size;
+    }
+
+    if (!cp_thrift_write_varint(out, min_delta, err)) {
+      return 0;
+    }
+    for (size_t m = 0; m < (size_t)mini_blocks; ++m) {
+      if (!cp_buf_append_u8(out, bit_widths[m], err)) {
+        return 0;
+      }
+    }
+
+    block_offset = 0;
+    for (size_t m = 0; m < (size_t)mini_blocks; ++m) {
+      int bit_width = bit_widths[m];
+      for (size_t j = 0; j < mini_block_size; ++j) {
+        size_t idx = block_offset + j;
+        pack_values[j] = idx < block_values ? adjusted[idx] : 0;
+      }
+      if (!cp_parquet_pack_bits_u64(pack_values, mini_block_size, bit_width,
+                                    out, err)) {
+        return 0;
+      }
+      block_offset += mini_block_size;
+    }
+    values_written += block_values;
+  }
+
+  if (offset != count * 8) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid delta source data");
+    return 0;
+  }
+  return 1;
+}
+
+static int cp_parquet_decode_delta_binary_packed_i64(const unsigned char *data,
+                                                     size_t data_len,
+                                                     size_t count,
+                                                     int64_t *out,
+                                                     size_t *consumed,
+                                                     CpError *err) {
+  if (!data || (!out && count > 0)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid delta data");
+    return 0;
+  }
+  CpThriftReader reader = {data, data_len, 0};
+  uint64_t block_size = 0;
+  uint64_t mini_blocks = 0;
+  uint64_t total_count = 0;
+  if (!cp_thrift_read_uvarint(&reader, &block_size, err) ||
+      !cp_thrift_read_uvarint(&reader, &mini_blocks, err) ||
+      !cp_thrift_read_uvarint(&reader, &total_count, err)) {
+    return 0;
+  }
+  if (block_size == 0 || mini_blocks == 0 || block_size % mini_blocks != 0 ||
+      block_size > 65536 || mini_blocks > 1024) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid delta layout");
+    return 0;
+  }
+  if (total_count > SIZE_MAX) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "delta count overflow");
+    return 0;
+  }
+  if ((size_t)total_count != count) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "delta count mismatch");
+    return 0;
+  }
+  if (total_count == 0) {
+    if (consumed) {
+      *consumed = reader.pos;
+    }
+    return 1;
+  }
+
+  int64_t first = 0;
+  if (!cp_thrift_read_varint(&reader, &first, err)) {
+    return 0;
+  }
+  out[0] = first;
+  size_t out_idx = 1;
+  int64_t prev = first;
+
+  size_t mini_block_size = (size_t)(block_size / mini_blocks);
+  if (mini_block_size == 0 ||
+      mini_block_size > (SIZE_MAX / sizeof(uint64_t))) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid delta block size");
+    return 0;
+  }
+  uint8_t *bit_widths = (uint8_t *)malloc((size_t)mini_blocks);
+  uint64_t *values = (uint64_t *)malloc(mini_block_size * sizeof(uint64_t));
+  if (!bit_widths || !values) {
+    free(bit_widths);
+    free(values);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+
+  while (out_idx < count) {
+    int64_t min_delta = 0;
+    if (!cp_thrift_read_varint(&reader, &min_delta, err)) {
+      free(bit_widths);
+      free(values);
+      return 0;
+    }
+    for (size_t m = 0; m < (size_t)mini_blocks; ++m) {
+      unsigned char bw = 0;
+      if (!cp_thrift_read_byte(&reader, &bw, err)) {
+        free(bit_widths);
+        free(values);
+        return 0;
+      }
+      if (bw > 64) {
+        free(bit_widths);
+        free(values);
+        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid delta bit width");
+        return 0;
+      }
+      bit_widths[m] = (uint8_t)bw;
+    }
+    for (size_t m = 0; m < (size_t)mini_blocks; ++m) {
+      int bit_width = bit_widths[m];
+      if (!cp_parquet_unpack_bits_u64(reader.data, reader.len, &reader.pos,
+                                      mini_block_size, bit_width, values, err)) {
+        free(bit_widths);
+        free(values);
+        return 0;
+      }
+      for (size_t j = 0; j < mini_block_size; ++j) {
+        uint64_t adj = values[j];
+        uint64_t delta_u = (uint64_t)min_delta + adj;
+        int64_t delta = (int64_t)delta_u;
+        uint64_t value_u = (uint64_t)prev + (uint64_t)delta;
+        int64_t value = (int64_t)value_u;
+        if (out_idx < count) {
+          out[out_idx++] = value;
+        }
+        prev = value;
+      }
+    }
+  }
+
+  free(bit_widths);
+  free(values);
+  if (consumed) {
+    *consumed = reader.pos;
+  }
+  return 1;
+}
+
 typedef struct {
   size_t bucket_count;
   size_t mask;
@@ -11329,6 +11725,25 @@ static int cp_parquet_pick_codec(CpError *err) {
 #endif
   }
   cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown parquet codec");
+  return -1;
+}
+
+static int cp_parquet_pick_encoding(CpError *err) {
+  const char *env = getenv("CPANDAS_PARQUET_ENCODING");
+  if (!env || env[0] == '\0' || strcmp(env, "auto") == 0) {
+    return CP_PARQUET_ENCODING_AUTO;
+  }
+  if (strcmp(env, "plain") == 0) {
+    return CP_PARQUET_ENCODING_PLAIN;
+  }
+  if (strcmp(env, "dict") == 0 || strcmp(env, "dictionary") == 0) {
+    return CP_PARQUET_ENCODING_DICTIONARY;
+  }
+  if (strcmp(env, "delta") == 0 ||
+      strcmp(env, "delta-binary-packed") == 0) {
+    return CP_PARQUET_ENCODING_DELTA;
+  }
+  cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown parquet encoding");
   return -1;
 }
 
@@ -11761,6 +12176,9 @@ static int cp_parquet_write_file_metadata(CpStrBuf *buf,
       if (col->encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
           col->encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY) {
         encodings[enc_count++] = col->encoding;
+      }
+      if (col->encoding == CP_PARQUET_ENC_DELTA_BINARY_PACKED) {
+        encodings[enc_count++] = CP_PARQUET_ENC_DELTA_BINARY_PACKED;
       }
       if (!cp_thrift_write_list_header(buf, CP_THRIFT_I32, enc_count, err)) {
         return 0;
@@ -14709,7 +15127,11 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
 
       int is_dict = (header.encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
                      header.encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY);
+      int use_delta = 0;
+      int64_t *delta_values = NULL;
+      size_t delta_pos = 0;
       if (is_dict && dict_count == 0) {
+        free(delta_values);
         free(def_levels);
         free(page);
         cp_error_set(err, CP_ERR_PARSE, 0, col, "missing dictionary page");
@@ -14718,7 +15140,34 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         fclose(fp);
         return NULL;
       }
-      if (!is_dict && header.encoding != CP_PARQUET_ENC_PLAIN) {
+      if (!is_dict &&
+          header.encoding == CP_PARQUET_ENC_DELTA_BINARY_PACKED) {
+        if (parquet_type != CP_PARQUET_TYPE_INT64) {
+          free(delta_values);
+          free(def_levels);
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_INVALID, 0, col,
+                       "unsupported delta encoding");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        use_delta = 1;
+      } else if (!is_dict && header.encoding != CP_PARQUET_ENC_PLAIN) {
+        free(delta_values);
         free(def_levels);
         free(page);
         if (dict_i64) {
@@ -14741,10 +15190,62 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         return NULL;
       }
 
+      if (use_delta && non_null > 0) {
+        delta_values = (int64_t *)malloc(non_null * sizeof(int64_t));
+        if (!delta_values) {
+          free(delta_values);
+          free(def_levels);
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        size_t consumed = 0;
+        if (!cp_parquet_decode_delta_binary_packed_i64(
+                page + offset, page_size - offset, non_null,
+                delta_values, &consumed, err)) {
+          free(delta_values);
+          free(def_levels);
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        offset += consumed;
+      }
+
       uint32_t *indices = NULL;
       if (is_dict && non_null > 0) {
         indices = (uint32_t *)malloc(non_null * sizeof(uint32_t));
         if (!indices) {
+          free(delta_values);
           free(def_levels);
           free(page);
           if (dict_i64) {
@@ -14773,6 +15274,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
                                            : (uint32_t)(dict_count - 1),
                                        indices, &consumed, err)) {
           free(indices);
+          free(delta_values);
           free(def_levels);
           free(page);
           if (dict_i64) {
@@ -14813,6 +15315,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
           uint32_t index = indices ? indices[idx_pos++] : 0;
           if (index >= dict_count) {
             free(indices);
+            free(delta_values);
             free(def_levels);
             free(page);
             if (dict_i64) {
@@ -14845,6 +15348,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
             char *value = cp_strndup(src ? src : "", len);
             if (!value) {
               free(indices);
+              free(delta_values);
               free(def_levels);
               free(page);
               if (dict_i64) {
@@ -14873,6 +15377,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               uint32_t value = 0;
               if (!cp_parquet_read_u32(page, page_size, &offset, &value, err)) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -14896,9 +15401,38 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               break;
             }
             case CP_PARQUET_TYPE_INT64: {
+              if (use_delta) {
+                if (!delta_values || delta_pos >= non_null) {
+                  free(indices);
+                  free(delta_values);
+                  free(def_levels);
+                  free(page);
+                  if (dict_i64) {
+                    free(dict_i64);
+                  }
+                  if (dict_f64) {
+                    free(dict_f64);
+                  }
+                  if (dict_str) {
+                    for (size_t i = 0; i < dict_count; ++i) {
+                      free(dict_str[i]);
+                    }
+                    free(dict_str);
+                  }
+                  cp_error_set(err, CP_ERR_PARSE, row, col,
+                               "invalid delta data");
+                  cp_df_free(df);
+                  cp_parquet_meta_free(&meta);
+                  fclose(fp);
+                  return NULL;
+                }
+                series->data.i64[out_row] = delta_values[delta_pos++];
+                break;
+              }
               uint64_t value = 0;
               if (!cp_parquet_read_u64(page, page_size, &offset, &value, err)) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -14925,6 +15459,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               float value = 0.0f;
               if (!cp_parquet_read_f32(page, page_size, &offset, &value, err)) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -14951,6 +15486,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               double value = 0.0;
               if (!cp_parquet_read_f64(page, page_size, &offset, &value, err)) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -14977,6 +15513,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               uint32_t len = 0;
               if (!cp_parquet_read_u32(page, page_size, &offset, &len, err)) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -14998,6 +15535,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               }
               if (len > page_size - offset) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -15022,6 +15560,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
               char *value = cp_strndup((const char *)page + offset, len);
               if (!value) {
                 free(indices);
+                free(delta_values);
                 free(def_levels);
                 free(page);
                 if (dict_i64) {
@@ -15048,6 +15587,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
             }
             default:
               free(indices);
+              free(delta_values);
               free(def_levels);
               free(page);
               if (dict_i64) {
@@ -15073,6 +15613,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
 
       if (!is_dict && offset != page_size) {
         free(indices);
+        free(delta_values);
         free(def_levels);
         free(page);
         if (dict_i64) {
@@ -15095,6 +15636,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
       }
       if (is_dict && offset != page_size) {
         free(indices);
+        free(delta_values);
         free(def_levels);
         free(page);
         if (dict_i64) {
@@ -15117,6 +15659,7 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
       }
 
       free(indices);
+      free(delta_values);
       free(def_levels);
       free(page);
       if (dict_i64) {
@@ -15689,6 +16232,10 @@ int cp_df_write_parquet(const CpDataFrame *df,
   if (codec < 0) {
     return 0;
   }
+  int encoding_pref = cp_parquet_pick_encoding(err);
+  if (encoding_pref < 0) {
+    return 0;
+  }
 
   FILE *fp = fopen(path, "wb");
   if (!fp) {
@@ -15851,17 +16398,21 @@ int cp_df_write_parquet(const CpDataFrame *df,
       size_t dict_str_count = 0;
       size_t dict_str_cap = 0;
       size_t dict_len_cap = 0;
+      CpStrBuf delta_buf = (CpStrBuf){0};
+      int delta_init = 0;
 
       if (non_null > 0) {
         indices = (uint32_t *)malloc(non_null * sizeof(uint32_t));
         if (!indices) {
           cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
         }
         if (!cp_parquet_dict_index_init(&dict_index, non_null, err)) {
           free(indices);
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -15899,6 +16450,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                                            (uint64_t)value, err)) {
               cp_parquet_dict_index_free(&dict_index);
               free(indices);
+              cp_strbuf_free(&delta_buf);
               cp_strbuf_free(&values_buf);
               free(def_levels);
               goto cleanup;
@@ -15911,6 +16463,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 cp_parquet_dict_index_free(&dict_index);
                 free(indices);
                 free(dict_i64);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -15938,6 +16491,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
             if (!cp_parquet_buf_append_f64(&values_buf, value, err)) {
               cp_parquet_dict_index_free(&dict_index);
               free(indices);
+              cp_strbuf_free(&delta_buf);
               cp_strbuf_free(&values_buf);
               free(def_levels);
               goto cleanup;
@@ -15950,6 +16504,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 cp_parquet_dict_index_free(&dict_index);
                 free(indices);
                 free(dict_f64);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -15973,6 +16528,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                   cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
                   cp_parquet_dict_index_free(&dict_index);
                   free(indices);
+                  cp_strbuf_free(&delta_buf);
                   cp_strbuf_free(&values_buf);
                   free(def_levels);
                   goto cleanup;
@@ -15984,6 +16540,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                   cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
                   cp_parquet_dict_index_free(&dict_index);
                   free(indices);
+                  cp_strbuf_free(&delta_buf);
                   cp_strbuf_free(&values_buf);
                   free(def_levels);
                   goto cleanup;
@@ -16012,6 +16569,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                     cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
                     cp_parquet_dict_index_free(&dict_index);
                     free(indices);
+                    cp_strbuf_free(&delta_buf);
                     cp_strbuf_free(&values_buf);
                     free(def_levels);
                     goto cleanup;
@@ -16030,6 +16588,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                     cp_error_set(err, CP_ERR_OOM, 0, col, "out of memory");
                     cp_parquet_dict_index_free(&dict_index);
                     free(indices);
+                    cp_strbuf_free(&delta_buf);
                     cp_strbuf_free(&values_buf);
                     free(def_levels);
                     goto cleanup;
@@ -16046,6 +16605,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                            "string too large");
               cp_parquet_dict_index_free(&dict_index);
               free(indices);
+              cp_strbuf_free(&delta_buf);
               cp_strbuf_free(&values_buf);
               free(def_levels);
               goto cleanup;
@@ -16054,6 +16614,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 !cp_strbuf_append(&values_buf, value, len, err)) {
               cp_parquet_dict_index_free(&dict_index);
               free(indices);
+              cp_strbuf_free(&delta_buf);
               cp_strbuf_free(&values_buf);
               free(def_levels);
               goto cleanup;
@@ -16068,6 +16629,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 free(indices);
                 free(dict_str);
                 free(dict_str_lens);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -16080,6 +16642,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
             cp_error_set(err, CP_ERR_INVALID, src_row, col, "unsupported type");
             cp_parquet_dict_index_free(&dict_index);
             free(indices);
+            cp_strbuf_free(&delta_buf);
             cp_strbuf_free(&values_buf);
             free(def_levels);
             goto cleanup;
@@ -16104,6 +16667,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         free(dict_f64);
         free(dict_str);
         free(dict_str_lens);
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16114,7 +16678,9 @@ int cp_df_write_parquet(const CpDataFrame *df,
       int dict_init = 0;
       int indices_init = 0;
       int use_dict = 0;
+      int use_delta = 0;
       size_t dict_count = 0;
+      size_t dict_len = 0;
       if (dict_index_init && non_null > 0) {
         if (parquet_type == CP_PARQUET_TYPE_INT64) {
           dict_count = dict_i64_count;
@@ -16131,6 +16697,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
             free(dict_f64);
             free(dict_str);
             free(dict_str_lens);
+            cp_strbuf_free(&delta_buf);
             cp_strbuf_free(&values_buf);
             free(def_levels);
             goto cleanup;
@@ -16147,6 +16714,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 free(dict_str);
                 free(dict_str_lens);
                 cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -16162,6 +16730,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 free(dict_str);
                 free(dict_str_lens);
                 cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -16178,6 +16747,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 free(dict_str);
                 free(dict_str_lens);
                 cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -16191,6 +16761,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
                 free(dict_str);
                 free(dict_str_lens);
                 cp_strbuf_free(&dict_buf);
+                cp_strbuf_free(&delta_buf);
                 cp_strbuf_free(&values_buf);
                 free(def_levels);
                 goto cleanup;
@@ -16205,6 +16776,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
             free(dict_str);
             free(dict_str_lens);
             cp_strbuf_free(&dict_buf);
+            cp_strbuf_free(&delta_buf);
             cp_strbuf_free(&values_buf);
             free(def_levels);
             goto cleanup;
@@ -16221,13 +16793,80 @@ int cp_df_write_parquet(const CpDataFrame *df,
             free(dict_str_lens);
             cp_strbuf_free(&dict_buf);
             cp_strbuf_free(&indices_buf);
+            cp_strbuf_free(&delta_buf);
             cp_strbuf_free(&values_buf);
             free(def_levels);
             goto cleanup;
           }
-          if (dict_buf.len + indices_buf.len < values_buf.len) {
-            use_dict = 1;
+          dict_len = dict_buf.len + indices_buf.len;
+        }
+      }
+
+      if (parquet_type == CP_PARQUET_TYPE_INT64 && non_null > 0 &&
+          (encoding_pref == CP_PARQUET_ENCODING_AUTO ||
+           encoding_pref == CP_PARQUET_ENCODING_DELTA)) {
+        if (!cp_strbuf_init(&delta_buf, 0, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
           }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&delta_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        if (!cp_parquet_encode_delta_binary_packed_i64(
+                (const unsigned char *)values_buf.data, values_buf.len,
+                non_null, &delta_buf, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&delta_buf);
+          cp_strbuf_free(&delta_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+        delta_init = 1;
+      }
+
+      if (encoding_pref == CP_PARQUET_ENCODING_PLAIN) {
+        use_dict = 0;
+        use_delta = 0;
+      } else if (encoding_pref == CP_PARQUET_ENCODING_DICTIONARY) {
+        if (dict_index_init && non_null > 0) {
+          use_dict = 1;
+        }
+      } else if (encoding_pref == CP_PARQUET_ENCODING_DELTA &&
+                 parquet_type == CP_PARQUET_TYPE_INT64 && delta_init) {
+        use_delta = 1;
+      } else {
+        size_t best_len = values_buf.len;
+        if (dict_index_init && non_null > 0 && dict_len > 0 &&
+            dict_len < best_len) {
+          use_dict = 1;
+          best_len = dict_len;
+        }
+        if (delta_init && delta_buf.len < best_len) {
+          use_delta = 1;
+          use_dict = 0;
         }
       }
 
@@ -16247,6 +16886,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           if (indices_init) {
             cp_strbuf_free(&indices_buf);
           }
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16266,6 +16906,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           if (indices_init) {
             cp_strbuf_free(&indices_buf);
           }
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16285,6 +16926,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           if (indices_init) {
             cp_strbuf_free(&indices_buf);
           }
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16308,6 +16950,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16330,6 +16973,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           if (indices_init) {
             cp_strbuf_free(&indices_buf);
           }
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16351,6 +16995,31 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           cp_strbuf_free(&dict_buf);
           cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&delta_buf);
+          cp_strbuf_free(&values_buf);
+          free(def_levels);
+          goto cleanup;
+        }
+      } else if (use_delta) {
+        if (!cp_strbuf_append(&data_buf, delta_buf.data,
+                              delta_buf.len, err)) {
+          cp_parquet_dict_index_free(&dict_index);
+          free(indices);
+          free(dict_i64);
+          free(dict_f64);
+          free(dict_str);
+          free(dict_str_lens);
+          cp_strbuf_free(&data_buf);
+          if (def_init) {
+            cp_strbuf_free(&def_buf);
+          }
+          if (dict_init) {
+            cp_strbuf_free(&dict_buf);
+          }
+          if (indices_init) {
+            cp_strbuf_free(&indices_buf);
+          }
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16374,6 +17043,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           if (indices_init) {
             cp_strbuf_free(&indices_buf);
           }
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16398,6 +17068,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16422,6 +17093,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16450,6 +17122,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           cp_strbuf_free(&dict_buf);
           cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16472,6 +17145,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           cp_strbuf_free(&dict_buf);
           cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16497,6 +17171,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           cp_strbuf_free(&dict_buf);
           cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16519,6 +17194,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           cp_strbuf_free(&dict_buf);
           cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16542,6 +17218,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
           }
           cp_strbuf_free(&dict_buf);
           cp_strbuf_free(&indices_buf);
+          cp_strbuf_free(&delta_buf);
           cp_strbuf_free(&values_buf);
           free(def_levels);
           goto cleanup;
@@ -16555,6 +17232,10 @@ int cp_df_write_parquet(const CpDataFrame *df,
         cp_strbuf_free(&dict_header);
       }
 
+      int data_encoding =
+          use_dict ? CP_PARQUET_ENC_RLE_DICTIONARY
+                   : (use_delta ? CP_PARQUET_ENC_DELTA_BINARY_PACKED
+                                : CP_PARQUET_ENC_PLAIN);
       CpStrBuf data_header = (CpStrBuf){0};
       if (!cp_strbuf_init(&data_header, 0, err)) {
         cp_parquet_dict_index_free(&dict_index);
@@ -16574,6 +17255,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16582,7 +17264,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
               &data_header, (int32_t)rg_rows,
               (int32_t)data_buf.len,
               (int32_t)compressed_data.len,
-              use_dict ? CP_PARQUET_ENC_RLE_DICTIONARY : CP_PARQUET_ENC_PLAIN,
+              data_encoding,
               schema[col].max_def_level > 0 ? CP_PARQUET_ENC_RLE : 0,
               0, err)) {
         cp_parquet_dict_index_free(&dict_index);
@@ -16603,6 +17285,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16629,6 +17312,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16655,6 +17339,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         if (indices_init) {
           cp_strbuf_free(&indices_buf);
         }
+        cp_strbuf_free(&delta_buf);
         cp_strbuf_free(&values_buf);
         free(def_levels);
         goto cleanup;
@@ -16663,8 +17348,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
       col_meta->data_page_offset = (int64_t)data_offset;
       col_meta->total_uncompressed_size = total_uncompressed;
       col_meta->total_compressed_size = total_compressed;
-      col_meta->encoding = use_dict ? CP_PARQUET_ENC_RLE_DICTIONARY
-                                    : CP_PARQUET_ENC_PLAIN;
+      col_meta->encoding = data_encoding;
 
       cp_parquet_dict_index_free(&dict_index);
       free(indices);
@@ -16684,6 +17368,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
       if (indices_init) {
         cp_strbuf_free(&indices_buf);
       }
+      cp_strbuf_free(&delta_buf);
       cp_strbuf_free(&values_buf);
       free(def_levels);
     }
