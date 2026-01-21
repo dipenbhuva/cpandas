@@ -1931,6 +1931,96 @@ static void test_fillna_strategy(void) {
   cp_df_free(df);
 }
 
+static void test_fillna_ffill_bfill(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"a", "b", "c"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "1.5", "x"};
+  const char *row2[] = {"", "", ""};
+  const char *row3[] = {"3", "", "y"};
+  const char *row4[] = {"", "4.5", ""};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+
+  CpFillStrategy ffill[] = {CP_FILL_FFILL, CP_FILL_FFILL, CP_FILL_FFILL};
+  CpDataFrame *ffilled =
+      cp_df_fillna_strategy(df, ffill, NULL, 3, &err);
+  CHECK(ffilled != NULL);
+  if (ffilled) {
+    const CpSeries *a = cp_df_get_col(ffilled, "a");
+    const CpSeries *b = cp_df_get_col(ffilled, "b");
+    const CpSeries *c = cp_df_get_col(ffilled, "c");
+    CHECK(a && b && c);
+
+    int64_t a_val = 0;
+    double b_val = 0.0;
+    const char *c_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(a, 1, &a_val, &is_null));
+    CHECK(!is_null && a_val == 1);
+    CHECK(cp_series_get_int64(a, 3, &a_val, &is_null));
+    CHECK(!is_null && a_val == 3);
+
+    CHECK(cp_series_get_float64(b, 1, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 1.5) < 1e-9);
+    CHECK(cp_series_get_float64(b, 2, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 1.5) < 1e-9);
+
+    CHECK(cp_series_get_string(c, 1, &c_val, &is_null));
+    CHECK(!is_null && strcmp(c_val, "x") == 0);
+    CHECK(cp_series_get_string(c, 3, &c_val, &is_null));
+    CHECK(!is_null && strcmp(c_val, "y") == 0);
+
+    cp_df_free(ffilled);
+  }
+
+  CpFillStrategy bfill[] = {CP_FILL_BFILL, CP_FILL_BFILL, CP_FILL_BFILL};
+  CpDataFrame *bfilled =
+      cp_df_fillna_strategy(df, bfill, NULL, 3, &err);
+  CHECK(bfilled != NULL);
+  if (bfilled) {
+    const CpSeries *a = cp_df_get_col(bfilled, "a");
+    const CpSeries *b = cp_df_get_col(bfilled, "b");
+    const CpSeries *c = cp_df_get_col(bfilled, "c");
+    CHECK(a && b && c);
+
+    int64_t a_val = 0;
+    double b_val = 0.0;
+    const char *c_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(a, 1, &a_val, &is_null));
+    CHECK(!is_null && a_val == 3);
+    CHECK(cp_series_get_int64(a, 3, &a_val, &is_null));
+    CHECK(is_null);
+
+    CHECK(cp_series_get_float64(b, 1, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 4.5) < 1e-9);
+    CHECK(cp_series_get_float64(b, 2, &b_val, &is_null));
+    CHECK(!is_null && fabs(b_val - 4.5) < 1e-9);
+
+    CHECK(cp_series_get_string(c, 1, &c_val, &is_null));
+    CHECK(!is_null && strcmp(c_val, "y") == 0);
+    CHECK(cp_series_get_string(c, 3, &c_val, &is_null));
+    CHECK(is_null);
+
+    cp_df_free(bfilled);
+  }
+
+  cp_df_free(df);
+}
+
 static void test_unique_counts_int64(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4770,6 +4860,7 @@ int main(void) {
   test_metadata_helpers();
   test_dtypes_and_rename_drop_fill();
   test_fillna_strategy();
+  test_fillna_ffill_bfill();
   test_unique_counts_int64();
   test_unique_counts_string();
   test_sample();
