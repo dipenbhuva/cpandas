@@ -9833,25 +9833,34 @@ static int cp_parquet_compress(int codec,
       return cp_snappy_compress(data, len, out, err);
     case CP_PARQUET_CODEC_GZIP: {
 #ifdef CPANDAS_HAVE_ZLIB
-      uLongf bound = compressBound((uLong)len);
+      z_stream stream;
+      memset(&stream, 0, sizeof(stream));
+      if (len > UINT_MAX) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip input too large");
+        return 0;
+      }
+      int rc = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED,
+                            15 + 16, 8, Z_DEFAULT_STRATEGY);
+      if (rc != Z_OK) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip init failed");
+        return 0;
+      }
+      uLong bound = deflateBound(&stream, (uLong)len);
+      if (bound > UINT_MAX) {
+        deflateEnd(&stream);
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip output too large");
+        return 0;
+      }
       unsigned char *buf = (unsigned char *)malloc((size_t)bound);
       if (!buf) {
+        deflateEnd(&stream);
         cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
         return 0;
       }
-      z_stream stream;
-      memset(&stream, 0, sizeof(stream));
       stream.next_in = (Bytef *)data;
       stream.avail_in = (uInt)len;
       stream.next_out = buf;
       stream.avail_out = (uInt)bound;
-      int rc = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED,
-                            15 + 16, 8, Z_DEFAULT_STRATEGY);
-      if (rc != Z_OK) {
-        free(buf);
-        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip init failed");
-        return 0;
-      }
       rc = deflate(&stream, Z_FINISH);
       if (rc != Z_STREAM_END) {
         deflateEnd(&stream);
@@ -9899,6 +9908,10 @@ static int cp_parquet_decompress(int codec,
       return cp_snappy_decompress(data, len, out, out_len, err);
     case CP_PARQUET_CODEC_GZIP: {
 #ifdef CPANDAS_HAVE_ZLIB
+      if (len > UINT_MAX || out_len > UINT_MAX) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "gzip size too large");
+        return 0;
+      }
       z_stream stream;
       memset(&stream, 0, sizeof(stream));
       stream.next_in = (Bytef *)data;
@@ -15000,6 +15013,8 @@ int cp_df_write_parquet(const CpDataFrame *df,
   }
 
   CpParquetRowGroupMeta *row_groups = NULL;
+  CpStrBuf meta_buf = (CpStrBuf){0};
+  int meta_init = 0;
   if (row_group_count > 0) {
     row_groups =
         (CpParquetRowGroupMeta *)calloc(row_group_count,
@@ -15063,13 +15078,11 @@ int cp_df_write_parquet(const CpDataFrame *df,
         }
       }
 
-      CpStrBuf values_buf;
-      int values_init = 0;
+      CpStrBuf values_buf = (CpStrBuf){0};
       if (!cp_strbuf_init(&values_buf, 0, err)) {
         free(def_levels);
         goto cleanup;
       }
-      values_init = 1;
 
       CpParquetDictIndex dict_index;
       int dict_index_init = 0;
@@ -15226,8 +15239,8 @@ int cp_df_write_parquet(const CpDataFrame *df,
         goto cleanup;
       }
 
-      CpStrBuf dict_buf;
-      CpStrBuf indices_buf;
+      CpStrBuf dict_buf = (CpStrBuf){0};
+      CpStrBuf indices_buf = (CpStrBuf){0};
       int dict_init = 0;
       int indices_init = 0;
       int use_dict = 0;
@@ -15348,7 +15361,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         }
       }
 
-      CpStrBuf def_buf;
+      CpStrBuf def_buf = (CpStrBuf){0};
       int def_init = 0;
       if (schema[col].max_def_level > 0 && rg_rows > 0) {
         if (!cp_strbuf_init(&def_buf, 0, err)) {
@@ -15408,7 +15421,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         }
       }
 
-      CpStrBuf data_buf;
+      CpStrBuf data_buf = (CpStrBuf){0};
       if (!cp_strbuf_init(&data_buf, 0, err)) {
         cp_parquet_dict_index_free(&dict_index);
         free(indices);
@@ -15497,7 +15510,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         }
       }
 
-      CpStrBuf compressed_data;
+      CpStrBuf compressed_data = (CpStrBuf){0};
       if (!cp_strbuf_init(&compressed_data, 0, err)) {
         cp_parquet_dict_index_free(&dict_index);
         free(indices);
@@ -15548,8 +15561,8 @@ int cp_df_write_parquet(const CpDataFrame *df,
       int64_t total_compressed = (int64_t)compressed_data.len;
 
       if (use_dict) {
-        CpStrBuf compressed_dict;
-        CpStrBuf dict_header;
+        CpStrBuf compressed_dict = (CpStrBuf){0};
+        CpStrBuf dict_header = (CpStrBuf){0};
         if (!cp_strbuf_init(&compressed_dict, 0, err) ||
             !cp_strbuf_init(&dict_header, 0, err)) {
           cp_parquet_dict_index_free(&dict_index);
@@ -15558,6 +15571,8 @@ int cp_df_write_parquet(const CpDataFrame *df,
           free(dict_f64);
           free(dict_str);
           free(dict_str_lens);
+          cp_strbuf_free(&compressed_dict);
+          cp_strbuf_free(&dict_header);
           cp_strbuf_free(&compressed_data);
           cp_strbuf_free(&data_buf);
           if (def_init) {
@@ -15670,7 +15685,7 @@ int cp_df_write_parquet(const CpDataFrame *df,
         cp_strbuf_free(&dict_header);
       }
 
-      CpStrBuf data_header;
+      CpStrBuf data_header = (CpStrBuf){0};
       if (!cp_strbuf_init(&data_header, 0, err)) {
         cp_parquet_dict_index_free(&dict_index);
         free(indices);
@@ -15812,8 +15827,6 @@ int cp_df_write_parquet(const CpDataFrame *df,
         (int64_t)(rg_end_offset - rg_start_offset);
   }
 
-  CpStrBuf meta_buf;
-  int meta_init = 0;
   if (!cp_strbuf_init(&meta_buf, 0, err)) {
     goto cleanup;
   }
