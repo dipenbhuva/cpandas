@@ -10433,10 +10433,16 @@ static int cp_snappy_decompress(const unsigned char *data,
 #define CP_PARQUET_TYPE_BYTE_ARRAY 6
 
 #define CP_PARQUET_ENC_PLAIN 0
-#define CP_PARQUET_ENC_PLAIN_DICTIONARY 1
-#define CP_PARQUET_ENC_RLE 2
-#define CP_PARQUET_ENC_DELTA_BINARY_PACKED 4
-#define CP_PARQUET_ENC_RLE_DICTIONARY 7
+#define CP_PARQUET_ENC_PLAIN_DICTIONARY 2
+#define CP_PARQUET_ENC_RLE 3
+#define CP_PARQUET_ENC_BIT_PACKED 4
+#define CP_PARQUET_ENC_DELTA_BINARY_PACKED 5
+#define CP_PARQUET_ENC_RLE_DICTIONARY 8
+
+#define CP_PARQUET_ENC_LEGACY_PLAIN_DICTIONARY 1
+#define CP_PARQUET_ENC_LEGACY_RLE 2
+#define CP_PARQUET_ENC_LEGACY_RLE_DICTIONARY 7
+#define CP_PARQUET_ENC_LEGACY_DELTA_BINARY_PACKED CP_PARQUET_ENC_BIT_PACKED
 
 #define CP_PARQUET_CODEC_UNCOMPRESSED 0
 #define CP_PARQUET_CODEC_SNAPPY 1
@@ -10602,11 +10608,8 @@ static int cp_parquet_encode_levels(const uint8_t *levels,
     return 0;
   }
   int bit_width = cp_parquet_bit_width(max_level);
-  if (bit_width <= 0) {
+  if (bit_width < 0) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid levels");
-    return 0;
-  }
-  if (!cp_buf_append_u8(out, (unsigned char)bit_width, err)) {
     return 0;
   }
   size_t value_bytes = (size_t)((bit_width + 7) / 8);
@@ -10632,29 +10635,22 @@ static int cp_parquet_encode_levels(const uint8_t *levels,
   return 1;
 }
 
-static int cp_parquet_decode_levels(const unsigned char *data,
-                                    size_t data_len,
-                                    size_t count,
-                                    uint8_t max_level,
-                                    uint8_t *out,
-                                    CpError *err) {
-  if (!data || !out) {
-    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid levels");
-    return 0;
-  }
-  if (data_len == 0) {
+static int cp_parquet_decode_levels_internal(const unsigned char *data,
+                                             size_t data_len,
+                                             size_t count,
+                                             uint8_t max_level,
+                                             int bit_width,
+                                             size_t start,
+                                             uint8_t *out,
+                                             size_t *consumed,
+                                             CpError *err) {
+  if (bit_width < 0) {
     cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
     return 0;
   }
-  int expected_width = cp_parquet_bit_width(max_level);
-  int bit_width = (int)data[0];
-  if (bit_width <= 0 || bit_width > expected_width) {
-    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
-    return 0;
-  }
-  size_t value_bytes = (size_t)((bit_width + 7) / 8);
-  size_t pos = 1;
+  size_t pos = start;
   size_t out_idx = 0;
+  size_t value_bytes = (size_t)((bit_width + 7) / 8);
   while (pos < data_len && out_idx < count) {
     uint64_t header = 0;
     int shift = 0;
@@ -10687,6 +10683,13 @@ static int cp_parquet_decode_levels(const unsigned char *data,
         cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
         return 0;
       }
+      if (bit_width == 0) {
+        for (size_t i = 0; i < value_count && out_idx < count; ++i) {
+          out[out_idx++] = 0;
+        }
+        pos += bytes_needed;
+        continue;
+      }
       uint64_t buffer = 0;
       int bits_in_buffer = 0;
       uint64_t mask = (bit_width == 64) ? UINT64_MAX
@@ -10709,13 +10712,15 @@ static int cp_parquet_decode_levels(const unsigned char *data,
       }
     } else {
       uint64_t run = header >> 1;
-      if (pos + value_bytes > data_len) {
-        cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
-        return 0;
-      }
       uint8_t value = 0;
-      for (size_t b = 0; b < value_bytes; ++b) {
-        value |= (uint8_t)(data[pos++] << (b * 8));
+      if (bit_width > 0) {
+        if (pos + value_bytes > data_len) {
+          cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+          return 0;
+        }
+        for (size_t b = 0; b < value_bytes; ++b) {
+          value |= (uint8_t)(data[pos++] << (b * 8));
+        }
       }
       if (value > max_level) {
         cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def level");
@@ -10730,7 +10735,39 @@ static int cp_parquet_decode_levels(const unsigned char *data,
     cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
     return 0;
   }
+  if (consumed) {
+    *consumed = pos;
+  }
   return 1;
+}
+
+static int cp_parquet_decode_levels(const unsigned char *data,
+                                    size_t data_len,
+                                    size_t count,
+                                    uint8_t max_level,
+                                    int has_prefix,
+                                    uint8_t *out,
+                                    CpError *err) {
+  if (!data || !out) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid levels");
+    return 0;
+  }
+  if (data_len == 0) {
+    cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+    return 0;
+  }
+  int expected_width = cp_parquet_bit_width(max_level);
+  if (has_prefix) {
+    int prefix_width = (int)data[0];
+    if (prefix_width < 0 || prefix_width > expected_width) {
+      cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid def levels");
+      return 0;
+    }
+    return cp_parquet_decode_levels_internal(data, data_len, count, max_level,
+                                             prefix_width, 1, out, NULL, err);
+  }
+  return cp_parquet_decode_levels_internal(data, data_len, count, max_level,
+                                           expected_width, 0, out, NULL, err);
 }
 
 static int cp_parquet_encode_indices(const uint32_t *values,
@@ -11678,6 +11715,8 @@ typedef struct {
   CpDType *dtypes;
   int *parquet_types;
   int *max_def_levels;
+  int *max_rep_levels;
+  int allow_legacy_encodings;
   size_t row_group_count;
   size_t *row_group_rows;
   int64_t *data_page_offsets;
@@ -11710,6 +11749,7 @@ static void cp_parquet_meta_free(CpParquetFileMeta *meta) {
   free(meta->dtypes);
   free(meta->parquet_types);
   free(meta->max_def_levels);
+  free(meta->max_rep_levels);
   free(meta->data_page_offsets);
   free(meta->dictionary_page_offsets);
   free(meta->row_group_rows);
@@ -11718,6 +11758,7 @@ static void cp_parquet_meta_free(CpParquetFileMeta *meta) {
   meta->dtypes = NULL;
   meta->parquet_types = NULL;
   meta->max_def_levels = NULL;
+  meta->max_rep_levels = NULL;
   meta->data_page_offsets = NULL;
   meta->dictionary_page_offsets = NULL;
   meta->row_group_rows = NULL;
@@ -11738,6 +11779,39 @@ static int cp_parquet_type_for_dtype(CpDType dtype) {
     default:
       return -1;
   }
+}
+
+static int cp_parquet_is_level_encoding(int encoding, int legacy_ok) {
+  if (encoding == CP_PARQUET_ENC_RLE || encoding == CP_PARQUET_ENC_BIT_PACKED) {
+    return 1;
+  }
+  return legacy_ok && encoding == CP_PARQUET_ENC_LEGACY_RLE;
+}
+
+static int cp_parquet_is_dict_encoding(int encoding, int legacy_ok) {
+  if (encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
+      encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY) {
+    return 1;
+  }
+  if (!legacy_ok) {
+    return 0;
+  }
+  return encoding == CP_PARQUET_ENC_LEGACY_RLE_DICTIONARY ||
+         encoding == CP_PARQUET_ENC_LEGACY_PLAIN_DICTIONARY;
+}
+
+static int cp_parquet_is_plain_dict_encoding(int encoding, int legacy_ok) {
+  if (encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY) {
+    return 1;
+  }
+  return legacy_ok && encoding == CP_PARQUET_ENC_LEGACY_PLAIN_DICTIONARY;
+}
+
+static int cp_parquet_is_delta_encoding(int encoding, int legacy_ok) {
+  if (encoding == CP_PARQUET_ENC_DELTA_BINARY_PACKED) {
+    return 1;
+  }
+  return legacy_ok && encoding == CP_PARQUET_ENC_LEGACY_DELTA_BINARY_PACKED;
 }
 
 static int cp_parquet_dtype_from_type(int type,
@@ -12212,7 +12286,7 @@ static int cp_parquet_write_file_metadata(CpStrBuf *buf,
     for (size_t i = 0; i < ncols; ++i) {
       const CpParquetColumnChunkMeta *col = &group->cols[i];
       int16_t cc_last = 0;
-      if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 2, &cc_last,
+      if (!cp_thrift_write_field_begin(buf, CP_THRIFT_STRUCT, 3, &cc_last,
                                        err)) {
         return 0;
       }
@@ -12388,7 +12462,7 @@ static int cp_parquet_write_file_metadata(CpStrBuf *buf,
       return 0;
     }
   }
-  if (!cp_thrift_write_field_binary(buf, 6, "cpandas", &last_id, err)) {
+  if (!cp_thrift_write_field_binary(buf, 6, "cpandas/1", &last_id, err)) {
     return 0;
   }
   return cp_thrift_write_stop(buf, err);
@@ -12429,6 +12503,7 @@ typedef struct {
 typedef struct {
   char *name;
   int def_level;
+  int rep_level;
   int remaining_children;
 } CpParquetSchemaFrame;
 
@@ -12717,7 +12792,8 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
         expected_children = elems[0].has_num_children
                                 ? elems[0].num_children
                                 : (int)(count - 1);
-        if (expected_children < 0 || expected_children != (int)(count - 1)) {
+        if (expected_children <= 0 ||
+            expected_children > (int)(count - 1)) {
           cp_error_set(err, CP_ERR_PARSE, 0, 0, "invalid parquet schema");
           goto schema_fail;
         }
@@ -12763,8 +12839,9 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
         out->dtypes = (CpDType *)malloc(out->ncols * sizeof(CpDType));
         out->parquet_types = (int *)malloc(out->ncols * sizeof(int));
         out->max_def_levels = (int *)calloc(out->ncols, sizeof(int));
+        out->max_rep_levels = (int *)calloc(out->ncols, sizeof(int));
         if (!out->names || !out->dtypes || !out->parquet_types ||
-            !out->max_def_levels) {
+            !out->max_def_levels || !out->max_rep_levels) {
           cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
           goto schema_fail;
         }
@@ -12777,6 +12854,7 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
         }
         frames[depth++] = (CpParquetSchemaFrame){.name = NULL,
                                                  .def_level = 0,
+                                                 .rep_level = 0,
                                                  .remaining_children =
                                                      expected_children};
 
@@ -12807,10 +12885,12 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
             goto schema_fail;
           }
           int def_level = frames[depth - 1].def_level + def_inc;
+          int rep_level = frames[depth - 1].rep_level;
           if (elem->has_num_children && elem->num_children > 0) {
             frames[depth - 1].remaining_children -= 1;
             frames[depth].name = elem->name;
             frames[depth].def_level = def_level;
+            frames[depth].rep_level = rep_level;
             frames[depth].remaining_children = elem->num_children;
             depth += 1;
             elem->name = NULL;
@@ -12865,6 +12945,7 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
           out->dtypes[out_idx] = dtype;
           out->parquet_types[out_idx] = elem->type;
           out->max_def_levels[out_idx] = def_level;
+          out->max_rep_levels[out_idx] = rep_level;
           out_idx += 1;
         }
 
@@ -13015,7 +13096,8 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
                   if (cc_type == CP_THRIFT_STOP) {
                     break;
                   }
-                  if (cc_field == 2 && cc_type == CP_THRIFT_STRUCT) {
+                  if ((cc_field == 2 || cc_field == 3) &&
+                      cc_type == CP_THRIFT_STRUCT) {
                     if (!cp_parquet_read_column_meta(&r, &meta, err)) {
                       cp_parquet_column_meta_clear(&meta);
                       cp_parquet_meta_free(out);
@@ -13132,6 +13214,18 @@ static int cp_parquet_parse_file_metadata(const unsigned char *data,
           (void)have_rg_rows;
         }
         have_row_groups = 1;
+        break;
+      }
+      case 6: {
+        char *created_by = NULL;
+        if (!cp_thrift_read_string(&r, &created_by, err)) {
+          cp_parquet_meta_free(out);
+          return 0;
+        }
+        if (created_by && strcmp(created_by, "cpandas") == 0) {
+          out->allow_legacy_encodings = 1;
+        }
+        free(created_by);
         break;
       }
       default:
@@ -14914,7 +15008,8 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
           return NULL;
         }
         if (dict_header.dict_encoding != CP_PARQUET_ENC_PLAIN &&
-            dict_header.dict_encoding != CP_PARQUET_ENC_PLAIN_DICTIONARY) {
+            !cp_parquet_is_plain_dict_encoding(dict_header.dict_encoding,
+                                               meta.allow_legacy_encodings)) {
           cp_error_set(err, CP_ERR_INVALID, 0, col,
                        "unsupported dictionary encoding");
           cp_df_free(df);
@@ -15157,7 +15252,8 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         return NULL;
       }
       if (meta.max_def_levels[col] > 0 &&
-          header.def_encoding != CP_PARQUET_ENC_RLE) {
+          !cp_parquet_is_level_encoding(header.def_encoding,
+                                        meta.allow_legacy_encodings)) {
         if (dict_i64) {
           free(dict_i64);
         }
@@ -15178,7 +15274,8 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         return NULL;
       }
       if (header.rep_encoding != 0 &&
-          header.rep_encoding != CP_PARQUET_ENC_RLE) {
+          !cp_parquet_is_level_encoding(header.rep_encoding,
+                                        meta.allow_legacy_encodings)) {
         if (dict_i64) {
           free(dict_i64);
         }
@@ -15242,6 +15339,51 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
       }
 
       size_t offset = 0;
+      if (meta.max_rep_levels && meta.max_rep_levels[col] > 0 &&
+          header.rep_encoding != 0 && rg_rows > 0) {
+        uint32_t rep_len = 0;
+        if (!cp_parquet_read_u32(page, page_size, &offset, &rep_len, err)) {
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        if (rep_len > page_size - offset) {
+          free(page);
+          if (dict_i64) {
+            free(dict_i64);
+          }
+          if (dict_f64) {
+            free(dict_f64);
+          }
+          if (dict_str) {
+            for (size_t i = 0; i < dict_count; ++i) {
+              free(dict_str[i]);
+            }
+            free(dict_str);
+          }
+          cp_error_set(err, CP_ERR_PARSE, 0, col,
+                       "invalid repetition levels");
+          cp_df_free(df);
+          cp_parquet_meta_free(&meta);
+          fclose(fp);
+          return NULL;
+        }
+        offset += rep_len;
+      }
       uint8_t *def_levels = NULL;
       uint8_t max_def = 0;
       if (meta.max_def_levels[col] > 0 && rg_rows > 0) {
@@ -15328,8 +15470,11 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
           fclose(fp);
           return NULL;
         }
+        int def_has_prefix =
+            meta.allow_legacy_encodings &&
+            header.def_encoding == CP_PARQUET_ENC_LEGACY_RLE;
         if (!cp_parquet_decode_levels(page + offset, def_len, rg_rows, max_def,
-                                      def_levels, err)) {
+                                      def_has_prefix, def_levels, err)) {
           free(def_levels);
           free(page);
           if (dict_i64) {
@@ -15383,8 +15528,9 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         non_null = rg_rows;
       }
 
-      int is_dict = (header.encoding == CP_PARQUET_ENC_RLE_DICTIONARY ||
-                     header.encoding == CP_PARQUET_ENC_PLAIN_DICTIONARY);
+      int is_dict =
+          cp_parquet_is_dict_encoding(header.encoding,
+                                      meta.allow_legacy_encodings);
       int use_delta = 0;
       int64_t *delta_values = NULL;
       size_t delta_pos = 0;
@@ -15399,7 +15545,8 @@ CpDataFrame *cp_df_read_parquet(const char *path, CpError *err) {
         return NULL;
       }
       if (!is_dict &&
-          header.encoding == CP_PARQUET_ENC_DELTA_BINARY_PACKED) {
+          cp_parquet_is_delta_encoding(header.encoding,
+                                       meta.allow_legacy_encodings)) {
         if (parquet_type != CP_PARQUET_TYPE_INT64) {
           free(delta_values);
           free(def_levels);
