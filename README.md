@@ -66,6 +66,11 @@ zlib and can be selected with `CPANDAS_PARQUET_CODEC=gzip`. Repeated fields and
 complex nested types are not supported yet. The default row-group size is
 65,536 rows.
 
+Compatibility note: cpandas follows the Parquet spec encoding IDs; older
+cpandas files (created_by = `cpandas`) used legacy IDs and RLE level headers.
+Those legacy files are still readable, while new files are written with
+spec-compliant encodings.
+
 ## Repo metadata (SEO)
 
 Suggested GitHub description:
