@@ -18,6 +18,8 @@ I/O
 - NDJSON read/write (line-delimited objects).
 - CPD binary read/write (cpandas columnar format).
 - Parquet read/write (C-only, Snappy/uncompressed, dictionary support).
+- Parquet nested schema write for dotted column names and list/map prefixes.
+- Parquet list/map read/write (string-only values encoded as JSON arrays/objects).
 
 Data exploration
 - `head` / `tail` row slicing helpers.
@@ -103,7 +105,7 @@ Indexing and missing values
 - None.
 
 I/O and formats
-- Additional Parquet features (repeated/list/map types, nested write support).
+- None.
 
 Performance and scalability
 - SIMD or parallel ops.
@@ -158,6 +160,8 @@ Advanced pandas features
   statistics (min/max/null_count), and primitive types (int64, float64,
   string/UTF8) with optional nulls. GZIP compression is supported when built with
   zlib and selected via `CPANDAS_PARQUET_CODEC=gzip`.
+- Parquet list/map columns are exposed as `list:`/`map:` string columns containing
+  JSON arrays/objects with string values (nulls allowed); map keys must be strings.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional

@@ -1024,6 +1024,81 @@ static void test_parquet_nested_struct(void) {
   free(path);
 }
 
+static void test_parquet_list_map(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "list:tags", "map:attrs"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_STRING, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "[\"a\",\"b\"]", "{\"x\":\"1\",\"y\":null}"};
+  const char *row2[] = {"2", "[]", "{}"};
+  const char *row3[] = {"3", "", ""};
+  const char *row4[] = {"4", "[\"c\",null]", "{\"k\":\"v\"}"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+
+  char *path = make_temp_path();
+  CHECK(path != NULL);
+  if (path) {
+    cp_error_clear(&err);
+    CHECK(cp_df_write_parquet(df, path, &err));
+    cp_error_clear(&err);
+    CpDataFrame *df2 = cp_df_read_parquet(path, &err);
+    CHECK(df2 != NULL);
+    if (df2) {
+      const CpSeries *id = cp_df_get_col(df2, "id");
+      const CpSeries *tags = cp_df_get_col(df2, "list:tags");
+      const CpSeries *attrs = cp_df_get_col(df2, "map:attrs");
+      CHECK(id && tags && attrs);
+      if (id && tags && attrs) {
+        int64_t id_val = 0;
+        const char *val = NULL;
+        int is_null = 0;
+
+        CHECK(cp_series_get_int64(id, 0, &id_val, &is_null));
+        CHECK(!is_null && id_val == 1);
+        CHECK(cp_series_get_string(tags, 0, &val, &is_null));
+        CHECK(!is_null && strcmp(val, "[\"a\",\"b\"]") == 0);
+        CHECK(cp_series_get_string(attrs, 0, &val, &is_null));
+        CHECK(!is_null && strcmp(val, "{\"x\":\"1\",\"y\":null}") == 0);
+
+        CHECK(cp_series_get_int64(id, 1, &id_val, &is_null));
+        CHECK(!is_null && id_val == 2);
+        CHECK(cp_series_get_string(tags, 1, &val, &is_null));
+        CHECK(!is_null && strcmp(val, "[]") == 0);
+        CHECK(cp_series_get_string(attrs, 1, &val, &is_null));
+        CHECK(!is_null && strcmp(val, "{}") == 0);
+
+        CHECK(cp_series_get_int64(id, 2, &id_val, &is_null));
+        CHECK(!is_null && id_val == 3);
+        CHECK(cp_series_get_string(tags, 2, &val, &is_null));
+        CHECK(is_null);
+        CHECK(cp_series_get_string(attrs, 2, &val, &is_null));
+        CHECK(is_null);
+
+        CHECK(cp_series_get_int64(id, 3, &id_val, &is_null));
+        CHECK(!is_null && id_val == 4);
+        CHECK(cp_series_get_string(tags, 3, &val, &is_null));
+        CHECK(!is_null && strcmp(val, "[\"c\",null]") == 0);
+        CHECK(cp_series_get_string(attrs, 3, &val, &is_null));
+        CHECK(!is_null && strcmp(val, "{\"k\":\"v\"}") == 0);
+      }
+      cp_df_free(df2);
+    }
+    remove(path);
+    free(path);
+  }
+  cp_df_free(df);
+}
+
 static void test_plot(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5222,6 +5297,7 @@ int main(void) {
   test_parquet_io();
   test_parquet_delta_encoding();
   test_parquet_nested_struct();
+  test_parquet_list_map();
   test_plot();
   test_write_csv_header();
   test_append_row_errors();
