@@ -15,6 +15,23 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - Vectorized arithmetic helpers and column-to-column comparisons.
 - Tests and benchmarks for correctness and performance.
 
+## Multi-index pivot tables
+
+Use `cp_df_pivot_table_multi` for multi-index pivots and margins.
+
+```c
+const char *index_cols[] = {"region", "year"};
+const char *column_cols[] = {"quarter", "channel"};
+CpDataFrame *pivot = cp_df_pivot_table_multi(
+    df, index_cols, 2, column_cols, 2, "sales", CP_AGG_SUM, 1, &err);
+```
+
+- Column headers are flattened as `col=value|col=value` (example:
+  `quarter=Q1|channel=Online`).
+- With `margins=1`, an `All` column is appended. A totals row is appended with
+  `All` in the first string index level and nulls for the remaining index
+  levels.
+
 ## Apache Arrow comparison
 
 Apache Arrow is a columnar in-memory data format and cross-language standard for interchange. cpandas is a pandas-like DataFrame library written in C that focuses on operations inside C programs. If you need zero-copy IPC or broad language interoperability, Arrow is the better fit; if you need a lightweight pandas alternative C for in-process analytics, cpandas is a good choice. Parquet read/write is available with a minimal C-only implementation.
