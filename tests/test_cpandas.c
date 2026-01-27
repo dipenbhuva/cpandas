@@ -4881,6 +4881,115 @@ static void test_pivot_table(void) {
   cp_df_free(df3);
 }
 
+static void test_pivot_table_multi(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"region", "year", "quarter", "channel", "sales"};
+  CpDType dtypes[] = {CP_DTYPE_STRING, CP_DTYPE_INT64, CP_DTYPE_STRING,
+                      CP_DTYPE_STRING, CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(5, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *r1[] = {"East", "2023", "Q1", "Online", "100"};
+  const char *r2[] = {"East", "2023", "Q1", "Store", "50"};
+  const char *r3[] = {"East", "2023", "Q2", "Online", "80"};
+  const char *r4[] = {"West", "2023", "Q1", "Online", "70"};
+  const char *r5[] = {"West", "2024", "Q1", "Store", "40"};
+  const char *r6[] = {"West", "2024", "Q2", "Online", "30"};
+  CHECK(cp_df_append_row(df, r1, 5, &err));
+  CHECK(cp_df_append_row(df, r2, 5, &err));
+  CHECK(cp_df_append_row(df, r3, 5, &err));
+  CHECK(cp_df_append_row(df, r4, 5, &err));
+  CHECK(cp_df_append_row(df, r5, 5, &err));
+  CHECK(cp_df_append_row(df, r6, 5, &err));
+
+  const char *index_cols[] = {"region", "year"};
+  const char *column_cols[] = {"quarter", "channel"};
+  CpDataFrame *pivot = cp_df_pivot_table_multi(
+      df, index_cols, 2, column_cols, 2, "sales", CP_AGG_SUM, 1, &err);
+  CHECK(pivot != NULL);
+  if (pivot) {
+    CHECK(cp_df_nrows(pivot) == 4);
+    CHECK(cp_df_ncols(pivot) == 6);
+
+    const CpSeries *region = cp_df_get_col(pivot, "region");
+    const CpSeries *year = cp_df_get_col(pivot, "year");
+    const CpSeries *q1_online =
+        cp_df_get_col(pivot, "quarter=Q1|channel=Online");
+    const CpSeries *q1_store =
+        cp_df_get_col(pivot, "quarter=Q1|channel=Store");
+    const CpSeries *q2_online =
+        cp_df_get_col(pivot, "quarter=Q2|channel=Online");
+    const CpSeries *all = cp_df_get_col(pivot, "All");
+    CHECK(region && year && q1_online && q1_store && q2_online && all);
+
+    const char *region_val = NULL;
+    int64_t i64_val = 0;
+    int is_null = 0;
+
+    CHECK(cp_series_get_string(region, 0, &region_val, &is_null));
+    CHECK(!is_null && strcmp(region_val, "East") == 0);
+    CHECK(cp_series_get_int64(year, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 2023);
+    CHECK(cp_series_get_int64(q1_online, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 100);
+    CHECK(cp_series_get_int64(q1_store, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 50);
+    CHECK(cp_series_get_int64(q2_online, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 80);
+    CHECK(cp_series_get_int64(all, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 230);
+
+    CHECK(cp_series_get_string(region, 1, &region_val, &is_null));
+    CHECK(!is_null && strcmp(region_val, "West") == 0);
+    CHECK(cp_series_get_int64(year, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 2023);
+    CHECK(cp_series_get_int64(q1_online, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 70);
+    CHECK(cp_series_get_int64(q1_store, 1, &i64_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_int64(q2_online, 1, &i64_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_int64(all, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 70);
+
+    CHECK(cp_series_get_string(region, 2, &region_val, &is_null));
+    CHECK(!is_null && strcmp(region_val, "West") == 0);
+    CHECK(cp_series_get_int64(year, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 2024);
+    CHECK(cp_series_get_int64(q1_online, 2, &i64_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_int64(q1_store, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 40);
+    CHECK(cp_series_get_int64(q2_online, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 30);
+    CHECK(cp_series_get_int64(all, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 70);
+
+    CHECK(cp_series_get_string(region, 3, &region_val, &is_null));
+    CHECK(!is_null && strcmp(region_val, "All") == 0);
+    CHECK(cp_series_get_int64(year, 3, &i64_val, &is_null));
+    CHECK(is_null);
+    CHECK(cp_series_get_int64(q1_online, 3, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 170);
+    CHECK(cp_series_get_int64(q1_store, 3, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 90);
+    CHECK(cp_series_get_int64(q2_online, 3, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 110);
+    CHECK(cp_series_get_int64(all, 3, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 370);
+  }
+
+  if (pivot) {
+    cp_df_free(pivot);
+  }
+  cp_df_free(df);
+}
+
 static void test_predicate_filters(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5338,6 +5447,7 @@ int main(void) {
   test_join_hash_path();
   test_join_strategy_forced();
   test_pivot_table();
+  test_pivot_table_multi();
   test_predicate_filters();
   test_vector_ops();
   test_query();

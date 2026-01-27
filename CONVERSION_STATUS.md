@@ -43,7 +43,7 @@ Data operations
 - Joins (inner/left/right/outer) on single or multiple key columns with configurable suffixes.
 - Hash-indexed and sorted-index join paths for larger joins.
 - Join strategy override for benchmarking (nested/hash/sorted/auto).
-- Pivot tables (single index/column/value with count/sum/mean/min/max).
+- Pivot tables (single or multi-index/column with count/sum/mean/min/max, plus optional margins).
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -117,7 +117,6 @@ Interop and parity
 
 Advanced pandas features
 - Time series APIs.
-- Multi-index pivot tables and margins.
 - Advanced indexing (multi-index, label-based slices).
 
 ## Notes
