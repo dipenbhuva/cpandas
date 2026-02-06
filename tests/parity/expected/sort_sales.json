@@ -1,0 +1,8 @@
+[
+  {"city":"NY","sales":5,"score":2.5},
+  {"city":"NY","sales":10,"score":1.5},
+  {"city":"LA","sales":15,"score":3},
+  {"city":"LA","sales":20,"score":2},
+  {"city":"NY","sales":30,"score":null},
+  {"city":"SF","sales":null,"score":4.5}
+]

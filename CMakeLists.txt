@@ -46,6 +46,19 @@ target_link_libraries(cpandas_fuzz_tests
 
 add_test(NAME cpandas_fuzz_tests COMMAND cpandas_fuzz_tests)
 
+add_executable(cpandas_parity_tests
+  tests/test_parity.c
+)
+
+target_link_libraries(cpandas_parity_tests
+  PRIVATE
+    cpandas
+)
+
+add_test(NAME cpandas_parity_tests
+  COMMAND cpandas_parity_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/parity
+)
+
 add_executable(cpandas_bench
   benchmarks/benchmark_cpandas.c
 )

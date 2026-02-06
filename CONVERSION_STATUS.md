@@ -63,6 +63,7 @@ Validation and tooling
 - Unit tests for CSV parsing/writing, error cases, and aggregations.
 - Deterministic CSV roundtrip fuzz test.
 - Simple benchmark target for append and sum throughput.
+- Parity fixture tests against pandas-derived JSON outputs.
 
 ## GeeksforGeeks Pandas Functions Checklist
 
@@ -114,8 +115,7 @@ Performance and scalability
 - Memory pooling and zero-copy views.
 
 Interop and parity
-- Python bindings for parity validation.
-- Parity test harness against pandas.
+- None.
 
 Advanced pandas features
 - None.

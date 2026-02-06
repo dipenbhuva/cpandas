@@ -64,6 +64,14 @@ cmake --build build
 ctest --test-dir build
 ```
 
+Parity fixture tests:
+
+```sh
+ctest --test-dir build -R cpandas_parity_tests --output-on-failure
+```
+
+Fixtures live in `tests/parity`.
+
 ## Benchmark
 
 ```sh
