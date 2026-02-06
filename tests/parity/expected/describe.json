@@ -1,0 +1,6 @@
+[
+  {"stat":"count","sales":5,"score":5},
+  {"stat":"mean","sales":16,"score":2.7},
+  {"stat":"min","sales":5,"score":1.5},
+  {"stat":"max","sales":30,"score":4.5}
+]

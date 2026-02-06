@@ -1,0 +1,5 @@
+[
+  {"city":"NY","sales_sum":45},
+  {"city":"LA","sales_sum":35},
+  {"city":"SF","sales_sum":null}
+]
