@@ -13,6 +13,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - Pure C11 core (no C++ dependencies required).
 - Query filtering with AND/OR and parentheses.
 - Vectorized arithmetic helpers and column-to-column comparisons.
+- Time series resample over fixed-second buckets (int64 epoch seconds).
 - Tests and benchmarks for correctness and performance.
 
 ## Multi-index pivot tables

@@ -44,6 +44,7 @@ Data operations
 - Hash-indexed and sorted-index join paths for larger joins.
 - Join strategy override for benchmarking (nested/hash/sorted/auto).
 - Pivot tables (single or multi-index/column with count/sum/mean/min/max, plus optional margins).
+- Time series resample (fixed-second buckets over int64 epoch seconds).
 - Aggregations (Series-level and DataFrame-level by name/index):
   - count
   - sum (int64/float64)
@@ -116,7 +117,6 @@ Interop and parity
 - Parity test harness against pandas.
 
 Advanced pandas features
-- Time series APIs.
 - Advanced indexing (multi-index, label-based slices).
 
 ## Notes

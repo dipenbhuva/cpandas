@@ -4990,6 +4990,75 @@ static void test_pivot_table_multi(void) {
   cp_df_free(df);
 }
 
+static void test_resample(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"ts", "value", "label"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_INT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *r1[] = {"0", "10", "A"};
+  const char *r2[] = {"30", "5", ""};
+  const char *r3[] = {"61", "3", "B"};
+  const char *r4[] = {"120", "8", "C"};
+  const char *r5[] = {"", "7", "D"};
+  CHECK(cp_df_append_row(df, r1, 3, &err));
+  CHECK(cp_df_append_row(df, r2, 3, &err));
+  CHECK(cp_df_append_row(df, r3, 3, &err));
+  CHECK(cp_df_append_row(df, r4, 3, &err));
+  CHECK(cp_df_append_row(df, r5, 3, &err));
+
+  const char *value_cols[] = {"value", "label"};
+  CpAggOp ops[] = {CP_AGG_SUM, CP_AGG_COUNT};
+  CpDataFrame *resampled =
+      cp_df_resample(df, "ts", 60, value_cols, ops, 2, &err);
+  CHECK(resampled != NULL);
+  if (resampled) {
+    CHECK(cp_df_nrows(resampled) == 3);
+    CHECK(cp_df_ncols(resampled) == 3);
+
+    const CpSeries *ts = cp_df_get_col(resampled, "ts");
+    const CpSeries *value_sum = cp_df_get_col(resampled, "value_sum");
+    const CpSeries *label_count = cp_df_get_col(resampled, "label_count");
+    CHECK(ts && value_sum && label_count);
+
+    int is_null = 0;
+    int64_t ts_val = 0;
+    int64_t i64_val = 0;
+
+    CHECK(cp_series_get_int64(ts, 0, &ts_val, &is_null));
+    CHECK(!is_null && ts_val == 0);
+    CHECK(cp_series_get_int64(value_sum, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 15);
+    CHECK(cp_series_get_int64(label_count, 0, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 1);
+
+    CHECK(cp_series_get_int64(ts, 1, &ts_val, &is_null));
+    CHECK(!is_null && ts_val == 60);
+    CHECK(cp_series_get_int64(value_sum, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 3);
+    CHECK(cp_series_get_int64(label_count, 1, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 1);
+
+    CHECK(cp_series_get_int64(ts, 2, &ts_val, &is_null));
+    CHECK(!is_null && ts_val == 120);
+    CHECK(cp_series_get_int64(value_sum, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 8);
+    CHECK(cp_series_get_int64(label_count, 2, &i64_val, &is_null));
+    CHECK(!is_null && i64_val == 1);
+  }
+
+  if (resampled) {
+    cp_df_free(resampled);
+  }
+  cp_df_free(df);
+}
+
 static void test_predicate_filters(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5448,6 +5517,7 @@ int main(void) {
   test_join_strategy_forced();
   test_pivot_table();
   test_pivot_table_multi();
+  test_resample();
   test_predicate_filters();
   test_vector_ops();
   test_query();
