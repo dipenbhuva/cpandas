@@ -36,6 +36,7 @@ Data operations
 - Row append with type parsing (int64/float64/string).
 - Row filtering by boolean mask.
 - Row/column selection by position and name (`iloc`, `loc`).
+- Advanced indexing with multi-index metadata and label-based slices.
 - Predicate filtering helpers (numeric/string comparisons).
 - Sorting by a single column (ascending/descending, nulls last).
 - Sorting by multiple columns.
@@ -117,7 +118,7 @@ Interop and parity
 - Parity test harness against pandas.
 
 Advanced pandas features
-- Advanced indexing (multi-index, label-based slices).
+- None.
 
 ## Notes
 - CSV parsing is intentionally minimal for MVP and does not support multiline
@@ -125,8 +126,8 @@ Advanced pandas features
 - dtype inference is not implemented; dtypes must be provided or default to string.
 - `query` supports `AND`/`OR` chaining with parentheses and basic comparison
   operators; it does not support functions or complex expressions.
-- `set_index` stores a single column as index metadata (column remains in data and
-  must be int64 or string); `reset_index` clears it.
+- `set_index`/`set_index_multi` store one or more columns as index metadata
+  (columns remain in data and must be int64 or string); `reset_index` clears it.
 - `at` uses index metadata when present, otherwise treats the row label as a
   positional index.
 - `apply` returns a single-column DataFrame from a row callback; `transform`
@@ -164,5 +165,7 @@ Advanced pandas features
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional
-  indices otherwise; duplicate index labels return the first match.
+  indices otherwise; duplicate index labels return the first match. Multi-index
+  labels are encoded as `level1|level2` strings and the `|` separator cannot
+  appear inside level values.
 - `read_csv_with_na`/`read_tsv_with_na` accept custom NA tokens for parsing.

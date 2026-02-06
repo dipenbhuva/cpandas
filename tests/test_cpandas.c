@@ -4031,6 +4031,90 @@ static void test_loc_labels_slice(void) {
   cp_df_free(df);
 }
 
+static void test_multi_index_loc(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"city", "year", "value"};
+  CpDType dtypes[] = {CP_DTYPE_STRING, CP_DTYPE_INT64, CP_DTYPE_INT64};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *r1[] = {"NY", "2022", "10"};
+  const char *r2[] = {"NY", "2023", "15"};
+  const char *r3[] = {"SF", "2022", "20"};
+  const char *r4[] = {"SF", "2023", "25"};
+  CHECK(cp_df_append_row(df, r1, 3, &err));
+  CHECK(cp_df_append_row(df, r2, 3, &err));
+  CHECK(cp_df_append_row(df, r3, 3, &err));
+  CHECK(cp_df_append_row(df, r4, 3, &err));
+
+  const char *index_cols[] = {"city", "year"};
+  CpDataFrame *indexed = cp_df_set_index_multi(df, index_cols, 2, &err);
+  CHECK(indexed != NULL);
+  if (indexed) {
+    const char *labels[] = {"NY|2023", "SF|2022"};
+    CpDataFrame *loc = cp_df_loc_labels(indexed, labels, 2, NULL, 0, &err);
+    CHECK(loc != NULL);
+    if (loc) {
+      CHECK(cp_df_nrows(loc) == 2);
+      const CpSeries *value = cp_df_get_col(loc, "value");
+      CHECK(value != NULL);
+      int64_t v = 0;
+      int is_null = 0;
+      CHECK(cp_series_get_int64(value, 0, &v, &is_null));
+      CHECK(!is_null && v == 15);
+      CHECK(cp_series_get_int64(value, 1, &v, &is_null));
+      CHECK(!is_null && v == 20);
+    }
+
+    int64_t at_val = 0;
+    int at_null = 0;
+    CHECK(cp_df_at_int64(indexed, "SF|2023", "value",
+                         &at_val, &at_null, &err));
+    CHECK(!at_null && at_val == 25);
+
+    CpDataFrame *slice =
+        cp_df_loc_slice(indexed, "NY|2023", "SF|2022", NULL, 0, &err);
+    CHECK(slice != NULL);
+    if (slice) {
+      CHECK(cp_df_nrows(slice) == 2);
+      const CpSeries *value = cp_df_get_col(slice, "value");
+      CHECK(value != NULL);
+      int64_t v = 0;
+      int is_null = 0;
+      CHECK(cp_series_get_int64(value, 0, &v, &is_null));
+      CHECK(!is_null && v == 15);
+      CHECK(cp_series_get_int64(value, 1, &v, &is_null));
+      CHECK(!is_null && v == 20);
+    }
+
+    cp_error_clear(&err);
+    const char *bad_labels[] = {"NY"};
+    CpDataFrame *bad = cp_df_loc_labels(indexed, bad_labels, 1, NULL, 0, &err);
+    CHECK(bad == NULL);
+    CHECK(err.code == CP_ERR_INVALID);
+
+    if (loc) {
+      cp_df_free(loc);
+    }
+    if (slice) {
+      cp_df_free(slice);
+    }
+    if (bad) {
+      cp_df_free(bad);
+    }
+  }
+
+  if (indexed) {
+    cp_df_free(indexed);
+  }
+  cp_df_free(df);
+}
+
 static void test_groupby_agg(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5510,6 +5594,7 @@ int main(void) {
   test_info_describe();
   test_loc_iloc();
   test_loc_labels_slice();
+  test_multi_index_loc();
   test_groupby_agg();
   test_join_inner_left();
   test_join_multi_key();
