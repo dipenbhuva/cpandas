@@ -410,6 +410,10 @@ CpDataFrame *cp_df_to_numeric(const CpDataFrame *df,
 CpDataFrame *cp_df_to_datetime(const CpDataFrame *df,
                                const char *name,
                                CpError *err);
+CpDataFrame *cp_df_set_index_multi(const CpDataFrame *df,
+                                   const char **names,
+                                   size_t count,
+                                   CpError *err);
 CpDataFrame *cp_df_set_index(const CpDataFrame *df,
                              const char *name,
                              CpError *err);

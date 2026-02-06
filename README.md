@@ -8,6 +8,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 
 - Columnar data C storage with typed columns (int64, float64, string).
 - DataFrame and Series API with selection, sorting, joins, groupby, and pivot tables.
+- Multi-index indexing with label-based `loc`/`at` helpers.
 - Aggregations (count, sum, mean, min, max, median, std, corr, cov, rank, diff).
 - CSV/TSV/JSON/NDJSON/Parquet/CPD read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
 - Pure C11 core (no C++ dependencies required).
@@ -32,6 +33,18 @@ CpDataFrame *pivot = cp_df_pivot_table_multi(
 - With `margins=1`, an `All` column is appended. A totals row is appended with
   `All` in the first string index level and nulls for the remaining index
   levels.
+
+## Advanced indexing
+
+Attach multi-index metadata with `cp_df_set_index_multi`. Labels are encoded as
+`level1|level2` strings when using `loc`/`at` helpers.
+
+```c
+const char *index_cols[] = {"city", "year"};
+CpDataFrame *indexed = cp_df_set_index_multi(df, index_cols, 2, &err);
+const char *labels[] = {"NY|2023", "SF|2022"};
+CpDataFrame *subset = cp_df_loc_labels(indexed, labels, 2, NULL, 0, &err);
+```
 
 ## Apache Arrow comparison
 
