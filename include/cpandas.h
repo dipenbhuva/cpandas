@@ -213,6 +213,13 @@ CpDataFrame *cp_df_pivot_table(const CpDataFrame *df,
                                const char *values,
                                CpAggOp op,
                                CpError *err);
+CpDataFrame *cp_df_resample(const CpDataFrame *df,
+                            const char *time_col,
+                            int64_t freq_seconds,
+                            const char **value_cols,
+                            const CpAggOp *ops,
+                            size_t count,
+                            CpError *err);
 CpDataFrame *cp_df_join(const CpDataFrame *left,
                         const CpDataFrame *right,
                         const char *left_key,

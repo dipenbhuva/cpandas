@@ -2609,6 +2609,32 @@ static int cp_join_key_is_null(const CpSeries *s, size_t row) {
   return 0;
 }
 
+typedef struct {
+  int64_t key;
+  CpAggState *states;
+} CpTimeGroup;
+
+static int cp_time_group_cmp(const void *a, const void *b) {
+  const CpTimeGroup *ga = (const CpTimeGroup *)a;
+  const CpTimeGroup *gb = (const CpTimeGroup *)b;
+  if (ga->key < gb->key) {
+    return -1;
+  }
+  if (ga->key > gb->key) {
+    return 1;
+  }
+  return 0;
+}
+
+static int64_t cp_time_bucket_start(int64_t ts, int64_t freq) {
+  int64_t div = ts / freq;
+  int64_t rem = ts % freq;
+  if (rem != 0 && ts < 0) {
+    div -= 1;
+  }
+  return div * freq;
+}
+
 static int cp_join_key_equal(const CpSeries *left_key,
                              size_t left_row,
                              const CpSeries *right_key,
@@ -8961,6 +8987,239 @@ CpDataFrame *cp_df_pivot_table(const CpDataFrame *df,
   const char *column_list[] = {columns};
   return cp_df_pivot_table_multi(df, index_list, 1, column_list, 1,
                                  values, op, 0, err);
+}
+
+CpDataFrame *cp_df_resample(const CpDataFrame *df,
+                            const char *time_col,
+                            int64_t freq_seconds,
+                            const char **value_cols,
+                            const CpAggOp *ops,
+                            size_t count,
+                            CpError *err) {
+  if (!df || !time_col || !value_cols || !ops || count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid resample arguments");
+    return NULL;
+  }
+  if (freq_seconds <= 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid resample frequency");
+    return NULL;
+  }
+
+  const CpSeries *time_series = cp_df_require_col(df, time_col, err);
+  if (!time_series) {
+    return NULL;
+  }
+  if (time_series->dtype != CP_DTYPE_INT64) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "time column must be int64");
+    return NULL;
+  }
+
+  CpAggSpec *specs = (CpAggSpec *)calloc(count, sizeof(CpAggSpec));
+  if (!specs) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const CpSeries *series = cp_df_require_col(df, value_cols[i], err);
+    if (!series) {
+      free(specs);
+      return NULL;
+    }
+    if (ops[i] != CP_AGG_COUNT &&
+        series->dtype != CP_DTYPE_INT64 &&
+        series->dtype != CP_DTYPE_FLOAT64) {
+      free(specs);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0,
+                   "aggregation requires numeric dtype");
+      return NULL;
+    }
+    CpDType out_dtype = CP_DTYPE_FLOAT64;
+    if (!cp_agg_output_dtype(series, ops[i], &out_dtype)) {
+      free(specs);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid aggregation dtype");
+      return NULL;
+    }
+    const char *op_name = cp_agg_op_name(ops[i]);
+    size_t name_len =
+        strlen(series->name ? series->name : "") + 1 + strlen(op_name) + 1;
+    char *col_name = (char *)malloc(name_len);
+    if (!col_name) {
+      free(specs);
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return NULL;
+    }
+    snprintf(col_name, name_len, "%s_%s",
+             series->name ? series->name : "", op_name);
+    specs[i].series = series;
+    specs[i].op = ops[i];
+    specs[i].out_dtype = out_dtype;
+    specs[i].name = col_name;
+  }
+
+  size_t group_cap = 8;
+  size_t group_count = 0;
+  CpTimeGroup *groups =
+      (CpTimeGroup *)calloc(group_cap, sizeof(CpTimeGroup));
+  if (!groups) {
+    for (size_t i = 0; i < count; ++i) {
+      free(specs[i].name);
+    }
+    free(specs);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t row = 0; row < df->nrows; ++row) {
+    if (time_series->is_null[row]) {
+      continue;
+    }
+    int64_t ts = time_series->data.i64[row];
+    int64_t bucket = cp_time_bucket_start(ts, freq_seconds);
+
+    size_t group_idx = group_count;
+    for (size_t g = 0; g < group_count; ++g) {
+      if (groups[g].key == bucket) {
+        group_idx = g;
+        break;
+      }
+    }
+    if (group_idx == group_count) {
+      if (group_count == group_cap) {
+        size_t new_cap = group_cap * 2;
+        CpTimeGroup *next =
+            (CpTimeGroup *)realloc(groups, new_cap * sizeof(CpTimeGroup));
+        if (!next) {
+          cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+          for (size_t g = 0; g < group_count; ++g) {
+            free(groups[g].states);
+          }
+          free(groups);
+          for (size_t i = 0; i < count; ++i) {
+            free(specs[i].name);
+          }
+          free(specs);
+          return NULL;
+        }
+        memset(next + group_cap, 0,
+               (new_cap - group_cap) * sizeof(CpTimeGroup));
+        groups = next;
+        group_cap = new_cap;
+      }
+      groups[group_idx].states =
+          (CpAggState *)calloc(count, sizeof(CpAggState));
+      if (!groups[group_idx].states) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        for (size_t g = 0; g < group_count; ++g) {
+          free(groups[g].states);
+        }
+        free(groups);
+        for (size_t i = 0; i < count; ++i) {
+          free(specs[i].name);
+        }
+        free(specs);
+        return NULL;
+      }
+      groups[group_idx].key = bucket;
+      group_count += 1;
+    }
+
+    CpAggState *states = groups[group_idx].states;
+    for (size_t i = 0; i < count; ++i) {
+      if (!cp_pivot_update_state(&states[i], specs[i].series, row,
+                                 specs[i].op, err)) {
+        for (size_t g = 0; g < group_count; ++g) {
+          free(groups[g].states);
+        }
+        free(groups);
+        for (size_t j = 0; j < count; ++j) {
+          free(specs[j].name);
+        }
+        free(specs);
+        return NULL;
+      }
+    }
+  }
+
+  if (group_count > 1) {
+    qsort(groups, group_count, sizeof(*groups), cp_time_group_cmp);
+  }
+
+  size_t out_cols = count + 1;
+  const char **names = (const char **)malloc(out_cols * sizeof(const char *));
+  CpDType *dtypes = (CpDType *)malloc(out_cols * sizeof(CpDType));
+  if (!names || !dtypes) {
+    free(names);
+    free(dtypes);
+    for (size_t g = 0; g < group_count; ++g) {
+      free(groups[g].states);
+    }
+    free(groups);
+    for (size_t i = 0; i < count; ++i) {
+      free(specs[i].name);
+    }
+    free(specs);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  names[0] = time_series->name ? time_series->name : "time";
+  dtypes[0] = CP_DTYPE_INT64;
+  for (size_t i = 0; i < count; ++i) {
+    names[i + 1] = specs[i].name;
+    dtypes[i + 1] = specs[i].out_dtype;
+  }
+
+  CpDataFrame *out = cp_df_create(out_cols, names, dtypes, group_count, err);
+  free(names);
+  free(dtypes);
+  if (!out) {
+    for (size_t g = 0; g < group_count; ++g) {
+      free(groups[g].states);
+    }
+    free(groups);
+    for (size_t i = 0; i < count; ++i) {
+      free(specs[i].name);
+    }
+    free(specs);
+    return NULL;
+  }
+
+  for (size_t g = 0; g < group_count; ++g) {
+    int ok = cp_series_append_int64(out->cols[0], groups[g].key, 0, err);
+    if (ok) {
+      for (size_t i = 0; i < count; ++i) {
+        int values_is_int = specs[i].series->dtype == CP_DTYPE_INT64;
+        ok = cp_pivot_append_state(out->cols[i + 1], &groups[g].states[i],
+                                   specs[i].op, values_is_int, err);
+        if (!ok) {
+          for (size_t j = 0; j <= i; ++j) {
+            cp_series_pop(out->cols[j]);
+          }
+          cp_df_free(out);
+          out = NULL;
+          break;
+        }
+      }
+    } else {
+      cp_df_free(out);
+      out = NULL;
+    }
+    if (!out) {
+      break;
+    }
+    out->nrows += 1;
+  }
+
+  for (size_t g = 0; g < group_count; ++g) {
+    free(groups[g].states);
+  }
+  free(groups);
+  for (size_t i = 0; i < count; ++i) {
+    free(specs[i].name);
+  }
+  free(specs);
+  return out;
 }
 
 int cp_df_mask_int64(const CpDataFrame *df,
