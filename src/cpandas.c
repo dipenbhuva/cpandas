@@ -30,6 +30,7 @@ struct CpDataFrame {
   size_t ncols;
   size_t nrows;
   CpSeries **cols;
+  int owns_columns;
   int has_index;
   size_t index_col;
   size_t index_count;
@@ -45,6 +46,10 @@ static int cp_df_append_row_from_sources(CpDataFrame *df,
                                          size_t ncols,
                                          size_t row,
                                          CpError *err);
+static CpDataFrame *cp_df_create_view(const CpDataFrame *df,
+                                      const CpSeries **cols,
+                                      size_t count,
+                                      CpError *err);
 static const CpSeries *cp_df_require_col(const CpDataFrame *df,
                                          const char *name,
                                          CpError *err);
@@ -2574,6 +2579,7 @@ CpDataFrame *cp_df_create(size_t ncols,
   }
   df->ncols = ncols;
   df->nrows = 0;
+  df->owns_columns = 1;
   df->has_index = 0;
   df->index_col = 0;
   df->index_count = 0;
@@ -2599,8 +2605,10 @@ void cp_df_free(CpDataFrame *df) {
   if (!df) {
     return;
   }
-  for (size_t i = 0; i < df->ncols; ++i) {
-    cp_series_free(df->cols[i]);
+  if (df->owns_columns) {
+    for (size_t i = 0; i < df->ncols; ++i) {
+      cp_series_free(df->cols[i]);
+    }
   }
   free(df->cols);
   free(df->index_cols);
@@ -3295,6 +3303,39 @@ static CpDataFrame *cp_df_empty_like(const CpDataFrame *df, CpError *err) {
   return out;
 }
 
+static CpDataFrame *cp_df_create_view(const CpDataFrame *df,
+                                      const CpSeries **cols,
+                                      size_t count,
+                                      CpError *err) {
+  if (!df || !cols || count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe view");
+    return NULL;
+  }
+  CpDataFrame *out = (CpDataFrame *)calloc(1, sizeof(CpDataFrame));
+  if (!out) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  out->cols = (CpSeries **)calloc(count, sizeof(CpSeries *));
+  if (!out->cols) {
+    free(out);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  out->ncols = count;
+  out->nrows = df->nrows;
+  out->owns_columns = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (!cols[i]) {
+      cp_df_free(out);
+      cp_error_set(err, CP_ERR_INVALID, 0, i, "column not found");
+      return NULL;
+    }
+    out->cols[i] = (CpSeries *)cols[i];
+  }
+  return out;
+}
+
 static int cp_indices_have_duplicates(const size_t *indices, size_t count) {
   if (!indices) {
     return 0;
@@ -3611,6 +3652,47 @@ CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
 
   free(dtypes);
   free(sel_names);
+  free(src_cols);
+  return out;
+}
+
+CpDataFrame *cp_df_select_cols_view(const CpDataFrame *df,
+                                    const char **names,
+                                    size_t count,
+                                    CpError *err) {
+  if (!df || !names || count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid selection");
+    return NULL;
+  }
+
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(count * sizeof(const CpSeries *));
+  if (!src_cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const CpSeries *series = cp_df_get_col(df, names[i]);
+    if (!series) {
+      free(src_cols);
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+      return NULL;
+    }
+    src_cols[i] = series;
+  }
+
+  CpDataFrame *out = cp_df_create_view(df, src_cols, count, err);
+  if (!out) {
+    free(src_cols);
+    return NULL;
+  }
+  if (!cp_df_copy_index_meta_from_cols(df, src_cols, count, out, err)) {
+    cp_df_free(out);
+    free(src_cols);
+    return NULL;
+  }
+
   free(src_cols);
   return out;
 }
@@ -7884,6 +7966,7 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
   unsigned char *out_from_right = NULL;
   unsigned char *name_owned = NULL;
   unsigned char *right_matched = NULL;
+  int track_right_matches = 0;
   size_t right_include_count = 0;
   size_t out_cols = 0;
   size_t out_idx = 0;
@@ -8049,7 +8132,8 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
     goto cleanup;
   }
 
-  if (right->nrows > 0) {
+  track_right_matches = (how == CP_JOIN_RIGHT || how == CP_JOIN_OUTER);
+  if (track_right_matches && right->nrows > 0) {
     right_matched =
         (unsigned char *)calloc(right->nrows, sizeof(unsigned char));
     if (!right_matched) {
@@ -8066,11 +8150,18 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
     }
   } else if (strategy == CP_JOIN_STRATEGY_AUTO) {
     if (left->nrows > 0 && right->nrows > 0) {
-      size_t threshold = 1024;
-      if (left->nrows > threshold / right->nrows) {
-        use_hash = 1;
-      } else {
+      size_t product = SIZE_MAX;
+      size_t nested_threshold = 4096;
+      size_t sorted_threshold = 256;
+      if (left->nrows <= SIZE_MAX / right->nrows) {
+        product = left->nrows * right->nrows;
+      }
+      if (product <= nested_threshold) {
+        /* Tiny joins are faster without paying hash/sort setup costs. */
+      } else if (right->nrows <= sorted_threshold) {
         use_index = 1;
+      } else {
+        use_hash = 1;
       }
     }
   }
@@ -10242,6 +10333,10 @@ static int cp_df_append_row_internal(CpDataFrame *df,
                                      CpError *err) {
   if (!df || !values || nvalues != df->ncols) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid row data");
+    return 0;
+  }
+  if (!df->owns_columns) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "cannot append to dataframe view");
     return 0;
   }
   size_t row = df->nrows;

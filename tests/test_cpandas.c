@@ -1532,6 +1532,62 @@ static void test_select_and_filter(void) {
   cp_df_free(df);
 }
 
+static void test_select_cols_view(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "10.5", "Alice"};
+  const char *row2[] = {"2", "", "Bob"};
+  const char *row3[] = {"3", "8.0", "Cara"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+
+  CpDataFrame *indexed = cp_df_set_index(df, "id", &err);
+  CHECK(indexed != NULL);
+  if (!indexed) {
+    cp_df_free(df);
+    return;
+  }
+
+  const char *sel[] = {"id", "name"};
+  CpDataFrame *view = cp_df_select_cols_view(indexed, sel, 2, &err);
+  CHECK(view != NULL);
+  if (view) {
+    CHECK(cp_df_ncols(view) == 2);
+    CHECK(cp_df_nrows(view) == 3);
+    CHECK(cp_df_get_col(view, "id") == cp_df_get_col(indexed, "id"));
+    CHECK(cp_df_get_col(view, "name") == cp_df_get_col(indexed, "name"));
+
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_df_at_string(view, "2", "name", &name_val, &is_null, &err));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+
+    cp_error_clear(&err);
+    const char *bad_row[] = {"4", "Dana"};
+    CHECK(!cp_df_append_row(view, bad_row, 2, &err));
+    CHECK(err.code == CP_ERR_INVALID);
+    CHECK(cp_df_nrows(indexed) == 3);
+  }
+
+  if (view) {
+    cp_df_free(view);
+  }
+  if (indexed) {
+    cp_df_free(indexed);
+  }
+  cp_df_free(df);
+}
+
 static void test_select_dtypes(void) {
   CpError err;
   cp_error_clear(&err);
@@ -4766,6 +4822,16 @@ static void test_join_strategy_forced(void) {
                                &err);
   assert_join_strategy_result(hash);
 
+  CpDataFrame *auto_join =
+      cp_df_join_with_strategy(left,
+                               right,
+                               "id",
+                               "id",
+                               CP_JOIN_INNER,
+                               CP_JOIN_STRATEGY_AUTO,
+                               &err);
+  assert_join_strategy_result(auto_join);
+
   if (nested) {
     cp_df_free(nested);
   }
@@ -4774,6 +4840,9 @@ static void test_join_strategy_forced(void) {
   }
   if (hash) {
     cp_df_free(hash);
+  }
+  if (auto_join) {
+    cp_df_free(auto_join);
   }
   cp_df_free(right);
   cp_df_free(left);
@@ -5567,6 +5636,7 @@ int main(void) {
   test_aggregations();
   test_df_aggregation_helpers();
   test_select_and_filter();
+  test_select_cols_view();
   test_select_dtypes();
   test_sort_values();
   test_sort_values_multi();

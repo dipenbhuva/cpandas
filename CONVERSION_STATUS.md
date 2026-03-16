@@ -30,6 +30,7 @@ Data exploration
 Data operations
 - Column lookup by name.
 - Column selection by name.
+- Zero-copy read-only column views.
 - Column selection by dtype.
 - Column drop and rename.
 - Vectorized arithmetic helpers and column-to-column comparisons.
@@ -44,6 +45,7 @@ Data operations
 - Joins (inner/left/right/outer) on single or multiple key columns with configurable suffixes.
 - Hash-indexed and sorted-index join paths for larger joins.
 - Join strategy override for benchmarking (nested/hash/sorted/auto).
+- Join auto-strategy tuning for tiny joins and reduced match-tracking overhead for inner/left joins.
 - Pivot tables (single or multi-index/column with count/sum/mean/min/max, plus optional margins).
 - Time series resample (fixed-second buckets over int64 epoch seconds).
 - Aggregations (Series-level and DataFrame-level by name/index):
@@ -102,7 +104,7 @@ Core DataFrame operations
 - None.
 
 Joins
-- Join performance tuning (parallelism, memory).
+- Further join performance tuning (parallelism, deeper memory tuning).
 
 Indexing and missing values
 - None.
@@ -112,7 +114,7 @@ I/O and formats
 
 Performance and scalability
 - SIMD or parallel ops.
-- Memory pooling and zero-copy views.
+- Memory pooling and broader zero-copy views.
 
 Interop and parity
 - None.
@@ -164,6 +166,8 @@ Advanced pandas features
   JSON arrays/objects with string values (nulls allowed); map keys must be strings.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
+- `select_cols_view` returns a read-only zero-copy column view; the source
+  DataFrame must outlive the view, and appending rows to a view is rejected.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional
   indices otherwise; duplicate index labels return the first match. Multi-index
   labels are encoded as `level1|level2` strings and the `|` separator cannot

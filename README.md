@@ -9,6 +9,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - Columnar data C storage with typed columns (int64, float64, string).
 - DataFrame and Series API with selection, sorting, joins, groupby, and pivot tables.
 - Multi-index indexing with label-based `loc`/`at` helpers.
+- Zero-copy read-only column views for lower-overhead selection.
 - Aggregations (count, sum, mean, min, max, median, std, corr, cov, rank, diff).
 - CSV/TSV/JSON/NDJSON/Parquet/CPD read/write, TSV export (`to_excel`), SQL script export (`to_sql`).
 - Pure C11 core (no C++ dependencies required).
@@ -44,6 +45,16 @@ const char *index_cols[] = {"city", "year"};
 CpDataFrame *indexed = cp_df_set_index_multi(df, index_cols, 2, &err);
 const char *labels[] = {"NY|2023", "SF|2022"};
 CpDataFrame *subset = cp_df_loc_labels(indexed, labels, 2, NULL, 0, &err);
+```
+
+## Zero-copy views
+
+Use `cp_df_select_cols_view` when you want a read-only column subset without
+copying data. The source DataFrame must outlive the view.
+
+```c
+const char *cols[] = {"id", "name"};
+CpDataFrame *view = cp_df_select_cols_view(df, cols, 2, &err);
 ```
 
 ## Apache Arrow comparison

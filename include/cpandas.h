@@ -170,6 +170,10 @@ CpDataFrame *cp_df_select_cols(const CpDataFrame *df,
                                const char **names,
                                size_t count,
                                CpError *err);
+CpDataFrame *cp_df_select_cols_view(const CpDataFrame *df,
+                                    const char **names,
+                                    size_t count,
+                                    CpError *err);
 CpDataFrame *cp_df_select_dtypes(const CpDataFrame *df,
                                  const CpDType *include,
                                  size_t include_count,
