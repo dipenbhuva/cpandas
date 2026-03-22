@@ -8181,30 +8181,30 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
     }
   }
 
-  if (use_index) {
+  if (!use_hash && right->nrows > 0) {
+    right_sorted = (size_t *)malloc(right->nrows * sizeof(size_t));
+    if (!right_sorted) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      goto cleanup;
+    }
     for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
       if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
         continue;
       }
-      right_sorted_count += 1;
+      right_sorted[right_sorted_count++] = rrow;
     }
+  }
+
+  if (use_index) {
     if (right_sorted_count > 0) {
-      right_sorted = (size_t *)malloc(right_sorted_count * sizeof(size_t));
       right_tmp = (size_t *)malloc(right_sorted_count * sizeof(size_t));
       sort_asc = (int *)malloc(key_count * sizeof(int));
-      if (!right_sorted || !right_tmp || !sort_asc) {
+      if (!right_tmp || !sort_asc) {
         cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
         goto cleanup;
       }
       for (size_t i = 0; i < key_count; ++i) {
         sort_asc[i] = 1;
-      }
-      size_t idx = 0;
-      for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
-        if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
-          continue;
-        }
-        right_sorted[idx++] = rrow;
       }
       if (right_sorted_count > 1) {
         cp_sort_indices_merge_multi(right_sorted,
@@ -8272,10 +8272,8 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
         }
       }
     } else {
-      for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
-        if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
-          continue;
-        }
+      for (size_t pos = 0; pos < right_sorted_count; ++pos) {
+        size_t rrow = right_sorted[pos];
         if (cp_join_keys_equal(left_key_series,
                                right_key_series,
                                key_count,
@@ -8426,10 +8424,8 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
         }
       }
     } else {
-      for (size_t rrow = 0; rrow < right->nrows; ++rrow) {
-        if (cp_join_keys_any_null(right_key_series, key_count, rrow)) {
-          continue;
-        }
+      for (size_t pos = 0; pos < right_sorted_count; ++pos) {
+        size_t rrow = right_sorted[pos];
         if (cp_join_keys_equal(left_key_series,
                                right_key_series,
                                key_count,
