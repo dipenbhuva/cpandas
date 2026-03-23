@@ -3336,6 +3336,25 @@ static CpDataFrame *cp_df_create_view(const CpDataFrame *df,
   return out;
 }
 
+static CpDataFrame *cp_df_create_view_with_index(const CpDataFrame *df,
+                                                 const CpSeries **cols,
+                                                 size_t count,
+                                                 CpError *err) {
+  CpDataFrame *out = cp_df_create_view(df, cols, count, err);
+  if (!out) {
+    return NULL;
+  }
+  if (!cp_df_copy_index_meta_from_cols(df, cols, count, out, err)) {
+    cp_df_free(out);
+    return NULL;
+  }
+  return out;
+}
+
+static int cp_dtype_in_list(const CpDType *list,
+                            size_t count,
+                            CpDType dtype);
+
 static int cp_indices_have_duplicates(const size_t *indices, size_t count) {
   if (!indices) {
     return 0;
@@ -3682,17 +3701,61 @@ CpDataFrame *cp_df_select_cols_view(const CpDataFrame *df,
     src_cols[i] = series;
   }
 
-  CpDataFrame *out = cp_df_create_view(df, src_cols, count, err);
-  if (!out) {
-    free(src_cols);
+  CpDataFrame *out = cp_df_create_view_with_index(df, src_cols, count, err);
+  free(src_cols);
+  return out;
+}
+
+CpDataFrame *cp_df_select_dtypes_view(const CpDataFrame *df,
+                                      const CpDType *include,
+                                      size_t include_count,
+                                      const CpDType *exclude,
+                                      size_t exclude_count,
+                                      CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid selection");
     return NULL;
   }
-  if (!cp_df_copy_index_meta_from_cols(df, src_cols, count, out, err)) {
-    cp_df_free(out);
-    free(src_cols);
+  if ((include_count > 0 && !include) || (exclude_count > 0 && !exclude)) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid selection");
+    return NULL;
+  }
+  if (include_count == 0 && exclude_count == 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no selection criteria");
     return NULL;
   }
 
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(df->ncols * sizeof(const CpSeries *));
+  if (!src_cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  size_t count = 0;
+  for (size_t col = 0; col < df->ncols; ++col) {
+    const CpSeries *series = df->cols[col];
+    if (!series) {
+      free(src_cols);
+      cp_error_set(err, CP_ERR_INVALID, 0, col, "column not found");
+      return NULL;
+    }
+    int include_ok = include_count == 0 ||
+                     cp_dtype_in_list(include, include_count, series->dtype);
+    int exclude_ok = exclude_count == 0 ||
+                     !cp_dtype_in_list(exclude, exclude_count, series->dtype);
+    if (include_ok && exclude_ok) {
+      src_cols[count++] = series;
+    }
+  }
+
+  if (count == 0) {
+    free(src_cols);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no columns selected");
+    return NULL;
+  }
+
+  CpDataFrame *out = cp_df_create_view_with_index(df, src_cols, count, err);
   free(src_cols);
   return out;
 }
@@ -3913,6 +3976,51 @@ CpDataFrame *cp_df_drop_cols(const CpDataFrame *df,
 
   CpDataFrame *out = cp_df_select_cols(df, keep_names, keep_count, err);
   free(keep_names);
+  return out;
+}
+
+CpDataFrame *cp_df_drop_cols_view(const CpDataFrame *df,
+                                  const char **names,
+                                  size_t count,
+                                  CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (!names && count > 0) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid column list");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    if (names[i] && !cp_df_get_col(df, names[i])) {
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "column not found");
+      return NULL;
+    }
+  }
+
+  const CpSeries **src_cols =
+      (const CpSeries **)malloc(df->ncols * sizeof(const CpSeries *));
+  if (!src_cols) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+
+  size_t keep_count = 0;
+  for (size_t i = 0; i < df->ncols; ++i) {
+    if (!cp_name_in_list(df->cols[i]->name, names, count)) {
+      src_cols[keep_count++] = df->cols[i];
+    }
+  }
+  if (keep_count == 0) {
+    free(src_cols);
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "no columns remaining");
+    return NULL;
+  }
+
+  CpDataFrame *out =
+      cp_df_create_view_with_index(df, src_cols, keep_count, err);
+  free(src_cols);
   return out;
 }
 

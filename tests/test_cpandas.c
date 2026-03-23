@@ -1667,6 +1667,89 @@ static void test_select_dtypes(void) {
   cp_df_free(df);
 }
 
+static void test_zero_copy_dtype_and_drop_views(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "10.5", "Alice"};
+  const char *row2[] = {"2", "", "Bob"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+
+  CpDataFrame *indexed = cp_df_set_index(df, "id", &err);
+  CHECK(indexed != NULL);
+  if (!indexed) {
+    cp_df_free(df);
+    return;
+  }
+
+  CpDType numeric[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64};
+  CpDataFrame *dtype_view =
+      cp_df_select_dtypes_view(indexed, numeric, 2, NULL, 0, &err);
+  CHECK(dtype_view != NULL);
+  if (dtype_view) {
+    CHECK(cp_df_ncols(dtype_view) == 2);
+    CHECK(cp_df_get_col(dtype_view, "id") == cp_df_get_col(indexed, "id"));
+    CHECK(cp_df_get_col(dtype_view, "score") ==
+          cp_df_get_col(indexed, "score"));
+
+    double score_val = 0.0;
+    int is_null = 0;
+    CHECK(cp_df_at_float64(dtype_view, "1", "score",
+                           &score_val, &is_null, &err));
+    CHECK(!is_null && fabs(score_val - 10.5) < 1e-9);
+
+    cp_error_clear(&err);
+    const char *bad_row[] = {"3", "4.0"};
+    CHECK(!cp_df_append_row(dtype_view, bad_row, 2, &err));
+    CHECK(err.code == CP_ERR_INVALID);
+  }
+
+  const char *drop_cols[] = {"score"};
+  CpDataFrame *drop_view = cp_df_drop_cols_view(indexed, drop_cols, 1, &err);
+  CHECK(drop_view != NULL);
+  if (drop_view) {
+    CHECK(cp_df_ncols(drop_view) == 2);
+    CHECK(cp_df_get_col(drop_view, "id") == cp_df_get_col(indexed, "id"));
+    CHECK(cp_df_get_col(drop_view, "name") == cp_df_get_col(indexed, "name"));
+
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_df_at_string(drop_view, "2", "name", &name_val, &is_null, &err));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+  }
+
+  cp_error_clear(&err);
+  CpDataFrame *bad_dtype_view =
+      cp_df_select_dtypes_view(indexed, NULL, 0, NULL, 0, &err);
+  CHECK(bad_dtype_view == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  cp_error_clear(&err);
+  const char *drop_all[] = {"id", "score", "name"};
+  CpDataFrame *bad_drop_view =
+      cp_df_drop_cols_view(indexed, drop_all, 3, &err);
+  CHECK(bad_drop_view == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (dtype_view) {
+    cp_df_free(dtype_view);
+  }
+  if (drop_view) {
+    cp_df_free(drop_view);
+  }
+  cp_df_free(indexed);
+  cp_df_free(df);
+}
+
 static void test_sort_values(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5638,6 +5721,7 @@ int main(void) {
   test_select_and_filter();
   test_select_cols_view();
   test_select_dtypes();
+  test_zero_copy_dtype_and_drop_views();
   test_sort_values();
   test_sort_values_multi();
   test_head_tail();

@@ -174,6 +174,12 @@ CpDataFrame *cp_df_select_cols_view(const CpDataFrame *df,
                                     const char **names,
                                     size_t count,
                                     CpError *err);
+CpDataFrame *cp_df_select_dtypes_view(const CpDataFrame *df,
+                                      const CpDType *include,
+                                      size_t include_count,
+                                      const CpDType *exclude,
+                                      size_t exclude_count,
+                                      CpError *err);
 CpDataFrame *cp_df_select_dtypes(const CpDataFrame *df,
                                  const CpDType *include,
                                  size_t include_count,
@@ -333,6 +339,10 @@ CpDataFrame *cp_df_drop_cols(const CpDataFrame *df,
                              const char **names,
                              size_t count,
                              CpError *err);
+CpDataFrame *cp_df_drop_cols_view(const CpDataFrame *df,
+                                  const char **names,
+                                  size_t count,
+                                  CpError *err);
 CpDataFrame *cp_df_rename_cols(const CpDataFrame *df,
                                const char **old_names,
                                const char **new_names,

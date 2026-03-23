@@ -30,7 +30,7 @@ Data exploration
 Data operations
 - Column lookup by name.
 - Column selection by name.
-- Zero-copy read-only column views.
+- Zero-copy read-only column views for name/dtype selection and column drops.
 - Column selection by dtype.
 - Column drop and rename.
 - Vectorized arithmetic helpers and column-to-column comparisons.
@@ -114,7 +114,7 @@ I/O and formats
 
 Performance and scalability
 - SIMD or parallel ops.
-- Memory pooling and broader zero-copy views.
+- Memory pooling and zero-copy row views.
 
 Interop and parity
 - None.
@@ -166,8 +166,9 @@ Advanced pandas features
   JSON arrays/objects with string values (nulls allowed); map keys must be strings.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
-- `select_cols_view` returns a read-only zero-copy column view; the source
-  DataFrame must outlive the view, and appending rows to a view is rejected.
+- `select_cols_view`, `select_dtypes_view`, and `drop_cols_view` return
+  read-only zero-copy column views; the source DataFrame must outlive the view,
+  and appending rows to a view is rejected.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional
   indices otherwise; duplicate index labels return the first match. Multi-index
   labels are encoded as `level1|level2` strings and the `|` separator cannot
