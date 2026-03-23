@@ -1334,6 +1334,48 @@ static void test_aggregations(void) {
   }
 }
 
+static void test_dense_float_aggregations(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"fval"};
+  CpDType dtypes[] = {CP_DTYPE_FLOAT64};
+  CpDataFrame *df = cp_df_create(1, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1.25"};
+  const char *row2[] = {"2.5"};
+  const char *row3[] = {"-0.75"};
+  const char *row4[] = {"4.0"};
+  CHECK(cp_df_append_row(df, row1, 1, &err));
+  CHECK(cp_df_append_row(df, row2, 1, &err));
+  CHECK(cp_df_append_row(df, row3, 1, &err));
+  CHECK(cp_df_append_row(df, row4, 1, &err));
+
+  const CpSeries *fval = cp_df_get_col(df, "fval");
+  CHECK(fval != NULL);
+  if (fval) {
+    double sum = 0.0;
+    double mean = 0.0;
+    size_t count = 0;
+    size_t nulls = 0;
+    CHECK(cp_series_sum_float64(fval, &sum, &count, &nulls, &err));
+    CHECK(fabs(sum - 7.0) < 1e-9);
+    CHECK(count == 4);
+    CHECK(nulls == 0);
+
+    CHECK(cp_series_mean(fval, &mean, &count, &nulls, &err));
+    CHECK(fabs(mean - 1.75) < 1e-9);
+    CHECK(count == 4);
+    CHECK(nulls == 0);
+  }
+
+  cp_df_free(df);
+}
+
 static void test_df_aggregation_helpers(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5717,6 +5759,7 @@ int main(void) {
   test_append_row_errors();
   test_read_csv_mismatch();
   test_aggregations();
+  test_dense_float_aggregations();
   test_df_aggregation_helpers();
   test_select_and_filter();
   test_select_cols_view();

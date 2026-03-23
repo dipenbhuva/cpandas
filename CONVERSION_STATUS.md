@@ -53,6 +53,7 @@ Data operations
   - sum (int64/float64)
   - mean (int64/float64)
   - min/max (int64/float64)
+- Optional SIMD-accelerated dense float64 sum/mean reductions with a C fallback.
 
 Data cleaning
 - Null mask extraction.
@@ -113,7 +114,7 @@ I/O and formats
 - None.
 
 Performance and scalability
-- SIMD or parallel ops.
+- Broader SIMD coverage or parallel ops.
 - Memory pooling and zero-copy row views.
 
 Interop and parity
@@ -166,6 +167,9 @@ Advanced pandas features
   JSON arrays/objects with string values (nulls allowed); map keys must be strings.
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
+- Dense float64 `sum`/`mean` use an SSE2 fast path on supported x86 builds and
+  fall back to portable C elsewhere; int64 dense reductions use a branch-free
+  null-free fast path but still preserve overflow checks.
 - `select_cols_view`, `select_dtypes_view`, and `drop_cols_view` return
   read-only zero-copy column views; the source DataFrame must outlive the view,
   and appending rows to a view is rejected.

@@ -9,6 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE2__) &&                                                  \
+    (defined(__x86_64__) || defined(_M_X64) || defined(__i386) ||         \
+     defined(_M_IX86))
+#include <emmintrin.h>
+#define CPANDAS_HAVE_X86_SSE2 1
+#else
+#define CPANDAS_HAVE_X86_SSE2 0
+#endif
 #ifdef CPANDAS_HAVE_ZLIB
 #include <zlib.h>
 #endif
@@ -66,6 +74,45 @@ static void cp_sort_indices_merge_multi(size_t *indices,
                                         const CpSeries **keys,
                                         const int *ascending,
                                         size_t key_count);
+
+static size_t cp_count_nulls(const unsigned char *is_null, size_t length) {
+  size_t nulls = 0;
+  if (!is_null) {
+    return 0;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    if (is_null[i]) {
+      nulls += 1;
+    }
+  }
+  return nulls;
+}
+
+static double cp_sum_float64_dense(const double *values, size_t length) {
+  double sum = 0.0;
+  if (!values) {
+    return 0.0;
+  }
+#if CPANDAS_HAVE_X86_SSE2
+  __m128d acc = _mm_setzero_pd();
+  size_t i = 0;
+  size_t limit = length & ~(size_t)1;
+  for (; i < limit; i += 2) {
+    acc = _mm_add_pd(acc, _mm_loadu_pd(values + i));
+  }
+  double lanes[2];
+  _mm_storeu_pd(lanes, acc);
+  sum = lanes[0] + lanes[1];
+  for (; i < length; ++i) {
+    sum += values[i];
+  }
+#else
+  for (size_t i = 0; i < length; ++i) {
+    sum += values[i];
+  }
+#endif
+  return sum;
+}
 
 static const char *cp_dtype_name(CpDType dtype) {
   switch (dtype) {
@@ -23140,21 +23187,31 @@ int cp_series_sum_int64(const CpSeries *s,
     return 0;
   }
   int64_t sum = 0;
-  size_t count = 0;
-  size_t nulls = 0;
-  for (size_t i = 0; i < s->length; ++i) {
-    if (s->is_null[i]) {
-      nulls += 1;
-      continue;
+  size_t nulls = cp_count_nulls(s->is_null, s->length);
+  size_t count = s->length - nulls;
+  if (nulls == 0) {
+    for (size_t i = 0; i < s->length; ++i) {
+      int64_t value = s->data.i64[i];
+      if ((value > 0 && sum > INT64_MAX - value) ||
+          (value < 0 && sum < INT64_MIN - value)) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "int64 sum overflow");
+        return 0;
+      }
+      sum += value;
     }
-    int64_t value = s->data.i64[i];
-    if ((value > 0 && sum > INT64_MAX - value) ||
-        (value < 0 && sum < INT64_MIN - value)) {
-      cp_error_set(err, CP_ERR_INVALID, 0, 0, "int64 sum overflow");
-      return 0;
+  } else {
+    for (size_t i = 0; i < s->length; ++i) {
+      if (s->is_null[i]) {
+        continue;
+      }
+      int64_t value = s->data.i64[i];
+      if ((value > 0 && sum > INT64_MAX - value) ||
+          (value < 0 && sum < INT64_MIN - value)) {
+        cp_error_set(err, CP_ERR_INVALID, 0, 0, "int64 sum overflow");
+        return 0;
+      }
+      sum += value;
     }
-    sum += value;
-    count += 1;
   }
   if (out) {
     *out = sum;
@@ -23177,16 +23234,18 @@ int cp_series_sum_float64(const CpSeries *s,
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
     return 0;
   }
+  size_t nulls = cp_count_nulls(s->is_null, s->length);
+  size_t count = s->length - nulls;
   double sum = 0.0;
-  size_t count = 0;
-  size_t nulls = 0;
-  for (size_t i = 0; i < s->length; ++i) {
-    if (s->is_null[i]) {
-      nulls += 1;
-      continue;
+  if (nulls == 0) {
+    sum = cp_sum_float64_dense(s->data.f64, s->length);
+  } else {
+    for (size_t i = 0; i < s->length; ++i) {
+      if (s->is_null[i]) {
+        continue;
+      }
+      sum += s->data.f64[i];
     }
-    sum += s->data.f64[i];
-    count += 1;
   }
   if (out) {
     *out = sum;
@@ -23210,25 +23269,31 @@ int cp_series_mean(const CpSeries *s,
     return 0;
   }
   double sum = 0.0;
-  size_t count = 0;
-  size_t nulls = 0;
+  size_t nulls = cp_count_nulls(s->is_null, s->length);
+  size_t count = s->length - nulls;
   if (s->dtype == CP_DTYPE_INT64) {
-    for (size_t i = 0; i < s->length; ++i) {
-      if (s->is_null[i]) {
-        nulls += 1;
-        continue;
+    if (nulls == 0) {
+      for (size_t i = 0; i < s->length; ++i) {
+        sum += (double)s->data.i64[i];
       }
-      sum += (double)s->data.i64[i];
-      count += 1;
+    } else {
+      for (size_t i = 0; i < s->length; ++i) {
+        if (s->is_null[i]) {
+          continue;
+        }
+        sum += (double)s->data.i64[i];
+      }
     }
   } else {
-    for (size_t i = 0; i < s->length; ++i) {
-      if (s->is_null[i]) {
-        nulls += 1;
-        continue;
+    if (nulls == 0) {
+      sum = cp_sum_float64_dense(s->data.f64, s->length);
+    } else {
+      for (size_t i = 0; i < s->length; ++i) {
+        if (s->is_null[i]) {
+          continue;
+        }
+        sum += s->data.f64[i];
       }
-      sum += s->data.f64[i];
-      count += 1;
     }
   }
   if (count == 0) {
