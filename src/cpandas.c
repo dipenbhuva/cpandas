@@ -8122,6 +8122,8 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
   unsigned char *name_owned = NULL;
   unsigned char *right_matched = NULL;
   int track_right_matches = 0;
+  unsigned char *left_has_null = NULL;
+  uint64_t *left_hashes = NULL;
   size_t right_include_count = 0;
   size_t out_cols = 0;
   size_t out_idx = 0;
@@ -8334,6 +8336,21 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
         goto cleanup;
       }
     }
+    if (left->nrows > 0) {
+      left_has_null = (unsigned char *)calloc(left->nrows, sizeof(unsigned char));
+      left_hashes = (uint64_t *)malloc(left->nrows * sizeof(uint64_t));
+      if (!left_has_null || !left_hashes) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        goto cleanup;
+      }
+      for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
+        if (cp_join_keys_any_null(left_key_series, key_count, lrow)) {
+          left_has_null[lrow] = 1;
+          continue;
+        }
+        left_hashes[lrow] = cp_join_hash_keys(left_key_series, key_count, lrow);
+      }
+    }
   }
 
   if (!use_hash && right->nrows > 0) {
@@ -8375,7 +8392,10 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
 
   total_rows = 0;
   for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
-    if (cp_join_keys_any_null(left_key_series, key_count, lrow)) {
+    int left_row_has_null =
+        use_hash ? (left_has_null && left_has_null[lrow])
+                 : cp_join_keys_any_null(left_key_series, key_count, lrow);
+    if (left_row_has_null) {
       if (how == CP_JOIN_LEFT || how == CP_JOIN_OUTER) {
         if (total_rows == SIZE_MAX) {
           cp_error_set(err, CP_ERR_INVALID, 0, 0, "row count overflow");
@@ -8387,7 +8407,9 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
     }
     size_t matches = 0;
     if (use_hash) {
-      uint64_t hash = cp_join_hash_keys(left_key_series, key_count, lrow);
+      uint64_t hash =
+          left_hashes ? left_hashes[lrow]
+                      : cp_join_hash_keys(left_key_series, key_count, lrow);
       const CpJoinBucket *bucket = cp_join_index_find(&hash_index, hash);
       if (bucket) {
         for (size_t i = 0; i < bucket->count; ++i) {
@@ -8492,7 +8514,10 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
   }
 
   for (size_t lrow = 0; lrow < left->nrows; ++lrow) {
-    if (cp_join_keys_any_null(left_key_series, key_count, lrow)) {
+    int left_row_has_null =
+        use_hash ? (left_has_null && left_has_null[lrow])
+                 : cp_join_keys_any_null(left_key_series, key_count, lrow);
+    if (left_row_has_null) {
       if (how == CP_JOIN_LEFT || how == CP_JOIN_OUTER) {
         if (!cp_join_append_row(out,
                                 out_sources,
@@ -8513,7 +8538,9 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
 
     int matched = 0;
     if (use_hash) {
-      uint64_t hash = cp_join_hash_keys(left_key_series, key_count, lrow);
+      uint64_t hash =
+          left_hashes ? left_hashes[lrow]
+                      : cp_join_hash_keys(left_key_series, key_count, lrow);
       const CpJoinBucket *bucket = cp_join_index_find(&hash_index, hash);
       if (bucket) {
         for (size_t i = 0; i < bucket->count; ++i) {
@@ -8650,6 +8677,8 @@ cleanup:
   free(right_sorted);
   free(right_tmp);
   free(sort_asc);
+  free(left_has_null);
+  free(left_hashes);
   free(left_key_series);
   free(right_key_series);
   free(right_include);

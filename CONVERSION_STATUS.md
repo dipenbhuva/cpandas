@@ -46,6 +46,7 @@ Data operations
 - Hash-indexed and sorted-index join paths for larger joins.
 - Join strategy override for benchmarking (nested/hash/sorted/auto).
 - Join auto-strategy tuning for tiny joins and reduced match-tracking overhead for inner/left joins.
+- Hash joins cache left-side null/hash metadata across sizing and output passes.
 - Pivot tables (single or multi-index/column with count/sum/mean/min/max, plus optional margins).
 - Time series resample (fixed-second buckets over int64 epoch seconds).
 - Aggregations (Series-level and DataFrame-level by name/index):
