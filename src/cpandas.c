@@ -97,11 +97,30 @@ static size_t cp_count_nulls(const unsigned char *is_null, size_t length) {
   if (!is_null) {
     return 0;
   }
+#if CPANDAS_HAVE_X86_SSE2
+  __m128i zero = _mm_setzero_si128();
+  __m128i acc = _mm_setzero_si128();
+  size_t i = 0;
+  size_t limit = length & ~(size_t)15;
+  for (; i < limit; i += 16) {
+    __m128i chunk = _mm_loadu_si128((const __m128i *)(is_null + i));
+    acc = _mm_add_epi64(acc, _mm_sad_epu8(chunk, zero));
+  }
+  uint64_t lanes[2];
+  _mm_storeu_si128((__m128i *)lanes, acc);
+  nulls = (size_t)(lanes[0] + lanes[1]);
+  for (; i < length; ++i) {
+    if (is_null[i]) {
+      nulls += 1;
+    }
+  }
+#else
   for (size_t i = 0; i < length; ++i) {
     if (is_null[i]) {
       nulls += 1;
     }
   }
+#endif
   return nulls;
 }
 
@@ -129,6 +148,82 @@ static double cp_sum_float64_dense(const double *values, size_t length) {
   }
 #endif
   return sum;
+}
+
+static int cp_float64_has_nan(const double *values, size_t length) {
+  if (!values) {
+    return 0;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    if (isnan(values[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static double cp_min_float64_dense(const double *values, size_t length) {
+  if (!values || length == 0) {
+    return 0.0;
+  }
+  double min_val = values[0];
+#if CPANDAS_HAVE_X86_SSE2
+  if (length >= 2) {
+    __m128d acc = _mm_loadu_pd(values);
+    size_t i = 2;
+    size_t limit = length & ~(size_t)1;
+    for (; i < limit; i += 2) {
+      acc = _mm_min_pd(acc, _mm_loadu_pd(values + i));
+    }
+    double lanes[2];
+    _mm_storeu_pd(lanes, acc);
+    min_val = lanes[0] < lanes[1] ? lanes[0] : lanes[1];
+    for (; i < length; ++i) {
+      if (values[i] < min_val) {
+        min_val = values[i];
+      }
+    }
+    return min_val;
+  }
+#endif
+  for (size_t i = 1; i < length; ++i) {
+    if (values[i] < min_val) {
+      min_val = values[i];
+    }
+  }
+  return min_val;
+}
+
+static double cp_max_float64_dense(const double *values, size_t length) {
+  if (!values || length == 0) {
+    return 0.0;
+  }
+  double max_val = values[0];
+#if CPANDAS_HAVE_X86_SSE2
+  if (length >= 2) {
+    __m128d acc = _mm_loadu_pd(values);
+    size_t i = 2;
+    size_t limit = length & ~(size_t)1;
+    for (; i < limit; i += 2) {
+      acc = _mm_max_pd(acc, _mm_loadu_pd(values + i));
+    }
+    double lanes[2];
+    _mm_storeu_pd(lanes, acc);
+    max_val = lanes[0] > lanes[1] ? lanes[0] : lanes[1];
+    for (; i < length; ++i) {
+      if (values[i] > max_val) {
+        max_val = values[i];
+      }
+    }
+    return max_val;
+  }
+#endif
+  for (size_t i = 1; i < length; ++i) {
+    if (values[i] > max_val) {
+      max_val = values[i];
+    }
+  }
+  return max_val;
 }
 
 static const char *cp_dtype_name(CpDType dtype) {
@@ -23735,19 +23830,23 @@ int cp_series_min_float64(const CpSeries *s,
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
     return 0;
   }
+  size_t nulls = cp_count_nulls(s->is_null, s->length);
   int found = 0;
   double min_val = 0.0;
-  size_t nulls = 0;
-  for (size_t i = 0; i < s->length; ++i) {
-    if (s->is_null[i]) {
-      nulls += 1;
-      continue;
-    }
-    if (!found) {
-      min_val = s->data.f64[i];
-      found = 1;
-    } else if (s->data.f64[i] < min_val) {
-      min_val = s->data.f64[i];
+  if (nulls == 0 && s->length > 0 && !cp_float64_has_nan(s->data.f64, s->length)) {
+    min_val = cp_min_float64_dense(s->data.f64, s->length);
+    found = 1;
+  } else {
+    for (size_t i = 0; i < s->length; ++i) {
+      if (s->is_null[i]) {
+        continue;
+      }
+      if (!found) {
+        min_val = s->data.f64[i];
+        found = 1;
+      } else if (s->data.f64[i] < min_val) {
+        min_val = s->data.f64[i];
+      }
     }
   }
   if (!found) {
@@ -23771,19 +23870,23 @@ int cp_series_max_float64(const CpSeries *s,
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "dtype mismatch");
     return 0;
   }
+  size_t nulls = cp_count_nulls(s->is_null, s->length);
   int found = 0;
   double max_val = 0.0;
-  size_t nulls = 0;
-  for (size_t i = 0; i < s->length; ++i) {
-    if (s->is_null[i]) {
-      nulls += 1;
-      continue;
-    }
-    if (!found) {
-      max_val = s->data.f64[i];
-      found = 1;
-    } else if (s->data.f64[i] > max_val) {
-      max_val = s->data.f64[i];
+  if (nulls == 0 && s->length > 0 && !cp_float64_has_nan(s->data.f64, s->length)) {
+    max_val = cp_max_float64_dense(s->data.f64, s->length);
+    found = 1;
+  } else {
+    for (size_t i = 0; i < s->length; ++i) {
+      if (s->is_null[i]) {
+        continue;
+      }
+      if (!found) {
+        max_val = s->data.f64[i];
+        found = 1;
+      } else if (s->data.f64[i] > max_val) {
+        max_val = s->data.f64[i];
+      }
     }
   }
   if (!found) {

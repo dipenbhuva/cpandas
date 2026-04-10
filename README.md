@@ -10,7 +10,7 @@ If you are searching for pandas C, DataFrame in C, columnar data C, or a pandas 
 - DataFrame and Series API with selection, sorting, joins, groupby, and pivot tables.
 - Multi-index indexing with label-based `loc`/`at` helpers.
 - Zero-copy read-only column views for lower-overhead selection and drop paths.
-- Optional SIMD-accelerated dense `float64` sum/mean reductions with a C fallback.
+- Optional SIMD-accelerated dense `float64` sum/mean/min/max reductions with a C fallback.
 - Initial reserved-capacity column buffer pooling to reduce heap churn.
 - Aggregations (count, sum, mean, min, max, median, std, corr, cov, rank, diff).
 - CSV/TSV/JSON/NDJSON/Parquet/CPD read/write, TSV export (`to_excel`), SQL script export (`to_sql`).

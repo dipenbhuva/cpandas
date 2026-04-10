@@ -1360,6 +1360,8 @@ static void test_dense_float_aggregations(void) {
   if (fval) {
     double sum = 0.0;
     double mean = 0.0;
+    double min_val = 0.0;
+    double max_val = 0.0;
     size_t count = 0;
     size_t nulls = 0;
     CHECK(cp_series_sum_float64(fval, &sum, &count, &nulls, &err));
@@ -1371,9 +1373,45 @@ static void test_dense_float_aggregations(void) {
     CHECK(fabs(mean - 1.75) < 1e-9);
     CHECK(count == 4);
     CHECK(nulls == 0);
+
+    CHECK(cp_series_min_float64(fval, &min_val, &nulls, &err));
+    CHECK(fabs(min_val - (-0.75)) < 1e-9);
+    CHECK(nulls == 0);
+
+    CHECK(cp_series_max_float64(fval, &max_val, &nulls, &err));
+    CHECK(fabs(max_val - 4.0) < 1e-9);
+    CHECK(nulls == 0);
   }
 
   cp_df_free(df);
+
+  cp_error_clear(&err);
+  CpDataFrame *nan_df = cp_df_create(1, names, dtypes, 0, &err);
+  CHECK(nan_df != NULL);
+  if (nan_df) {
+    const char *n1[] = {"1.0"};
+    const char *n2[] = {"nan"};
+    const char *n3[] = {"-2.0"};
+    CHECK(cp_df_append_row(nan_df, n1, 1, &err));
+    CHECK(cp_df_append_row(nan_df, n2, 1, &err));
+    CHECK(cp_df_append_row(nan_df, n3, 1, &err));
+
+    const CpSeries *nan_series = cp_df_get_col(nan_df, "fval");
+    CHECK(nan_series != NULL);
+    if (nan_series) {
+      double min_val = 0.0;
+      double max_val = 0.0;
+      size_t nulls = 0;
+      CHECK(cp_series_min_float64(nan_series, &min_val, &nulls, &err));
+      CHECK(fabs(min_val - (-2.0)) < 1e-9);
+      CHECK(nulls == 0);
+
+      CHECK(cp_series_max_float64(nan_series, &max_val, &nulls, &err));
+      CHECK(fabs(max_val - 1.0) < 1e-9);
+      CHECK(nulls == 0);
+    }
+    cp_df_free(nan_df);
+  }
 }
 
 static void test_df_aggregation_helpers(void) {
