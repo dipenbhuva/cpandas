@@ -3465,14 +3465,15 @@ static size_t cp_join_lower_bound(const CpSeries **left_keys,
 
 typedef struct {
   uint64_t hash;
-  size_t *rows;
+  size_t first_row;
+  size_t last_row;
   size_t count;
-  size_t capacity;
   int in_use;
 } CpJoinBucket;
 
 typedef struct {
   CpJoinBucket *buckets;
+  size_t *next_rows;
   size_t bucket_count;
   size_t mask;
 } CpJoinIndex;
@@ -3522,24 +3523,23 @@ static uint64_t cp_join_hash_keys(const CpSeries **keys,
   return hash;
 }
 
-static int cp_join_bucket_push(CpJoinBucket *bucket,
+static int cp_join_bucket_push(CpJoinIndex *index,
+                               CpJoinBucket *bucket,
                                size_t row,
                                CpError *err) {
-  if (!bucket) {
+  if (!index || !bucket || !index->next_rows) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid join bucket");
     return 0;
   }
-  if (bucket->count == bucket->capacity) {
-    size_t new_cap = bucket->capacity == 0 ? 4 : bucket->capacity * 2;
-    size_t *next = (size_t *)realloc(bucket->rows, new_cap * sizeof(size_t));
-    if (!next) {
-      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-      return 0;
-    }
-    bucket->rows = next;
-    bucket->capacity = new_cap;
+  index->next_rows[row] = SIZE_MAX;
+  if (bucket->count == 0) {
+    bucket->first_row = row;
+    bucket->last_row = row;
+  } else {
+    index->next_rows[bucket->last_row] = row;
+    bucket->last_row = row;
   }
-  bucket->rows[bucket->count++] = row;
+  bucket->count += 1;
   return 1;
 }
 
@@ -3551,6 +3551,7 @@ static int cp_join_index_init(CpJoinIndex *index,
     return 0;
   }
   index->buckets = NULL;
+  index->next_rows = NULL;
   index->bucket_count = 0;
   index->mask = 0;
   if (row_count == 0) {
@@ -3579,7 +3580,17 @@ static int cp_join_index_init(CpJoinIndex *index,
     cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
     return 0;
   }
+  size_t *next_rows = (size_t *)malloc(row_count * sizeof(size_t));
+  if (!next_rows) {
+    free(buckets);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return 0;
+  }
+  for (size_t i = 0; i < row_count; ++i) {
+    next_rows[i] = SIZE_MAX;
+  }
   index->buckets = buckets;
+  index->next_rows = next_rows;
   index->bucket_count = bucket_count;
   index->mask = bucket_count - 1;
   return 1;
@@ -3589,11 +3600,10 @@ static void cp_join_index_free(CpJoinIndex *index) {
   if (!index || !index->buckets) {
     return;
   }
-  for (size_t i = 0; i < index->bucket_count; ++i) {
-    free(index->buckets[i].rows);
-  }
   free(index->buckets);
+  free(index->next_rows);
   index->buckets = NULL;
+  index->next_rows = NULL;
   index->bucket_count = 0;
   index->mask = 0;
 }
@@ -3613,10 +3623,13 @@ static int cp_join_index_add(CpJoinIndex *index,
     if (!bucket->in_use) {
       bucket->in_use = 1;
       bucket->hash = hash;
-      return cp_join_bucket_push(bucket, row, err);
+      bucket->first_row = SIZE_MAX;
+      bucket->last_row = SIZE_MAX;
+      bucket->count = 0;
+      return cp_join_bucket_push(index, bucket, row, err);
     }
     if (bucket->hash == hash) {
-      return cp_join_bucket_push(bucket, row, err);
+      return cp_join_bucket_push(index, bucket, row, err);
     }
     idx = (idx + 1) & mask;
   }
@@ -8821,8 +8834,8 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
                       : cp_join_hash_keys(left_key_series, key_count, lrow);
       const CpJoinBucket *bucket = cp_join_index_find(&hash_index, hash);
       if (bucket) {
-        for (size_t i = 0; i < bucket->count; ++i) {
-          size_t rrow = bucket->rows[i];
+        for (size_t rrow = bucket->first_row; rrow != SIZE_MAX;
+             rrow = hash_index.next_rows[rrow]) {
           if (cp_join_keys_equal(left_key_series,
                                  right_key_series,
                                  key_count,
@@ -8952,8 +8965,8 @@ CpDataFrame *cp_df_join_multi_with_strategy(const CpDataFrame *left,
                       : cp_join_hash_keys(left_key_series, key_count, lrow);
       const CpJoinBucket *bucket = cp_join_index_find(&hash_index, hash);
       if (bucket) {
-        for (size_t i = 0; i < bucket->count; ++i) {
-          size_t rrow = bucket->rows[i];
+        for (size_t rrow = bucket->first_row; rrow != SIZE_MAX;
+             rrow = hash_index.next_rows[rrow]) {
           if (cp_join_keys_equal(left_key_series,
                                  right_key_series,
                                  key_count,
