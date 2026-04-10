@@ -30,7 +30,7 @@ Data exploration
 Data operations
 - Column lookup by name.
 - Column selection by name.
-- Zero-copy read-only column views for name/dtype selection and column drops.
+- Zero-copy read-only column and contiguous row views.
 - Column selection by dtype.
 - Column drop and rename.
 - Vectorized arithmetic helpers and column-to-column comparisons.
@@ -116,7 +116,7 @@ I/O and formats
 
 Performance and scalability
 - Broader SIMD coverage or parallel ops.
-- Memory pooling and zero-copy row views.
+- Memory pooling.
 
 Interop and parity
 - None.
@@ -171,9 +171,10 @@ Advanced pandas features
 - Dense float64 `sum`/`mean` use an SSE2 fast path on supported x86 builds and
   fall back to portable C elsewhere; int64 dense reductions use a branch-free
   null-free fast path but still preserve overflow checks.
-- `select_cols_view`, `select_dtypes_view`, and `drop_cols_view` return
-  read-only zero-copy column views; the source DataFrame must outlive the view,
-  and appending rows to a view is rejected.
+- `select_cols_view`, `select_dtypes_view`, `drop_cols_view`,
+  `row_slice_view`, `head_view`, and `tail_view` return read-only zero-copy
+  views; the source DataFrame must outlive the view, and appending rows to a
+  view is rejected.
 - `loc_labels`/`loc_slice` use the index metadata when present and positional
   indices otherwise; duplicate index labels return the first match. Multi-index
   labels are encoded as `level1|level2` strings and the `|` separator cannot

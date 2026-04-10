@@ -26,6 +26,7 @@ struct CpSeries {
   CpDType dtype;
   size_t length;
   size_t capacity;
+  int owns_data;
   unsigned char *is_null;
   union {
     int64_t *i64;
@@ -39,6 +40,7 @@ struct CpDataFrame {
   size_t nrows;
   CpSeries **cols;
   int owns_columns;
+  int writable;
   int has_index;
   size_t index_col;
   size_t index_count;
@@ -58,6 +60,10 @@ static CpDataFrame *cp_df_create_view(const CpDataFrame *df,
                                       const CpSeries **cols,
                                       size_t count,
                                       CpError *err);
+static CpSeries *cp_series_create_slice_view(const CpSeries *src,
+                                             size_t start,
+                                             size_t length,
+                                             CpError *err);
 static const CpSeries *cp_df_require_col(const CpDataFrame *df,
                                          const char *name,
                                          CpError *err);
@@ -1720,13 +1726,15 @@ void cp_series_free(CpSeries *s) {
     return;
   }
   free(s->name);
-  if (s->dtype == CP_DTYPE_STRING && s->data.str) {
+  if (s->owns_data && s->dtype == CP_DTYPE_STRING && s->data.str) {
     for (size_t i = 0; i < s->length; ++i) {
       free(s->data.str[i]);
     }
   }
-  free(s->data.str);
-  free(s->is_null);
+  if (s->owns_data) {
+    free(s->data.str);
+    free(s->is_null);
+  }
   free(s);
 }
 
@@ -1748,6 +1756,7 @@ static CpSeries *cp_series_create(const char *name,
   s->dtype = dtype;
   s->length = 0;
   s->capacity = 0;
+  s->owns_data = 1;
   s->is_null = NULL;
   s->data.str = NULL;
 
@@ -1759,6 +1768,48 @@ static CpSeries *cp_series_create(const char *name,
   }
 
   return s;
+}
+
+static CpSeries *cp_series_create_slice_view(const CpSeries *src,
+                                             size_t start,
+                                             size_t length,
+                                             CpError *err) {
+  if (!src || start > src->length || length > src->length - start) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid series slice view");
+    return NULL;
+  }
+  CpSeries *out = (CpSeries *)calloc(1, sizeof(CpSeries));
+  if (!out) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  out->name = cp_strdup(src->name ? src->name : "");
+  if (!out->name) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    cp_series_free(out);
+    return NULL;
+  }
+  out->dtype = src->dtype;
+  out->length = length;
+  out->capacity = length;
+  out->owns_data = 0;
+  out->is_null = src->is_null ? src->is_null + start : NULL;
+  switch (src->dtype) {
+    case CP_DTYPE_INT64:
+      out->data.i64 = src->data.i64 ? src->data.i64 + start : NULL;
+      break;
+    case CP_DTYPE_FLOAT64:
+      out->data.f64 = src->data.f64 ? src->data.f64 + start : NULL;
+      break;
+    case CP_DTYPE_STRING:
+      out->data.str = src->data.str ? src->data.str + start : NULL;
+      break;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+      cp_series_free(out);
+      return NULL;
+  }
+  return out;
 }
 
 static int cp_series_append_int64(CpSeries *s,
@@ -2627,6 +2678,7 @@ CpDataFrame *cp_df_create(size_t ncols,
   df->ncols = ncols;
   df->nrows = 0;
   df->owns_columns = 1;
+  df->writable = 1;
   df->has_index = 0;
   df->index_col = 0;
   df->index_count = 0;
@@ -3372,6 +3424,7 @@ static CpDataFrame *cp_df_create_view(const CpDataFrame *df,
   out->ncols = count;
   out->nrows = df->nrows;
   out->owns_columns = 0;
+  out->writable = 0;
   for (size_t i = 0; i < count; ++i) {
     if (!cols[i]) {
       cp_df_free(out);
@@ -3396,6 +3449,66 @@ static CpDataFrame *cp_df_create_view_with_index(const CpDataFrame *df,
     return NULL;
   }
   return out;
+}
+
+CpDataFrame *cp_df_row_slice_view(const CpDataFrame *df,
+                                  size_t start,
+                                  size_t count,
+                                  CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  if (start > df->nrows || count > df->nrows - start) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "row slice out of range");
+    return NULL;
+  }
+
+  CpDataFrame *out = (CpDataFrame *)calloc(1, sizeof(CpDataFrame));
+  if (!out) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  out->cols = (CpSeries **)calloc(df->ncols, sizeof(CpSeries *));
+  if (!out->cols) {
+    free(out);
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  out->ncols = df->ncols;
+  out->nrows = count;
+  out->owns_columns = 1;
+  out->writable = 0;
+  for (size_t i = 0; i < df->ncols; ++i) {
+    out->cols[i] = cp_series_create_slice_view(df->cols[i], start, count, err);
+    if (!out->cols[i]) {
+      cp_df_free(out);
+      return NULL;
+    }
+  }
+  if (!cp_df_copy_index_meta(df, out, err)) {
+    cp_df_free(out);
+    return NULL;
+  }
+  return out;
+}
+
+CpDataFrame *cp_df_head_view(const CpDataFrame *df, size_t n, CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  size_t take = n < df->nrows ? n : df->nrows;
+  return cp_df_row_slice_view(df, 0, take, err);
+}
+
+CpDataFrame *cp_df_tail_view(const CpDataFrame *df, size_t n, CpError *err) {
+  if (!df) {
+    cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid dataframe");
+    return NULL;
+  }
+  size_t take = n < df->nrows ? n : df->nrows;
+  return cp_df_row_slice_view(df, df->nrows - take, take, err);
 }
 
 static int cp_dtype_in_list(const CpDType *list,
@@ -10515,7 +10628,7 @@ static int cp_df_append_row_internal(CpDataFrame *df,
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "invalid row data");
     return 0;
   }
-  if (!df->owns_columns) {
+  if (!df->writable) {
     cp_error_set(err, CP_ERR_INVALID, 0, 0, "cannot append to dataframe view");
     return 0;
   }

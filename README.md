@@ -50,9 +50,9 @@ CpDataFrame *subset = cp_df_loc_labels(indexed, labels, 2, NULL, 0, &err);
 
 ## Zero-copy views
 
-Use `cp_df_select_cols_view`, `cp_df_select_dtypes_view`, or
-`cp_df_drop_cols_view` when you want a read-only column subset without copying
-data. The source DataFrame must outlive the view.
+Use `cp_df_select_cols_view`, `cp_df_select_dtypes_view`,
+`cp_df_drop_cols_view`, or `cp_df_row_slice_view` when you want a read-only
+view without copying data. The source DataFrame must outlive the view.
 
 ```c
 const char *cols[] = {"id", "name"};
@@ -64,6 +64,9 @@ CpDataFrame *numeric_view =
 
 const char *drop_cols[] = {"score"};
 CpDataFrame *drop_view = cp_df_drop_cols_view(df, drop_cols, 1, &err);
+
+CpDataFrame *rows = cp_df_row_slice_view(df, 10, 25, &err);
+CpDataFrame *tail = cp_df_tail_view(df, 50, &err);
 ```
 
 ## Apache Arrow comparison

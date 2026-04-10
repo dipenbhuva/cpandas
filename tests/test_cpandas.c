@@ -1630,6 +1630,95 @@ static void test_select_cols_view(void) {
   cp_df_free(df);
 }
 
+static void test_row_slice_views(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 0, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "10.5", "Alice"};
+  const char *row2[] = {"2", "", "Bob"};
+  const char *row3[] = {"3", "8.0", "Cara"};
+  const char *row4[] = {"4", "7.5", "Dan"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+
+  CpDataFrame *indexed = cp_df_set_index(df, "id", &err);
+  CHECK(indexed != NULL);
+  if (!indexed) {
+    cp_df_free(df);
+    return;
+  }
+
+  CpDataFrame *slice = cp_df_row_slice_view(indexed, 1, 2, &err);
+  CHECK(slice != NULL);
+  if (slice) {
+    CHECK(cp_df_nrows(slice) == 2);
+    CHECK(cp_df_ncols(slice) == 3);
+
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_df_at_string(slice, "2", "name", &name_val, &is_null, &err));
+    CHECK(!is_null && strcmp(name_val, "Bob") == 0);
+    CHECK(cp_df_at_string(slice, "3", "name", &name_val, &is_null, &err));
+    CHECK(!is_null && strcmp(name_val, "Cara") == 0);
+
+    cp_error_clear(&err);
+    CHECK(!cp_df_at_string(slice, "1", "name", &name_val, &is_null, &err));
+    CHECK(err.code == CP_ERR_INVALID);
+
+    cp_error_clear(&err);
+    const char *bad_row[] = {"5", "6.0", "Eve"};
+    CHECK(!cp_df_append_row(slice, bad_row, 3, &err));
+    CHECK(err.code == CP_ERR_INVALID);
+  }
+
+  CpDataFrame *head_view = cp_df_head_view(indexed, 2, &err);
+  CHECK(head_view != NULL);
+  if (head_view) {
+    CHECK(cp_df_nrows(head_view) == 2);
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_df_at_string(head_view, "1", "name", &name_val, &is_null, &err));
+    CHECK(!is_null && strcmp(name_val, "Alice") == 0);
+  }
+
+  CpDataFrame *tail_view = cp_df_tail_view(indexed, 2, &err);
+  CHECK(tail_view != NULL);
+  if (tail_view) {
+    CHECK(cp_df_nrows(tail_view) == 2);
+    const char *name_val = NULL;
+    int is_null = 0;
+    CHECK(cp_df_at_string(tail_view, "4", "name", &name_val, &is_null, &err));
+    CHECK(!is_null && strcmp(name_val, "Dan") == 0);
+  }
+
+  cp_error_clear(&err);
+  CpDataFrame *bad = cp_df_row_slice_view(indexed, 3, 2, &err);
+  CHECK(bad == NULL);
+  CHECK(err.code == CP_ERR_INVALID);
+
+  if (slice) {
+    cp_df_free(slice);
+  }
+  if (head_view) {
+    cp_df_free(head_view);
+  }
+  if (tail_view) {
+    cp_df_free(tail_view);
+  }
+  cp_df_free(indexed);
+  cp_df_free(df);
+}
+
 static void test_select_dtypes(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5763,6 +5852,7 @@ int main(void) {
   test_df_aggregation_helpers();
   test_select_and_filter();
   test_select_cols_view();
+  test_row_slice_views();
   test_select_dtypes();
   test_zero_copy_dtype_and_drop_views();
   test_sort_values();

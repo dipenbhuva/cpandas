@@ -190,6 +190,10 @@ CpDataFrame *cp_df_filter_mask(const CpDataFrame *df,
                                const uint8_t *mask,
                                size_t mask_len,
                                CpError *err);
+CpDataFrame *cp_df_row_slice_view(const CpDataFrame *df,
+                                  size_t start,
+                                  size_t count,
+                                  CpError *err);
 CpDataFrame *cp_df_sort_values(const CpDataFrame *df,
                                const char *name,
                                int ascending,
@@ -331,6 +335,8 @@ CpDataFrame *cp_df_loc_slice(const CpDataFrame *df,
                              CpError *err);
 CpDataFrame *cp_df_head(const CpDataFrame *df, size_t n, CpError *err);
 CpDataFrame *cp_df_tail(const CpDataFrame *df, size_t n, CpError *err);
+CpDataFrame *cp_df_head_view(const CpDataFrame *df, size_t n, CpError *err);
+CpDataFrame *cp_df_tail_view(const CpDataFrame *df, size_t n, CpError *err);
 int cp_df_dtypes(const CpDataFrame *df,
                  CpDType *out,
                  size_t out_len,
