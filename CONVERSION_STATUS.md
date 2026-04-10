@@ -55,7 +55,7 @@ Data operations
   - sum (int64/float64)
   - mean (int64/float64)
   - min/max (int64/float64)
-- Optional SIMD-accelerated dense float64 sum/mean/min/max reductions with a C fallback.
+- Optional SIMD/OpenMP-accelerated dense float64 sum/mean/min/max reductions with a C fallback.
 - Initial reserved-capacity column buffer pooling for DataFrame creation.
 
 Data cleaning
@@ -117,7 +117,7 @@ I/O and formats
 - None.
 
 Performance and scalability
-- Parallel ops.
+- None.
 
 Interop and parity
 - None.
@@ -170,8 +170,9 @@ Advanced pandas features
 - Vectorized arithmetic outputs float64 and treats nulls/NaNs as null; division by
   zero yields nulls.
 - Dense float64 `sum`/`mean`/`min`/`max` use SSE2 fast paths on supported x86
-  builds and fall back to portable C elsewhere; int64 dense reductions use a
-  branch-free null-free fast path but still preserve overflow checks.
+  builds and fall back to portable C elsewhere; OpenMP-enabled builds also use
+  parallel reductions for large dense numeric workloads. int64 dense reductions
+  use a branch-free null-free fast path but still preserve overflow checks.
 - `cp_df_create(..., capacity, ...)` pools initial per-column null/data buffers
   across reserved-capacity DataFrames and spills to standalone column storage if
   a column grows beyond the pooled reservation.

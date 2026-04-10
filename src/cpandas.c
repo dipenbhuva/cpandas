@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef CPANDAS_HAVE_OPENMP
+#include <omp.h>
+#endif
 #if defined(__SSE2__) &&                                                  \
     (defined(__x86_64__) || defined(_M_X64) || defined(__i386) ||         \
      defined(_M_IX86))
@@ -97,6 +100,17 @@ static size_t cp_count_nulls(const unsigned char *is_null, size_t length) {
   if (!is_null) {
     return 0;
   }
+#ifdef CPANDAS_HAVE_OPENMP
+  if (length >= (size_t)(1u << 18) && length <= (size_t)LLONG_MAX) {
+    unsigned long long nulls_omp = 0;
+    long long omp_len = (long long)length;
+#pragma omp parallel for reduction(+ : nulls_omp) schedule(static)
+    for (long long i = 0; i < omp_len; ++i) {
+      nulls_omp += is_null[i] ? 1ULL : 0ULL;
+    }
+    return (size_t)nulls_omp;
+  }
+#endif
 #if CPANDAS_HAVE_X86_SSE2
   __m128i zero = _mm_setzero_si128();
   __m128i acc = _mm_setzero_si128();
@@ -129,6 +143,17 @@ static double cp_sum_float64_dense(const double *values, size_t length) {
   if (!values) {
     return 0.0;
   }
+#ifdef CPANDAS_HAVE_OPENMP
+  if (length >= (size_t)(1u << 18) && length <= (size_t)LLONG_MAX) {
+    double sum_omp = 0.0;
+    long long omp_len = (long long)length;
+#pragma omp parallel for reduction(+ : sum_omp) schedule(static)
+    for (long long i = 0; i < omp_len; ++i) {
+      sum_omp += values[i];
+    }
+    return sum_omp;
+  }
+#endif
 #if CPANDAS_HAVE_X86_SSE2
   __m128d acc = _mm_setzero_pd();
   size_t i = 0;
@@ -167,6 +192,19 @@ static double cp_min_float64_dense(const double *values, size_t length) {
     return 0.0;
   }
   double min_val = values[0];
+#ifdef CPANDAS_HAVE_OPENMP
+  if (length >= (size_t)(1u << 18) && length <= (size_t)LLONG_MAX) {
+    double min_omp = values[0];
+    long long omp_len = (long long)length;
+#pragma omp parallel for reduction(min : min_omp) schedule(static)
+    for (long long i = 1; i < omp_len; ++i) {
+      if (values[i] < min_omp) {
+        min_omp = values[i];
+      }
+    }
+    return min_omp;
+  }
+#endif
 #if CPANDAS_HAVE_X86_SSE2
   if (length >= 2) {
     __m128d acc = _mm_loadu_pd(values);
@@ -199,6 +237,19 @@ static double cp_max_float64_dense(const double *values, size_t length) {
     return 0.0;
   }
   double max_val = values[0];
+#ifdef CPANDAS_HAVE_OPENMP
+  if (length >= (size_t)(1u << 18) && length <= (size_t)LLONG_MAX) {
+    double max_omp = values[0];
+    long long omp_len = (long long)length;
+#pragma omp parallel for reduction(max : max_omp) schedule(static)
+    for (long long i = 1; i < omp_len; ++i) {
+      if (values[i] > max_omp) {
+        max_omp = values[i];
+      }
+    }
+    return max_omp;
+  }
+#endif
 #if CPANDAS_HAVE_X86_SSE2
   if (length >= 2) {
     __m128d acc = _mm_loadu_pd(values);
