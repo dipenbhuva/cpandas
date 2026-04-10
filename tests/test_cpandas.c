@@ -1719,6 +1719,51 @@ static void test_row_slice_views(void) {
   cp_df_free(df);
 }
 
+static void test_pooled_capacity_growth(void) {
+  CpError err;
+  cp_error_clear(&err);
+
+  const char *names[] = {"id", "score", "name"};
+  CpDType dtypes[] = {CP_DTYPE_INT64, CP_DTYPE_FLOAT64, CP_DTYPE_STRING};
+  CpDataFrame *df = cp_df_create(3, names, dtypes, 2, &err);
+  CHECK(df != NULL);
+  if (!df) {
+    return;
+  }
+
+  const char *row1[] = {"1", "1.5", "Alice"};
+  const char *row2[] = {"2", "2.5", "Bob"};
+  const char *row3[] = {"3", "", "Cara"};
+  const char *row4[] = {"4", "4.5", "Dan"};
+  CHECK(cp_df_append_row(df, row1, 3, &err));
+  CHECK(cp_df_append_row(df, row2, 3, &err));
+  CHECK(cp_df_append_row(df, row3, 3, &err));
+  CHECK(cp_df_append_row(df, row4, 3, &err));
+  CHECK(cp_df_nrows(df) == 4);
+
+  const CpSeries *id = cp_df_get_col(df, "id");
+  const CpSeries *score = cp_df_get_col(df, "score");
+  const CpSeries *name = cp_df_get_col(df, "name");
+  CHECK(id != NULL && score != NULL && name != NULL);
+  if (id && score && name) {
+    int64_t id_val = 0;
+    double score_val = 0.0;
+    const char *name_val = NULL;
+    int is_null = 0;
+
+    CHECK(cp_series_get_int64(id, 3, &id_val, &is_null));
+    CHECK(!is_null && id_val == 4);
+
+    CHECK(cp_series_get_float64(score, 2, &score_val, &is_null));
+    CHECK(is_null);
+
+    CHECK(cp_series_get_string(name, 3, &name_val, &is_null));
+    CHECK(!is_null && strcmp(name_val, "Dan") == 0);
+  }
+
+  cp_df_free(df);
+}
+
 static void test_select_dtypes(void) {
   CpError err;
   cp_error_clear(&err);
@@ -5853,6 +5898,7 @@ int main(void) {
   test_select_and_filter();
   test_select_cols_view();
   test_row_slice_views();
+  test_pooled_capacity_growth();
   test_select_dtypes();
   test_zero_copy_dtype_and_drop_views();
   test_sort_values();

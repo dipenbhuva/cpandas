@@ -27,6 +27,7 @@ struct CpSeries {
   size_t length;
   size_t capacity;
   int owns_data;
+  int owns_string_values;
   unsigned char *is_null;
   union {
     int64_t *i64;
@@ -41,6 +42,10 @@ struct CpDataFrame {
   CpSeries **cols;
   int owns_columns;
   int writable;
+  unsigned char *pooled_nulls;
+  int64_t *pooled_i64;
+  double *pooled_f64;
+  char **pooled_str;
   int has_index;
   size_t index_col;
   size_t index_count;
@@ -60,6 +65,12 @@ static CpDataFrame *cp_df_create_view(const CpDataFrame *df,
                                       const CpSeries **cols,
                                       size_t count,
                                       CpError *err);
+static CpSeries *cp_series_create_pooled(const char *name,
+                                         CpDType dtype,
+                                         size_t capacity,
+                                         unsigned char *nulls,
+                                         void *data,
+                                         CpError *err);
 static CpSeries *cp_series_create_slice_view(const CpSeries *src,
                                              size_t start,
                                              size_t length,
@@ -1666,42 +1677,94 @@ static int cp_series_reserve(CpSeries *s, size_t needed, CpError *err) {
   while (new_cap < needed) {
     new_cap *= 2;
   }
+  int had_owned_data = s->owns_data;
+  unsigned char *old_nulls = s->is_null;
 
-  unsigned char *new_nulls =
-      (unsigned char *)realloc(s->is_null, new_cap * sizeof(unsigned char));
-  if (!new_nulls) {
-    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
-    return 0;
+  unsigned char *new_nulls = NULL;
+  if (had_owned_data) {
+    new_nulls =
+        (unsigned char *)realloc(s->is_null, new_cap * sizeof(unsigned char));
+    if (!new_nulls) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+  } else {
+    new_nulls = (unsigned char *)malloc(new_cap * sizeof(unsigned char));
+    if (!new_nulls) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      return 0;
+    }
+    if (s->length > 0 && s->is_null) {
+      memcpy(new_nulls, s->is_null, s->length * sizeof(unsigned char));
+    }
   }
   if (new_cap > s->capacity) {
     memset(new_nulls + s->capacity, 0, new_cap - s->capacity);
   }
-  s->is_null = new_nulls;
 
   switch (s->dtype) {
     case CP_DTYPE_INT64: {
-      int64_t *new_data =
-          (int64_t *)realloc(s->data.i64, new_cap * sizeof(int64_t));
+      int64_t *new_data = NULL;
+      if (had_owned_data) {
+        new_data = (int64_t *)realloc(s->data.i64, new_cap * sizeof(int64_t));
+      } else {
+        new_data = (int64_t *)malloc(new_cap * sizeof(int64_t));
+        if (new_data && s->length > 0 && s->data.i64) {
+          memcpy(new_data, s->data.i64, s->length * sizeof(int64_t));
+        }
+      }
       if (!new_data) {
+        if (!had_owned_data) {
+          free(new_nulls);
+        } else {
+          s->is_null = new_nulls;
+        }
         cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
         return 0;
       }
+      s->is_null = new_nulls;
       s->data.i64 = new_data;
       break;
     }
     case CP_DTYPE_FLOAT64: {
-      double *new_data =
-          (double *)realloc(s->data.f64, new_cap * sizeof(double));
+      double *new_data = NULL;
+      if (had_owned_data) {
+        new_data = (double *)realloc(s->data.f64, new_cap * sizeof(double));
+      } else {
+        new_data = (double *)malloc(new_cap * sizeof(double));
+        if (new_data && s->length > 0 && s->data.f64) {
+          memcpy(new_data, s->data.f64, s->length * sizeof(double));
+        }
+      }
       if (!new_data) {
+        if (!had_owned_data) {
+          free(new_nulls);
+        } else {
+          s->is_null = new_nulls;
+        }
         cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
         return 0;
       }
+      s->is_null = new_nulls;
       s->data.f64 = new_data;
       break;
     }
     case CP_DTYPE_STRING: {
-      char **new_data = (char **)realloc(s->data.str, new_cap * sizeof(char *));
+      char **new_data = NULL;
+      if (had_owned_data) {
+        new_data = (char **)realloc(s->data.str, new_cap * sizeof(char *));
+      } else {
+        new_data = (char **)malloc(new_cap * sizeof(char *));
+        if (new_data && s->length > 0 && s->data.str) {
+          memcpy(new_data, s->data.str, s->length * sizeof(char *));
+        }
+      }
       if (!new_data) {
+        if (!had_owned_data) {
+          free(new_nulls);
+        } else {
+          s->is_null = new_nulls;
+        }
         cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
         return 0;
       }
@@ -1709,14 +1772,20 @@ static int cp_series_reserve(CpSeries *s, size_t needed, CpError *err) {
         memset(new_data + s->capacity, 0,
                (new_cap - s->capacity) * sizeof(char *));
       }
+      s->is_null = new_nulls;
       s->data.str = new_data;
       break;
     }
     default:
+      if (!had_owned_data) {
+        free(new_nulls);
+      }
+      s->is_null = old_nulls;
       cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
       return 0;
   }
 
+  s->owns_data = 1;
   s->capacity = new_cap;
   return 1;
 }
@@ -1726,7 +1795,7 @@ void cp_series_free(CpSeries *s) {
     return;
   }
   free(s->name);
-  if (s->owns_data && s->dtype == CP_DTYPE_STRING && s->data.str) {
+  if (s->owns_string_values && s->dtype == CP_DTYPE_STRING && s->data.str) {
     for (size_t i = 0; i < s->length; ++i) {
       free(s->data.str[i]);
     }
@@ -1757,6 +1826,7 @@ static CpSeries *cp_series_create(const char *name,
   s->length = 0;
   s->capacity = 0;
   s->owns_data = 1;
+  s->owns_string_values = 1;
   s->is_null = NULL;
   s->data.str = NULL;
 
@@ -1767,6 +1837,47 @@ static CpSeries *cp_series_create(const char *name,
     }
   }
 
+  return s;
+}
+
+static CpSeries *cp_series_create_pooled(const char *name,
+                                         CpDType dtype,
+                                         size_t capacity,
+                                         unsigned char *nulls,
+                                         void *data,
+                                         CpError *err) {
+  CpSeries *s = (CpSeries *)calloc(1, sizeof(CpSeries));
+  if (!s) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    return NULL;
+  }
+  s->name = cp_strdup(name ? name : "");
+  if (!s->name) {
+    cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+    cp_series_free(s);
+    return NULL;
+  }
+  s->dtype = dtype;
+  s->length = 0;
+  s->capacity = capacity;
+  s->owns_data = 0;
+  s->owns_string_values = (dtype == CP_DTYPE_STRING) ? 1 : 0;
+  s->is_null = nulls;
+  switch (dtype) {
+    case CP_DTYPE_INT64:
+      s->data.i64 = (int64_t *)data;
+      break;
+    case CP_DTYPE_FLOAT64:
+      s->data.f64 = (double *)data;
+      break;
+    case CP_DTYPE_STRING:
+      s->data.str = (char **)data;
+      break;
+    default:
+      cp_error_set(err, CP_ERR_INVALID, 0, 0, "unknown dtype");
+      cp_series_free(s);
+      return NULL;
+  }
   return s;
 }
 
@@ -1793,6 +1904,7 @@ static CpSeries *cp_series_create_slice_view(const CpSeries *src,
   out->length = length;
   out->capacity = length;
   out->owns_data = 0;
+  out->owns_string_values = 0;
   out->is_null = src->is_null ? src->is_null + start : NULL;
   switch (src->dtype) {
     case CP_DTYPE_INT64:
@@ -2679,6 +2791,10 @@ CpDataFrame *cp_df_create(size_t ncols,
   df->nrows = 0;
   df->owns_columns = 1;
   df->writable = 1;
+  df->pooled_nulls = NULL;
+  df->pooled_i64 = NULL;
+  df->pooled_f64 = NULL;
+  df->pooled_str = NULL;
   df->has_index = 0;
   df->index_col = 0;
   df->index_count = 0;
@@ -2690,8 +2806,89 @@ CpDataFrame *cp_df_create(size_t ncols,
     return NULL;
   }
 
+  size_t int_cols = 0;
+  size_t float_cols = 0;
+  size_t string_cols = 0;
+  if (capacity > 0) {
+    for (size_t i = 0; i < ncols; ++i) {
+      switch (dtypes[i]) {
+        case CP_DTYPE_INT64:
+          int_cols += 1;
+          break;
+        case CP_DTYPE_FLOAT64:
+          float_cols += 1;
+          break;
+        case CP_DTYPE_STRING:
+          string_cols += 1;
+          break;
+        default:
+          cp_error_set(err, CP_ERR_INVALID, 0, i, "unknown dtype");
+          cp_df_free(df);
+          return NULL;
+      }
+    }
+    df->pooled_nulls =
+        (unsigned char *)calloc(ncols * capacity, sizeof(unsigned char));
+    if (!df->pooled_nulls) {
+      cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+      cp_df_free(df);
+      return NULL;
+    }
+    if (int_cols > 0) {
+      df->pooled_i64 = (int64_t *)malloc(int_cols * capacity * sizeof(int64_t));
+      if (!df->pooled_i64) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        cp_df_free(df);
+        return NULL;
+      }
+    }
+    if (float_cols > 0) {
+      df->pooled_f64 =
+          (double *)malloc(float_cols * capacity * sizeof(double));
+      if (!df->pooled_f64) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        cp_df_free(df);
+        return NULL;
+      }
+    }
+    if (string_cols > 0) {
+      df->pooled_str =
+          (char **)calloc(string_cols * capacity, sizeof(char *));
+      if (!df->pooled_str) {
+        cp_error_set(err, CP_ERR_OOM, 0, 0, "out of memory");
+        cp_df_free(df);
+        return NULL;
+      }
+    }
+  }
+
+  size_t int_idx = 0;
+  size_t float_idx = 0;
+  size_t string_idx = 0;
   for (size_t i = 0; i < ncols; ++i) {
-    df->cols[i] = cp_series_create(names[i], dtypes[i], capacity, err);
+    if (capacity > 0) {
+      unsigned char *nulls = df->pooled_nulls + (i * capacity);
+      void *data = NULL;
+      switch (dtypes[i]) {
+        case CP_DTYPE_INT64:
+          data = df->pooled_i64 + (int_idx++ * capacity);
+          break;
+        case CP_DTYPE_FLOAT64:
+          data = df->pooled_f64 + (float_idx++ * capacity);
+          break;
+        case CP_DTYPE_STRING:
+          data = df->pooled_str + (string_idx++ * capacity);
+          break;
+        default:
+          cp_error_set(err, CP_ERR_INVALID, 0, i, "unknown dtype");
+          cp_df_free(df);
+          return NULL;
+      }
+      df->cols[i] =
+          cp_series_create_pooled(names[i], dtypes[i], capacity, nulls, data, err);
+    } else {
+      df->cols[i] = cp_series_create(names[i], dtypes[i], capacity, err);
+    }
     if (!df->cols[i]) {
       cp_df_free(df);
       return NULL;
@@ -2709,6 +2906,10 @@ void cp_df_free(CpDataFrame *df) {
       cp_series_free(df->cols[i]);
     }
   }
+  free(df->pooled_nulls);
+  free(df->pooled_i64);
+  free(df->pooled_f64);
+  free(df->pooled_str);
   free(df->cols);
   free(df->index_cols);
   free(df);
